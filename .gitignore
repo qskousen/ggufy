@@ -1,0 +1,6 @@
+.idea
+.zig-cache
+zig-out
+# because it's nice to have example files in the operating dir :)
+*.safetensors
+*.gguf
