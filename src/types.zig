@@ -4,7 +4,7 @@ pub const FileType = enum {
     safetensors,
     gguf,
 
-    pub fn detect(reader: *std.io.Reader, allocator: std.mem.Allocator) !FileType {
+    pub fn detect_from_file(reader: *std.io.Reader, allocator: std.mem.Allocator) !FileType {
         const file_header = try reader.readAlloc(allocator, 8);
 
         // Check for GGUF magic "GGUF" followed by version (2 bytes) and tensor count
@@ -21,4 +21,21 @@ pub const FileType = enum {
 
         return error.UnknownFormat;
     }
+
+    pub fn parse_from_string(str: []const u8) !FileType {
+        inline for (std.meta.fields(FileType)) |field| {
+            if (std.mem.eql(u8, str, field.name)) {
+                return @field(FileType, field.name);
+            }
+        }
+        return error.UnknownFormat;
+    }
+};
+
+pub const Tensor = struct {
+    name: []const u8,
+    type: []const u8,
+    dims: []usize,
+    size: u64,
+    offset: u64,
 };
