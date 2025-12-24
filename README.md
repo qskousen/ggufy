@@ -7,5 +7,5 @@ todos:
 
 - [ ] allow opening st or gguf non-existing path and use for writing (seperate instances for read and write)
 - [ ] generate "importance matrix" file from a template, weight tensors 100-0 on how much quantization affects them
-- [ ] allow to set output directory and output file when converting
+- [x] allow to set output directory and output file when converting
 - [ ] starting with q8_0, support actual quantization

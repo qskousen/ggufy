@@ -54,17 +54,20 @@ pub fn main() !void {
     const params = comptime clap.parseParamsComptime(
         \\-h, --help                 Display this help and exit.
         \\-d, --datatype <DATATYPE>  When converting, the target datatype (default fp16).
-        \\-f, --filetype <FILETYPE>  When converting, the target filetype (default gguf).
+        \\-f, --filetype <FILETYPE>  When converting, the target filetype: gguf (default), safetensors.
         \\-t, --template <FILENAME>  When converting, specify a template to use.
+        \\-o, --output-dir <DIR>     Output directory (default: same as source file).
+        \\-n, --output-name <FILENAME>   Output filename without extension (default: source name + datatype).
         \\<COMMAND>    Specify a command: header, tree, metadata, convert, template
         \\<FILENAME>   The file to use for input
     );
 
     const parsers = comptime .{
-        .DATATYPE = clap.parsers.enumeration(st.DType),
+        .DATATYPE = clap.parsers.enumeration(gguf.GgmlType),
         .FILETYPE = clap.parsers.enumeration(types.FileType),
         .COMMAND = clap.parsers.enumeration(Command),
         .FILENAME = clap.parsers.string,
+        .DIR = clap.parsers.string,
     };
 
     // Initialize our diagnostics, which can be used for reporting useful errors.
@@ -96,8 +99,10 @@ pub fn main() !void {
     const command = res.positionals[0] orelse return error.MissingCommand;
     const path = res.positionals[1] orelse return error.MissingModelPath;
     const filetype = res.args.filetype orelse types.FileType.gguf;
-    const datatype = res.args.datatype orelse st.DType.F16;
+    const datatype = res.args.datatype orelse gguf.GgmlType.f16;
     const template_path = res.args.template;
+    const output_dir = res.args.@"output-dir";
+    const output_name = res.args.@"output-name";
 
     const file = try std.fs.cwd().openFile(path, .{ .mode = .read_only });
     defer file.close();
@@ -257,7 +262,23 @@ pub fn main() !void {
 
                     switch (filetype) {
                         .gguf => {
-                            const out_filename = try std.fmt.allocPrint(arena_alloc, "{s}.gguf", .{std.fs.path.stem(path)});
+                            // Determine output directory
+                            const dir_path = if (output_dir) |od|
+                                od
+                            else
+                                std.fs.path.dirname(path) orelse ".";
+
+                            // Determine output filename
+                            const base_name = if (output_name) |on|
+                                on
+                            else blk: {
+                                const stem = std.fs.path.stem(path);
+                                // Append datatype to filename
+                                const dtype_str = @tagName(datatype);
+                                break :blk try std.fmt.allocPrint(arena_alloc, "{s}-{s}", .{ stem, dtype_str });
+                            };
+
+                            const out_filename = try std.fs.path.join(arena_alloc, &[_][]const u8{ dir_path, try std.fmt.allocPrint(arena_alloc, "{s}.gguf", .{base_name}) });
                             const out_file = try std.fs.cwd().createFile(out_filename, .{ .truncate = true });
                             defer out_file.close();
                             var writer_buffer: [1024]u8 = undefined;
@@ -390,8 +411,6 @@ pub fn main() !void {
                             return error.Unimplimented;
                         },
                     }
-
-                    _ = datatype;
                 },
                 .template => {
                     return error.Unimplimented;
