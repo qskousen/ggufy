@@ -74,11 +74,13 @@ pub fn main() !void {
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    const file_type = try types.FileType.detect_from_file(&reader.interface, arena_alloc);
+    const file_type = types.FileType.detect_from_file(&reader.interface, arena_alloc)
+        catch types.FileType.safetensors;
     try reader.seekTo(0);
     switch (file_type) {
         .safetensors => {
-            var f = st.init(&reader.interface, arena_alloc);
+            var f = try st.init(path, arena_alloc);
+            defer f.deinit();
 
             switch (command) {
                 .header => {
@@ -88,14 +90,7 @@ pub fn main() !void {
                     try f.printTensorTree(stdout);
                 },
                 .metadata => {
-                    f.printMetadata(stdout) catch |err| {
-                        if (err == error.NoMetadataHeader) {
-                            try stderr.print("This file does not have a metadata header.\n", .{});
-                            try stderr.flush();
-                        } else {
-                            return err;
-                        }
-                    };
+                    try f.printMetadata(stdout);
                 },
                 .convert => {
                     const target_filetype_str = args_it.next() orelse {
@@ -127,7 +122,6 @@ pub fn main() !void {
 
                     switch (target_filetype) {
                         .gguf => {
-                            // We need to convert the metadata and tensor header to gguf format, then convert each tensor to gguf.
                             const out_filename = try std.fmt.allocPrint(arena_alloc, "{s}.gguf", .{std.fs.path.stem(path)});
                             const out_file = try std.fs.cwd().createFile(out_filename, .{ .truncate = true });
                             defer out_file.close();
@@ -135,146 +129,103 @@ pub fn main() !void {
                             var out_writer = out_file.writer(&writer_buffer);
                             var writer = &out_writer.interface;
 
-                            // Parse header again to get the JSON object
-                            const header_json = try f.parseHeader();
-                            defer header_json.deinit();
-                            const root_obj = header_json.value.object;
-
-                            // 1. Collect and Sort Tensors
-                            try reader.seekTo(0);
-                            const tensors = try f.getTensors();
-
-                            var metadata_count: u64 = 0;
-                            // We need to store the metadata object to iterate it later
-                            var metadata_obj: ?std.json.ObjectMap = null;
-
-                            if (root_obj.get("__metadata__")) |meta_val| {
-                                metadata_obj = meta_val.object;
-                            }
-
-                            // Sort tensors by name
-                            std.sort.block(types.Tensor, tensors.items, {}, struct {
+                            // Sort tensors
+                            std.sort.block(types.Tensor, f.tensors.items, {}, struct {
                                 fn lessThan(_: void, a: types.Tensor, b: types.Tensor) bool {
                                     return std.mem.lessThan(u8, a.name, b.name);
                                 }
                             }.lessThan);
 
-                            // Calculate exact metadata count
-                            // Start with 1 for general.alignment
-                            metadata_count = 1;
-                            if (metadata_obj) |meta| {
-                                var meta_it = meta.iterator();
-                                while (meta_it.next()) |entry| {
-                                    if (entry.value_ptr.* == .string) {
-                                        metadata_count += 1;
-                                    }
+                            // Metadata count
+                            var metadata_count: u64 = 1; // general.alignment
+                            if (f.metadata) |meta| {
+                                var it = meta.iterator();
+                                while (it.next()) |entry| {
+                                    if (entry.value_ptr.* == .string) metadata_count += 1;
                                 }
                             }
 
-                            // Write GGUF Header
-                            try gguf.writeHeader(writer, @intCast(tensors.items.len), metadata_count);
-
-                            // Write Metadata
+                            try gguf.writeHeader(writer, @intCast(f.tensors.items.len), metadata_count);
                             try gguf.writeMetadataKVU32(writer, "general.alignment", 32);
 
-                            if (metadata_obj) |meta| {
-                                var meta_it = meta.iterator();
-                                while (meta_it.next()) |entry| {
-                                    try stdout.print("metadata: {s} value: {s}\n", .{ entry.key_ptr.*, entry.value_ptr.string });
-                                    // Safetensors metadata values are usually strings
+                            if (f.metadata) |meta| {
+                                var it = meta.iterator();
+                                while (it.next()) |entry| {
                                     if (entry.value_ptr.* == .string) {
                                         try gguf.writeMetadataKVString(writer, entry.key_ptr.*, entry.value_ptr.string);
                                     }
                                 }
                             }
 
-                            // Write Tensor Info and calculate offsets
                             var current_offset: u64 = 0;
-                            for (tensors.items) |t| {
+                            for (f.tensors.items) |t| {
                                 const ggml_type = try gguf.GgmlType.fromSafetensorsType(t.type);
-
-                                // Validation 1: Check data start/offset vs dims/dtype
-                                const st_dtype = try st.DType.fromString(t.type);
-                                var num_elements: u64 = 1;
-                                for (t.dims) |d| num_elements *= d;
-                                const expected_size = num_elements * st_dtype.getSizeInBytes();
-
-                                if (expected_size != t.size) {
-                                    try stderr.print("\nWARNING: Data size mismatch for tensor '{s}'\n", .{t.name});
-                                    try stderr.print("  Expected: {} bytes (dims: {any} * type: {s})\n", .{ expected_size, t.dims, t.type });
-                                    try stderr.print("  Actual:   {} bytes\n", .{ t.size });
-                                    try stderr.flush();
-                                }
-
-                                // Write info
                                 try gguf.writeTensorInfo(writer, t.name, t.dims, ggml_type, current_offset);
 
-                                // Use the ACTUAL size from Safetensors to advance offset
-                                // This guarantees that the GGUF offset points to where we actually write the data
                                 const byte_size = t.size;
-
-                                // Calculate next offset with 32-byte alignment
                                 var next_offset = current_offset + byte_size;
                                 const remainder = next_offset % 32;
-                                if (remainder != 0) {
-                                    next_offset += (32 - remainder);
-                                }
+                                if (remainder != 0) next_offset += (32 - remainder);
                                 current_offset = next_offset;
                             }
 
-                            // IMPORTANT: Flush headers before writing bulk data
                             try writer.flush();
 
-                            // Write padding to align data section start to 32 bytes
+                            // Padding for data start
                             const header_pos = try out_file.getPos();
                             const padding_len = (32 - (header_pos % 32)) % 32;
                             if (padding_len > 0) {
                                 const zeros = [_]u8{0} ** 32;
                                 try writer.writeAll(zeros[0..padding_len]);
-                                try writer.flush(); // Flush padding
+                                try writer.flush();
                             }
 
-                            // --- Write Tensor Data ---
+                            // Data Copy
+                            var copy_buf = try arena_alloc.alloc(u8, 1024 * 1024);
+                            var current_open_path: []const u8 = "";
+                            var current_file_handle: ?std.fs.File = null;
+                            var current_data_begin: u64 = 0;
+                            defer if (current_file_handle) |h| h.close();
 
-                            // 1. Determine start of data section in Safetensors
-                            try reader.seekTo(0);
-                            const len_bytes = try reader.interface.readAlloc(allocator, 8);
-                            defer allocator.free(len_bytes);
-                            const st_header_len = std.mem.readInt(u64, len_bytes[0..8], .little);
-                            const st_data_begin = 8 + st_header_len;
+                            for (f.tensors.items) |t| {
+                                try stdout.print("Converting tensor {s}\n", .{t.name});
+                                try stdout.flush();
+                                const tensor_path = t.source_path orelse path;
 
-                            // 2. Buffer for copying
-                            var copy_buf = try allocator.alloc(u8, 1 * 1024 * 1024); // 1MB buffer
-                            defer allocator.free(copy_buf);
+                                if (!std.mem.eql(u8, current_open_path, tensor_path)) {
+                                    if (current_file_handle) |h| h.close();
 
-                            // 3. Iterate SORTED tensors again to copy data
-                            for (tensors.items) |t| {
-                                const size = t.size;
+                                    try stdout.print("Opening file {s}\n", .{tensor_path});
+                                    try stdout.flush();
+                                    const new_file = try std.fs.cwd().openFile(tensor_path, .{});
+                                    current_file_handle = new_file;
+                                    current_open_path = tensor_path;
 
-                                // Seek to tensor data in input
-                                try reader.seekTo(st_data_begin + t.offset);
-
-                                // Copy data in chunks
-                                var left = size;
-                                while (left > 0) {
-                                    const n = try reader.interface.readSliceShort(copy_buf);
-                                    if (n == 0) return error.UnexpectedEof;
-
-                                    const size_left = @min(left, n);
-                                    try writer.writeAll(copy_buf[0..size_left]);
-                                    left -= size_left;
+                                    var len_bytes: [8]u8 = undefined;
+                                    _ = try new_file.readAll(&len_bytes);
+                                    const st_len = std.mem.readInt(u64, len_bytes[0..8], .little);
+                                    current_data_begin = 8 + st_len;
                                 }
 
-                                // Write padding to align next tensor to 32 bytes
-                                const padding = (32 - (size % 32)) % 32;
+                                if (current_file_handle) |h| {
+                                    try h.seekTo(current_data_begin + t.offset);
+                                    var left = t.size;
+                                    while (left > 0) {
+                                        const n = try h.read(copy_buf);
+                                        if (n == 0) return error.UnexpectedEof;
+                                        const take = @min(left, n);
+                                        try writer.writeAll(copy_buf[0..take]);
+                                        left -= take;
+                                    }
+                                }
+
+                                const padding = (32 - (t.size % 32)) % 32;
                                 if (padding > 0) {
                                     const zeros = [_]u8{0} ** 32;
                                     try writer.writeAll(zeros[0..padding]);
                                 }
                             }
-
                             try writer.flush();
-
                             try stdout.print("Converted to {s}\n", .{out_filename});
                         },
                         .safetensors => {

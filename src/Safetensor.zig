@@ -1,63 +1,249 @@
 const std = @import("std");
 const types = @import("types.zig");
 
-reader: *std.io.Reader,
+path: []const u8,
 allocator: std.mem.Allocator,
+
+// We'll store parsed data here
+json_data: std.json.Parsed(std.json.Value),
+tensors: std.ArrayList(types.Tensor),
+metadata: ?std.json.ObjectMap = null,
 
 pub const formatType = types.FileType.safetensors;
 
 const Safetensors = @This();
 
-pub fn init(data_reader: *std.io.Reader, mem_allocator: std.mem.Allocator) Safetensors {
-    return .{
-        .reader = data_reader,
-        .allocator = mem_allocator,
+pub fn init(path: []const u8, allocator: std.mem.Allocator) !Safetensors {
+    // 1. Detect if directory or file
+    // 2. If directory (or index file), handle sharding logic
+    // 3. Parse headers and populate tensors list
+
+    var self = Safetensors{
+        .path = path,
+        .allocator = allocator,
+        .json_data = undefined,
+        .tensors = try std.ArrayList(types.Tensor).initCapacity(allocator, 200),
+        .metadata = null,
     };
+
+    // Determine effective path (if directory provided, look for index or single file)
+    // For simplicity, let's assume 'path' is the entry point file (either .safetensors or .index.json)
+    // or the directory containing them.
+
+    var entry_path = path;
+    const stat = try std.fs.cwd().statFile(path);
+    if (stat.kind == .directory) {
+        // Look for index.json
+        const paths_index = [_][]const u8{ path, "model.safetensors.index.json" };
+        const index_path = try std.fs.path.join(allocator, &paths_index);
+        if (std.fs.cwd().access(index_path, .{})) {
+            entry_path = index_path;
+        } else |_| {
+            // Look for model.safetensors
+            const paths_single = [_][]const u8{ path, "model.safetensors" };
+            const single_path = try std.fs.path.join(allocator, &paths_single);
+            if (std.fs.cwd().access(single_path, .{})) {
+                entry_path = single_path;
+            } else |_| {
+                return error.ModelNotFound;
+            }
+        }
+    }
+
+    if (std.mem.endsWith(u8, entry_path, "index.json")) {
+        try self.loadSharded(entry_path);
+    } else {
+        try self.loadSingle(entry_path);
+    }
+
+    return self;
 }
 
-pub fn printMetadata(self: Safetensors, writer: *std.io.Writer) !void {
-    var data = try self.parseHeader();
-    defer data.deinit();
-    if (data.value.object.get("__metadata__")) |metadata| {
-        switch (metadata) {
-            .object => |obj| {
-                var it = obj.iterator();
-                while (it.next()) |entry| {
-                    try writer.print("{s}: ", .{entry.key_ptr.*});
+pub fn deinit(self: *Safetensors) void {
+    self.json_data.deinit();
+    for (self.tensors.items) |t| {
+        self.allocator.free(t.name);
+        self.allocator.free(t.dims);
+        if (t.source_path) |p| self.allocator.free(p);
+    }
+    self.tensors.deinit(self.allocator);
+}
 
-                    switch (entry.value_ptr.*) {
-                        .string => |str| {
-                            if (str.len > 0 and (str[0] == '{' or str[0] == '[')) {
-                                if (std.json.parseFromSlice(std.json.Value, self.allocator, str, .{})) |nested_json| {
-                                    defer nested_json.deinit();
-                                    var w: std.json.Stringify = .{ .writer = writer, .options = .{ .whitespace = .indent_2 } };
-                                    try w.write(nested_json.value);
-                                } else |_| {
-                                    try writer.print("{s}", .{str});
-                                }
-                            } else {
-                                try writer.print("{s}", .{str});
-                            }
-                        },
-                        else => {
-                            var w: std.json.Stringify = .{ .writer = writer, .options = .{ .whitespace = .indent_2 } };
-                            try w.write(entry.value_ptr.*);
-                        },
-                    }
-                    try writer.writeAll("\n");
+fn loadSingle(self: *Safetensors, path: []const u8) !void {
+    const file = try std.fs.cwd().openFile(path, .{ .mode = .read_only });
+    defer file.close();
+    var read_buffer: [1024]u8 = undefined;
+    var reader = file.reader(&read_buffer);
+
+    const len = try reader.interface.readAlloc(self.allocator, 8);
+    defer self.allocator.free(len);
+    const header_len = std.mem.readInt(u64, len[0..8], .little);
+
+    const header_bytes = try reader.interface.readAlloc(self.allocator, header_len);
+
+    self.json_data = try std.json.parseFromSlice(std.json.Value, self.allocator, header_bytes, .{});
+    self.allocator.free(header_bytes); // Safe because parseFromSlice copies strings by default
+
+    const root = self.json_data.value.object;
+    if (root.get("__metadata__")) |m| {
+        self.metadata = m.object;
+    }
+
+    try self.extractTensorsFromObject(root, path);
+}
+
+fn loadSharded(self: *Safetensors, index_path: []const u8) !void {
+    const dir = std.fs.path.dirname(index_path) orelse ".";
+
+    // Read index file
+    const file = try std.fs.cwd().openFile(index_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(self.allocator, 10 * 1024 * 1024);
+    defer self.allocator.free(content);
+
+    const index_json = try std.json.parseFromSlice(std.json.Value, self.allocator, content, .{});
+    defer index_json.deinit();
+
+    // We need to store *some* metadata, ideally from the first shard found or config?
+    // Usually one of the shards has the __metadata__ field.
+    // We will lazy-load shards.
+
+    var filenames = try std.ArrayList([]const u8).initCapacity(self.allocator, 3);
+    defer {
+        for (filenames.items) |n| self.allocator.free(n);
+        filenames.deinit(self.allocator);
+    }
+
+    if (index_json.value.object.get("weight_map")) |weight_map| {
+        var it = weight_map.object.iterator();
+        while (it.next()) |entry| {
+            const fname = entry.value_ptr.string;
+            var exists = false;
+            for (filenames.items) |e| {
+                if (std.mem.eql(u8, e, fname)) {
+                    exists = true;
+                    break;
                 }
-            },
-            else => try writer.print("__metadata__ is not an object\n", .{}),
+            }
+            if (!exists) {
+                try filenames.append(self.allocator, try self.allocator.dupe(u8, fname));
+            }
         }
-    } else {
-        return error.NoMetadataHeader;
+    }
+
+    var first = true;
+    for (filenames.items) |fname| {
+        const paths = [_][]const u8{ dir, fname };
+        const full_path = try std.fs.path.join(self.allocator, &paths);
+        defer self.allocator.free(full_path);
+
+        const shard_file = try std.fs.cwd().openFile(full_path, .{});
+        defer shard_file.close();
+        var read_buffer: [1024]u8 = undefined;
+        var reader = shard_file.reader(&read_buffer);
+
+        const len = try reader.interface.readAlloc(self.allocator, 8);
+        defer self.allocator.free(len);
+        const header_len = std.mem.readInt(u64, len[0..8], .little);
+        const header_bytes = try reader.interface.readAlloc(self.allocator, header_len);
+
+        const shard_json = try std.json.parseFromSlice(std.json.Value, self.allocator, header_bytes, .{});
+        self.allocator.free(header_bytes);
+
+        if (first) {
+            self.json_data = shard_json; // Keep ownership of the first one for metadata/structure
+            if (shard_json.value.object.get("__metadata__")) |m| {
+                self.metadata = m.object;
+            }
+            first = false;
+        } else {
+            // For subsequent shards, we just extract tensors and discard the JSON
+            // Check for metadata if we haven't found it yet
+            if (self.metadata == null) {
+                if (shard_json.value.object.get("__metadata__")) |m| {
+                    // We need to copy this metadata out because we are about to deinit shard_json
+                    // Actually, simpler to just swap ownership of this json_data if we find metadata
+                    // But that gets messy.
+                    // Let's assume metadata is in the first shard or duplicated.
+                    _ = m;
+                }
+            }
+            defer shard_json.deinit();
+        }
+
+        // We use the JSON object to extract tensors
+        // Note: For the 'first' shard, we are using self.json_data which is valid.
+        // For others, we use shard_json.
+        //const root = if (!first and self.json_data.value == shard_json.value) self.json_data.value.object else shard_json.value.object;
+        try self.extractTensorsFromObject(self.json_data.value.object, full_path);
     }
 }
 
-// split getting the header and printing the header
-// same with metadata
-// make it a nice data structure for consooming
-// might not work out to just split them since for safetensors it just kinda prints it all out
+fn extractTensorsFromObject(self: *Safetensors, root: std.json.ObjectMap, source_path: []const u8) !void {
+    var it = root.iterator();
+    while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "__metadata__")) continue;
+
+        const name = try self.allocator.dupe(u8, entry.key_ptr.*);
+        errdefer self.allocator.free(name);
+
+        const obj = entry.value_ptr.object;
+        const dtype_str = obj.get("dtype").?.string;
+        const dtype = try DType.fromString(dtype_str);
+
+        const shape = obj.get("shape").?.array;
+        var dims = try self.allocator.alloc(usize, shape.items.len);
+        errdefer self.allocator.free(dims);
+        for (shape.items, 0..) |item, i| {
+            dims[i] = @intCast(item.integer);
+        }
+
+        const offsets = obj.get("data_offsets").?.array;
+        const start = @as(u64, @intCast(offsets.items[0].integer));
+        const end = @as(u64, @intCast(offsets.items[1].integer));
+
+        try self.tensors.append(self.allocator, .{
+            .name = name,
+            .type = @tagName(dtype),
+            .dims = dims,
+            .size = end - start,
+            .offset = start,
+            .source_path = try self.allocator.dupe(u8, source_path),
+        });
+    }
+}
+
+pub fn printMetadata(self: Safetensors, writer: *std.io.Writer) !void {
+    if (self.metadata) |meta| {
+        var it = meta.iterator();
+        while (it.next()) |entry| {
+            try writer.print("{s}: ", .{entry.key_ptr.*});
+            switch (entry.value_ptr.*) {
+                .string => |str| {
+                    // Try to pretty print if it looks like JSON
+                    if (str.len > 0 and (str[0] == '{' or str[0] == '[')) {
+                        if (std.json.parseFromSlice(std.json.Value, self.allocator, str, .{})) |nested_json| {
+                            defer nested_json.deinit();
+                            var w: std.json.Stringify = .{ .writer = writer, .options = .{ .whitespace = .indent_2 } };
+                            try w.write(nested_json.value);
+                        } else |_| {
+                            try writer.print("{s}", .{str});
+                        }
+                    } else {
+                        try writer.print("{s}", .{str});
+                    }
+                },
+                else => {
+                    var w: std.json.Stringify = .{ .writer = writer, .options = .{ .whitespace = .indent_2 } };
+                    try w.write(entry.value_ptr.*);
+                }
+            }
+            try writer.writeAll("\n");
+        }
+    } else {
+        try writer.print("No metadata found.\n", .{});
+    }
+}
 
 // Define a node structure that can represent our hierarchical data
 pub const TensorNode = struct {
@@ -168,7 +354,6 @@ pub const DType = enum {
     }
 };
 
-// Add this to your Safetensors struct
 pub fn buildTensorTree(self: Safetensors) !*TensorNode {
     const root = try TensorNode.init(self.allocator, "root");
     var json_data = try self.parseHeader();
@@ -218,8 +403,29 @@ pub fn buildTensorTree(self: Safetensors) !*TensorNode {
 }
 
 pub fn printTensorTree(self: Safetensors, writer: *std.io.Writer) !void {
-    var root = try self.buildTensorTree();
+    const root = try TensorNode.init(self.allocator, "root");
     defer root.deinit(self.allocator);
+
+    for (self.tensors.items) |t| {
+        var parts = std.mem.splitAny(u8, t.name, ".");
+        var current = root;
+        while (parts.next()) |part| {
+            const node = try current.children.getOrPut(part);
+            if (!node.found_existing) {
+                node.value_ptr.* = try TensorNode.init(self.allocator, part);
+                node.value_ptr.*.parent = current;
+            }
+            current = node.value_ptr.*;
+        }
+
+        // Populate leaf
+        current.dtype = try DType.fromString(t.type);
+        current.shape = t.dims; // Note: referencing slice in `t`, careful if t moves/reallocs?
+                                // ArrayList reallocs invalidate pointers, but slices point to heap?
+                                // t.dims is []usize allocated on heap. It's safe as long as we don't free t.
+        current.data_offsets = .{t.offset, t.offset + t.size};
+    }
+
     try self.printNode(root, writer, 0);
 }
 
@@ -280,30 +486,30 @@ fn printNode(self: Safetensors, node: *TensorNode, writer: *std.io.Writer, depth
 }
 
 pub fn printHeader(self: Safetensors, writer: *std.io.Writer) !void {
-    var w: std.json.Stringify = .{ .writer = writer, .options = .{ .whitespace = .indent_2 } };
-    const data = try self.parseHeader();
-    defer data.deinit();
-    try w.write(data.value);
-
     var dtype_counts = std.AutoHashMap(DType, usize).init(self.allocator);
     defer dtype_counts.deinit();
 
-    var it = data.value.object.iterator();
-    while (it.next()) |entry| {
-        if (std.mem.eql(u8, entry.key_ptr.*, "__metadata__")) continue;
-
-        if (entry.value_ptr.* == .object) {
-            if (entry.value_ptr.object.get("dtype")) |dtype_val| {
-                if (dtype_val == .string) {
-                    if (DType.fromString(dtype_val.string)) |dt| {
-                        const g = try dtype_counts.getOrPut(dt);
-                        if (!g.found_existing) g.value_ptr.* = 0;
-                        g.value_ptr.* += 1;
-                    } else |_| {}
-                }
-            }
+    try writer.print("{{\n", .{});
+    for (self.tensors.items, 0..) |t, i| {
+        try writer.print("  \"{s}\": {{\n", .{t.name});
+        try writer.print("    \"dtype\": \"{s}\",\n", .{t.type});
+        try writer.print("    \"shape\": [", .{});
+        for (t.dims, 0..) |d, di| {
+            if (di > 0) try writer.print(", ", .{});
+            try writer.print("{}", .{d});
         }
+        try writer.print("],\n", .{});
+        try writer.print("    \"data_offsets\": [{}, {}]\n", .{t.offset, t.offset + t.size});
+        try writer.print("  }}", .{});
+        if (i < self.tensors.items.len - 1) try writer.print(",", .{});
+        try writer.print("\n", .{});
+
+        const dt = try DType.fromString(t.type);
+        const g = try dtype_counts.getOrPut(dt);
+        if (!g.found_existing) g.value_ptr.* = 0;
+        g.value_ptr.* += 1;
     }
+    try writer.print("}}\n", .{});
 
     if (dtype_counts.count() > 0) {
         try writer.print("\n\nTensor Type Statistics:\n", .{});

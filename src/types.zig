@@ -38,4 +38,5 @@ pub const Tensor = struct {
     dims: []usize,
     size: u64,
     offset: u64,
+    source_path: ?[]const u8 = null,
 };

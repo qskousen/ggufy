@@ -336,7 +336,11 @@ pub fn readGgufMetadata(self: Gguf, writer: *std.io.Writer) !void {
                 const buf = try self.reader.readAlloc(self.allocator, 8);
                 const str_len = std.mem.readInt(i64, buf[0..8], .little);
                 const str = try self.reader.readAlloc(self.allocator, @intCast(str_len));
-                try writer.print("\"{s}\"\n", .{str});
+                if (str_len > 1024) {
+                    try writer.print("!! String size greater than 1024 bytes, not outputting !!\n", .{});
+                } else {
+                    try writer.print("\"{s}\"\n", .{str});
+                }
             },
             .array => {
                 const type_buf = try self.reader.readAlloc(self.allocator, 4);
@@ -344,16 +348,27 @@ pub fn readGgufMetadata(self: Gguf, writer: *std.io.Writer) !void {
                 var len_buf = try self.reader.readAlloc(self.allocator, 8);
                 const arr_len = std.mem.readInt(i64, len_buf[0..8], .little);
                 try writer.print("[array of {} elements of type {}]: ", .{ arr_len, array_type });
-                try writer.print("[", .{});
+                if (arr_len > 10) {
+                    try writer.print("!! Array size greater than 10, not outputting !!\n", .{});
 
-                var j: i64 = 0;
-                while (j < arr_len) : (j += 1) {
-                    if (j > 0) try writer.print(", ", .{});
-                    try self.readGgufArrayValue(writer, array_type, 0);
+                    var nb: [1]u8 = undefined;
+                    var null_writer = nw.nullWriter(&nb);
+                    var j: i64 = 0;
+                    while (j < arr_len) : (j += 1) {
+                        try self.readGgufArrayValue(&null_writer.interface, array_type, 0);
+                    }
+                } else {
+                    try writer.print("[", .{});
+
+                    var j: i64 = 0;
+                    while (j < arr_len) : (j += 1) {
+                        if (j > 0) try writer.print(", ", .{});
+                        try self.readGgufArrayValue(writer, array_type, 0);
+                    }
+
+                    try writer.print("]\n", .{});
+                    try writer.print("\n", .{});
                 }
-
-                try writer.print("]\n", .{});
-                try writer.print("\n", .{});
             },
         }
     }
@@ -411,7 +426,6 @@ pub fn readGgufTensorHeader(self: Gguf, stdout: *std.io.Writer) !void {
                     bad_size = true;
                     bad_size_count += 1;
                 }
-                try stdout.print("allocated: {} expected: {} | ", .{allocated_size, expected_size});
             }
 
             if (tt.isUnsupported()) {
