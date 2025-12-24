@@ -3,21 +3,14 @@ const st = @import("Safetensor.zig");
 const types = @import("types.zig");
 const nw = @import("NullWriter.zig");
 const gguf = @import("Gguf.zig");
+const clap = @import("clap");
 
 const Command = enum {
     header,
     tree,
     metadata,
     convert,
-
-    pub fn parse(str: []const u8) !Command {
-        inline for (std.meta.fields(Command)) |field| {
-            if (std.mem.eql(u8, str, field.name)) {
-                return @field(Command, field.name);
-            }
-        }
-        return error.UnknownCommand;
-    }
+    template,
 };
 
 pub fn main() !void {
@@ -25,44 +18,53 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var args_it = try std.process.argsWithAllocator(allocator);
-    defer args_it.deinit();
+    const params = comptime clap.parseParamsComptime(
+        \\-h, --help                 Display this help and exit.
+        \\-d, --datatype <DATATYPE>  When converting, the target datatype (default fp16).
+        \\-f, --filetype <FILETYPE>  When converting, the target filetype (default gguf).
+        \\-t, --template <FILENAME>  When converting, specify a template to use.
+        \\<COMMAND>    Specify a command: header, tree, metadata, convert, template
+        \\<FILENAME>   The file to use for input
+    );
+
+    const parsers = comptime .{
+        .DATATYPE = clap.parsers.enumeration(st.DType),
+        .FILETYPE = clap.parsers.enumeration(types.FileType),
+        .COMMAND = clap.parsers.enumeration(Command),
+        .FILENAME = clap.parsers.string,
+    };
+
+    // Initialize our diagnostics, which can be used for reporting useful errors.
+    // This is optional. You can also pass `.{}` to `clap.parse` if you don't
+    // care about the extra information `Diagnostic` provides.
+    var diag = clap.Diagnostic{};
+    var res = clap.parse(clap.Help, &params, parsers, .{
+        .diagnostic = &diag,
+        .allocator = allocator,
+    }) catch |err| {
+        // Report useful error and exit.
+        try diag.reportToFile(.stderr(), err);
+        return err;
+    };
+    defer res.deinit();
+
+    if (res.args.help != 0)
+        return clap.helpToFile(.stderr(), clap.Help, &params, .{});
 
     var stderr_buffer: [256]u8 = undefined;
     var err_writer = std.fs.File.stderr().writer(&stderr_buffer);
     const stderr = &err_writer.interface;
+    _ = stderr;
 
     var stdout_buffer: [1024]u8 = undefined;
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
     const stdout = &stdout_writer.interface;
 
-    _ = args_it.next(); // program name
-    const command_str = args_it.next() orelse {
-        try stderr.print(
-            \\Usage: ggufy <command> <file.safetensors> <convert_to_filetype> <convert_to_datatype>
-            \\Commands:
-            \\  header   - Show tensor names and shapes from header
-            \\  tree     - Show the tensors as a tree
-            \\  metadata - Show metadata
-            \\  convert  - Convert a file from one format to another
-            \\           - Filetype argument: safetensor, gguf
-            \\           - Datatype argument: f16
-            \\
-        , .{});
-        try stderr.flush();
-        return error.InvalidArgs;
-    };
-
-    const command = Command.parse(command_str) catch |err| {
-        try stderr.print("Unknown command: {s}\n", .{command_str});
-        try stderr.flush();
-        return err;
-    };
-    const path = args_it.next() orelse {
-        try stderr.print("Usage: ggufy <file.safetensors>\n", .{});
-        try stderr.flush();
-        return error.InvalidArgs;
-    };
+    const command = res.positionals[0] orelse return error.MissingCommand;
+    const path = res.positionals[1] orelse return error.MissingModelPath;
+    const filetype = res.args.filetype orelse types.FileType.gguf;
+    const datatype = res.args.datatype orelse st.DType.F16;
+    const template_path = res.args.template;
 
     const file = try std.fs.cwd().openFile(path, .{ .mode = .read_only });
     defer file.close();
@@ -74,8 +76,7 @@ pub fn main() !void {
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    const file_type = types.FileType.detect_from_file(&reader.interface, arena_alloc)
-        catch types.FileType.safetensors;
+    const file_type = types.FileType.detect_from_file(&reader.interface, arena_alloc) catch types.FileType.safetensors;
     try reader.seekTo(0);
     switch (file_type) {
         .safetensors => {
@@ -93,34 +94,73 @@ pub fn main() !void {
                     try f.printMetadata(stdout);
                 },
                 .convert => {
-                    const target_filetype_str = args_it.next() orelse {
-                        try stderr.print("Usage: ggufy convert <file.safetensors> <convert_to_filetype> <convert_to_datatype>\n", .{});
-                        try stderr.print("Example usage: ggufy convert file.safetensors gguf f16\n", .{});
-                        try stderr.flush();
-                        return error.InvalidArgs;
-                    };
-                    const target_filetype = types.FileType.parse_from_string(target_filetype_str) catch |err| {
-                        try stderr.print("Unknown target filetype: {s}\n", .{target_filetype_str});
-                        try stderr.flush();
-                        return err;
-                    };
-                    const target_datatype_str = args_it.next() orelse {
-                        try stderr.print("Usage: ggufy convert <file.safetensors> <convert_to_filetype> <convert_to_datatype>\n", .{});
-                        try stderr.print("Example usage: ggufy convert file.safetensors gguf f16\n", .{});
-                        try stderr.flush();
-                        return error.InvalidArgs;
-                    };
-                    const target_datatype = st.DType.fromString(target_datatype_str) catch |err| {
-                        try stderr.print("Unknown target datatype: {s}\n", .{target_datatype_str});
-                        try stderr.flush();
-                        return err;
-                    };
+                    var template_metadata: ?std.json.ObjectMap = null;
+                    if (template_path) |tp| {
+                        const t_file = try std.fs.cwd().openFile(tp, .{});
+                        defer t_file.close();
+                        const t_content = try t_file.readToEndAlloc(arena_alloc, 10 * 1024 * 1024);
+                        const t_json = try std.json.parseFromSlice(std.json.Value, arena_alloc, t_content, .{});
+
+                        if (t_json.value.object.get("metadata")) |m| {
+                            template_metadata = m.object;
+                        }
+
+                        const t_tensors = t_json.value.object.get("tensors") orelse return error.InvalidTemplate;
+                        var filtered_tensors = try std.ArrayList(types.Tensor).initCapacity(arena_alloc, f.tensors.items.len);
+
+                        var it = t_tensors.object.iterator();
+                        while (it.next()) |entry| {
+                            const target_name = entry.key_ptr.*;
+                            const target_info = entry.value_ptr.object;
+
+                            // Find source tensor using fuzzy matching (ends_with)
+                            var source_tensor: ?types.Tensor = null;
+                            for (f.tensors.items) |st_tensor| {
+                                if (std.mem.eql(u8, st_tensor.name, target_name) or
+                                    (st_tensor.name.len > target_name.len and
+                                        st_tensor.name[st_tensor.name.len - target_name.len - 1] == '.' and
+                                        std.mem.endsWith(u8, st_tensor.name, target_name)))
+                                {
+                                    source_tensor = st_tensor;
+                                    break;
+                                }
+                            }
+
+                            if (source_tensor) |st_t| {
+                                const target_shape_arr = target_info.get("shape").?.array;
+                                var target_dims = try arena_alloc.alloc(usize, target_shape_arr.items.len);
+                                var target_elements: u64 = 1;
+                                for (target_shape_arr.items, 0..) |item, i| {
+                                    // Templates generated from GGUF have reversed dimensions.
+                                    // We flip them back here to match the logical row-major shape.
+                                    target_dims[target_shape_arr.items.len - 1 - i] = @intCast(item.integer);
+                                    target_elements *= @intCast(item.integer);
+                                }
+
+                                var source_elements: u64 = 1;
+                                for (st_t.dims) |d| source_elements *= d;
+
+                                if (source_elements != target_elements) {
+                                    try stdout.print("Error: Tensor {s} shape mismatch. Source elements: {}, Target elements: {}\n", .{ target_name, source_elements, target_elements });
+                                    return error.ShapeMismatch;
+                                }
+
+                                var new_t = st_t;
+                                new_t.dims = target_dims;
+                                new_t.name = target_name;
+                                try filtered_tensors.append(arena_alloc, new_t);
+                            } else {
+                                try stdout.print("Warning: Template tensor {s} not found in source file.\n", .{target_name});
+                            }
+                        }
+                        f.tensors = filtered_tensors;
+                    }
 
                     // TODO: if the target datatype is higher precision than the source, print an error warning the user
                     // of the dangers of upcasting not resulting in higher precision/less perplexity and exit, unless
                     // they pass a flag acknowledging that they understand the issues involved and want to proceed.
 
-                    switch (target_filetype) {
+                    switch (filetype) {
                         .gguf => {
                             const out_filename = try std.fmt.allocPrint(arena_alloc, "{s}.gguf", .{std.fs.path.stem(path)});
                             const out_file = try std.fs.cwd().createFile(out_filename, .{ .truncate = true });
@@ -138,7 +178,10 @@ pub fn main() !void {
 
                             // Metadata count
                             var metadata_count: u64 = 1; // general.alignment
-                            if (f.metadata) |meta| {
+                            if (template_metadata) |meta| {
+                                metadata_count = @intCast(meta.count());
+                                metadata_count += 1;
+                            } else if (f.metadata) |meta| {
                                 var it = meta.iterator();
                                 while (it.next()) |entry| {
                                     if (entry.value_ptr.* == .string) metadata_count += 1;
@@ -146,13 +189,20 @@ pub fn main() !void {
                             }
 
                             try gguf.writeHeader(writer, @intCast(f.tensors.items.len), metadata_count);
-                            try gguf.writeMetadataKVU32(writer, "general.alignment", 32);
 
-                            if (f.metadata) |meta| {
+                            try gguf.writeMetadataKVU32(writer, "general.alignment", 32);
+                            if (template_metadata) |meta| {
                                 var it = meta.iterator();
                                 while (it.next()) |entry| {
-                                    if (entry.value_ptr.* == .string) {
-                                        try gguf.writeMetadataKVString(writer, entry.key_ptr.*, entry.value_ptr.string);
+                                    try gguf.writeMetadataKVJson(writer, entry.key_ptr.*, entry.value_ptr.*);
+                                }
+                            } else {
+                                if (f.metadata) |meta| {
+                                    var it = meta.iterator();
+                                    while (it.next()) |entry| {
+                                        if (entry.value_ptr.* == .string) {
+                                            try gguf.writeMetadataKVString(writer, entry.key_ptr.*, entry.value_ptr.string);
+                                        }
                                     }
                                 }
                             }
@@ -225,6 +275,9 @@ pub fn main() !void {
                                     try writer.writeAll(zeros[0..padding]);
                                 }
                             }
+                            const zeros = [_]u8{0} ** 32;
+                            // why does this work???
+                            try writer.writeAll(zeros[0..7]);
                             try writer.flush();
                             try stdout.print("Converted to {s}\n", .{out_filename});
                         },
@@ -233,15 +286,31 @@ pub fn main() !void {
                         },
                     }
 
-                    _ = target_datatype;
+                    _ = datatype;
+                },
+                .template => {
+                    return error.Unimplimented;
                 },
             }
         },
         .gguf => {
+            const file_size = try file.getEndPos();
             try reader.seekTo(4); // Skip GGUF magic
-            var f = gguf.init(&reader.interface, arena_alloc);
-            const version = try f.readGgufVersion();
-            try stdout.print("GGUF format version {}\n", .{version});
+            var f = try gguf.init(&reader.interface, arena_alloc);
+            defer f.deinit();
+
+            f.file_size = file_size;
+            // The data section start must be aligned.
+            // GGUF header ends exactly where the last tensor info was read.
+            const header_end = try file.getPos();
+            try stdout.print("Header end raw: {}\n", .{header_end});
+            const alignment = f.metadata.get("general.alignment") orelse std.json.Value{ .integer = 32 };
+            const align_val: u64 = @intCast(alignment.integer);
+
+            // The data section starts at the first multiple of align_val >= header_end
+            f.data_offset = ((header_end + align_val - 1) / align_val) * align_val;
+
+            try stdout.print("GGUF format version {}\n", .{f.version});
             try stdout.flush();
             switch (command) {
                 .header => {
@@ -251,12 +320,21 @@ pub fn main() !void {
                     return error.Unimplemented;
                 },
                 .metadata => {
-                    // skip the tensors count section
-                    try reader.seekBy(8);
                     try f.readGgufMetadata(stdout);
                 },
                 .convert => {
                     return error.Unimplimented;
+                },
+                .template => {
+                    const out_file = try std.fs.cwd().createFile("template.json", .{ .truncate = true });
+                    defer out_file.close();
+                    var writer_buffer: [1024]u8 = undefined;
+                    var out_writer = out_file.writer(&writer_buffer);
+                    var writer = &out_writer.interface;
+
+                    try f.writeTemplate(writer);
+                    try writer.flush();
+                    try stdout.print("Template exported to template.json\n", .{});
                 },
             }
         },

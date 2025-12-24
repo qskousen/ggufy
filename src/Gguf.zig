@@ -5,13 +5,98 @@ const types = @import("types.zig");
 reader: *std.io.Reader,
 allocator: std.mem.Allocator,
 
+tensors: std.ArrayList(types.Tensor),
+metadata: std.json.ObjectMap,
+version: u32 = 0,
+
+data_offset: u64 = 0,
+file_size: u64 = 0,
+
 const Gguf = @This();
 
-pub fn init(data_reader: *std.io.Reader, mem_allocator: std.mem.Allocator) Gguf {
-    return .{
+pub fn init(data_reader: *std.io.Reader, mem_allocator: std.mem.Allocator) !Gguf {
+    var self = Gguf{
         .reader = data_reader,
         .allocator = mem_allocator,
+        .tensors = try std.ArrayList(types.Tensor).initCapacity(mem_allocator, 200),
+        .metadata = std.json.ObjectMap.init(mem_allocator),
     };
+    errdefer {
+        self.metadata.deinit();
+        self.tensors.deinit(mem_allocator);
+    }
+
+    const version_buffer = try data_reader.readAlloc(mem_allocator, 4);
+    defer mem_allocator.free(version_buffer);
+    self.version = std.mem.readInt(u32, version_buffer[0..4], .little);
+
+    const tensor_count_buf = try data_reader.readAlloc(mem_allocator, 8);
+    defer mem_allocator.free(tensor_count_buf);
+    const tensor_count = std.mem.readInt(u64, tensor_count_buf[0..8], .little);
+
+    const metadata_count_buf = try data_reader.readAlloc(mem_allocator, 8);
+    defer mem_allocator.free(metadata_count_buf);
+    const metadata_count = std.mem.readInt(u64, metadata_count_buf[0..8], .little);
+
+    var i: u64 = 0;
+    while (i < metadata_count) : (i += 1) {
+        var metadata = try GgufMetadata.read(data_reader, mem_allocator);
+        defer metadata.deinit(mem_allocator);
+
+        const val = try self.readGgufValueAsJson(metadata.value_type);
+        try self.metadata.put(try mem_allocator.dupe(u8, metadata.title), val);
+    }
+
+    try self.tensors.ensureTotalCapacity(self.allocator, tensor_count);
+    var ti: u64 = 0;
+    while (ti < tensor_count) : (ti += 1) {
+        const str_len_buf = try data_reader.readAlloc(mem_allocator, 8);
+        defer mem_allocator.free(str_len_buf);
+        const str_len = std.mem.readInt(i64, str_len_buf[0..8], .little);
+        const name = try data_reader.readAlloc(mem_allocator, @intCast(str_len));
+        errdefer mem_allocator.free(name);
+
+        const dim_count_buf = try data_reader.readAlloc(mem_allocator, 4);
+        defer mem_allocator.free(dim_count_buf);
+        const dim_count = std.mem.readInt(u32, dim_count_buf[0..4], .little);
+
+        var dims = try mem_allocator.alloc(usize, dim_count);
+        errdefer mem_allocator.free(dims);
+
+        var j: u64 = 0;
+        while (j < dim_count) : (j += 1) {
+            const buf = try data_reader.readAlloc(mem_allocator, 8);
+            defer mem_allocator.free(buf);
+            dims[j] = @intCast(std.mem.readInt(u64, buf[0..8], .little));
+        }
+
+        const type_buf = try data_reader.readAlloc(mem_allocator, 4);
+        defer mem_allocator.free(type_buf);
+        const tensor_type = try GgmlType.fromInt(std.mem.readInt(u32, type_buf[0..4], .little));
+
+        const offset_buf = try data_reader.readAlloc(mem_allocator, 8);
+        defer mem_allocator.free(offset_buf);
+        const tensor_offset = std.mem.readInt(u64, offset_buf[0..8], .little);
+
+        try self.tensors.append(self.allocator, .{
+            .name = name,
+            .type = @tagName(tensor_type),
+            .dims = dims,
+            .size = 0, // GGUF tensor info doesn't store size, needs calculation
+            .offset = tensor_offset,
+        });
+    }
+
+    return self;
+}
+
+pub fn deinit(self: *Gguf) void {
+    self.metadata.deinit();
+    for (self.tensors.items) |t| {
+        self.allocator.free(t.name);
+        self.allocator.free(t.dims);
+    }
+    self.tensors.deinit(self.allocator);
 }
 
 pub const GgufValueType = enum(u32) {
@@ -173,8 +258,7 @@ const GgufMetadata = struct {
 };
 
 pub fn readGgufVersion(self: Gguf) !u32 {
-    const version_buffer = try self.reader.readAlloc(self.allocator, 4);
-    return std.mem.readInt(u32, version_buffer[0..4], .little);
+    return self.version;
 }
 
 pub fn getTensors(self: Gguf) !std.ArrayList(types.Tensor) {
@@ -261,6 +345,60 @@ pub fn writeMetadataKVU32(writer: *std.io.Writer, key: []const u8, value: u32) !
     try writer.writeInt(u32, value, .little);
 }
 
+pub fn writeMetadataKVJson(writer: *std.io.Writer, key: []const u8, value: std.json.Value) !void {
+    try writeString(writer, key);
+    switch (value) {
+        .bool => |b| {
+            try writer.writeInt(u32, @intFromEnum(GgufValueType.bool), .little);
+            try writer.writeByte(if (b) 1 else 0);
+        },
+        .integer => |i| {
+            // Heuristic: default to u32 for small positive integers if not specified
+            // GGUF expects specific types. For now we assume u32 or i64 based on size.
+            if (i >= 0 and i <= std.math.maxInt(u32)) {
+                try writer.writeInt(u32, @intFromEnum(GgufValueType.uint32), .little);
+                try writer.writeInt(u32, @intCast(i), .little);
+            } else {
+                try writer.writeInt(u32, @intFromEnum(GgufValueType.int64), .little);
+                try writer.writeInt(i64, i, .little);
+            }
+        },
+        .float => |f| {
+            try writer.writeInt(u32, @intFromEnum(GgufValueType.float32), .little);
+            try writer.writeInt(u32, @bitCast(@as(f32, @floatCast(f))), .little);
+        },
+        .string => |s| {
+            try writer.writeInt(u32, @intFromEnum(GgufValueType.string), .little);
+            try writeString(writer, s);
+        },
+        .array => |a| {
+            try writer.writeInt(u32, @intFromEnum(GgufValueType.array), .little);
+            // Assume all elements in array have same type as first element
+            if (a.items.len == 0) return error.EmptyMetadataArray;
+            const first = a.items[0];
+            const array_type: GgufValueType = switch (first) {
+                .bool => .bool,
+                .integer => .uint32, // Heuristic
+                .float => .float32,
+                .string => .string,
+                else => return error.UnsupportedMetadataArrayType,
+            };
+            try writer.writeInt(u32, @intFromEnum(array_type), .little);
+            try writer.writeInt(u64, a.items.len, .little);
+            for (a.items) |item| {
+                switch (item) {
+                    .bool => |b| try writer.writeByte(if (b) 1 else 0),
+                    .integer => |i| try writer.writeInt(u32, @intCast(i), .little),
+                    .float => |f| try writer.writeInt(u32, @bitCast(@as(f32, @floatCast(f))), .little),
+                    .string => |s| try writeString(writer, s),
+                    else => unreachable,
+                }
+            }
+        },
+        else => return error.UnsupportedMetadataType,
+    }
+}
+
 pub fn writeTensorInfo(writer: *std.io.Writer, name: []const u8, dims: []const usize, type_: GgmlType, offset: u64) !void {
     try writeString(writer, name);
     try writer.writeInt(u32, @intCast(dims.len), .little);
@@ -275,123 +413,60 @@ pub fn writeTensorInfo(writer: *std.io.Writer, name: []const u8, dims: []const u
 }
 
 pub fn readGgufMetadata(self: Gguf, writer: *std.io.Writer) !void {
-    var count_buffer = try self.reader.readAlloc(self.allocator, 8);
-    const count = std.mem.readInt(u64, count_buffer[0..8], .little);
+    try writer.print("Metadata count: {}\n", .{self.metadata.count()});
 
-    try writer.print("Metadata count: {}\n", .{count});
+    var it = self.metadata.iterator();
+    while (it.next()) |entry| {
+        try writer.print("{s}: ", .{entry.key_ptr.*});
+        try self.printJsonValue(writer, entry.value_ptr.*, 0);
+        try writer.writeAll("\n");
+    }
+}
 
-    var i: u64 = 0;
-    while (i < count) : (i += 1) {
-        var metadata = try GgufMetadata.read(self.reader, self.allocator);
-        defer metadata.deinit(self.allocator);
-
-        try writer.print("{s}: ", .{metadata.title});
-
-        switch (metadata.value_type) {
-            .bool => {
-                const buf = try self.reader.readAlloc(self.allocator, 1);
-                try writer.print("{}\n", .{buf[0] != 0});
-            },
-            .uint8 => {
-                const buf = try self.reader.readAlloc(self.allocator, 1);
-                try writer.print("{}\n", .{buf[0]});
-            },
-            .int8 => {
-                const buf = try self.reader.readAlloc(self.allocator, 1);
-                try writer.print("{}\n", .{@as(i8, @bitCast(buf[0]))});
-            },
-            .uint16 => {
-                const buf = try self.reader.readAlloc(self.allocator, 2);
-                try writer.print("{}\n", .{std.mem.readInt(u16, buf[0..2], .little)});
-            },
-            .int16 => {
-                const buf = try self.reader.readAlloc(self.allocator, 2);
-                try writer.print("{}\n", .{std.mem.readInt(i16, buf[0..2], .little)});
-            },
-            .uint32 => {
-                const buf = try self.reader.readAlloc(self.allocator, 4);
-                try writer.print("{}\n", .{std.mem.readInt(u32, buf[0..4], .little)});
-            },
-            .int32 => {
-                const buf = try self.reader.readAlloc(self.allocator, 4);
-                try writer.print("{}\n", .{std.mem.readInt(i32, buf[0..4], .little)});
-            },
-            .float32 => {
-                const buf = try self.reader.readAlloc(self.allocator, 4);
-                try writer.print("{d}\n", .{@as(f32, @bitCast(std.mem.readInt(u32, buf[0..4], .little)))});
-            },
-            .uint64 => {
-                const buf = try self.reader.readAlloc(self.allocator, 8);
-                try writer.print("{}\n", .{std.mem.readInt(u64, buf[0..8], .little)});
-            },
-            .int64 => {
-                const buf = try self.reader.readAlloc(self.allocator, 8);
-                try writer.print("{}\n", .{std.mem.readInt(i64, buf[0..8], .little)});
-            },
-            .float64 => {
-                const buf = try self.reader.readAlloc(self.allocator, 8);
-                try writer.print("{d}\n", .{@as(f64, @bitCast(std.mem.readInt(u64, buf[0..8], .little)))});
-            },
-            .string => {
-                const buf = try self.reader.readAlloc(self.allocator, 8);
-                const str_len = std.mem.readInt(i64, buf[0..8], .little);
-                const str = try self.reader.readAlloc(self.allocator, @intCast(str_len));
-                if (str_len > 1024) {
-                    try writer.print("!! String size greater than 1024 bytes, not outputting !!\n", .{});
-                } else {
-                    try writer.print("\"{s}\"\n", .{str});
+fn printJsonValue(self: Gguf, writer: *std.io.Writer, val: std.json.Value, depth: usize) !void {
+    switch (val) {
+        .bool => |b| try writer.print("{}", .{b}),
+        .integer => |i| try writer.print("{}", .{i}),
+        .float => |f| try writer.print("{d}", .{f}),
+        .string => |s| try writer.print("\"{s}\"", .{s}),
+        .array => |a| {
+            if (a.items.len > 10) {
+                try writer.print("[array of {} elements]: !! Array size greater than 10, not outputting !!", .{a.items.len});
+            } else {
+                try writer.writeAll("[");
+                for (a.items, 0..) |item, i| {
+                    if (i > 0) try writer.writeAll(", ");
+                    try self.printJsonValue(writer, item, depth + 1);
                 }
-            },
-            .array => {
-                const type_buf = try self.reader.readAlloc(self.allocator, 4);
-                const array_type = @as(GgufValueType, @enumFromInt(std.mem.readInt(u32, type_buf[0..4], .little)));
-                var len_buf = try self.reader.readAlloc(self.allocator, 8);
-                const arr_len = std.mem.readInt(i64, len_buf[0..8], .little);
-                try writer.print("[array of {} elements of type {}]: ", .{ arr_len, array_type });
-                if (arr_len > 10) {
-                    try writer.print("!! Array size greater than 10, not outputting !!\n", .{});
-
-                    var nb: [1]u8 = undefined;
-                    var null_writer = nw.nullWriter(&nb);
-                    var j: i64 = 0;
-                    while (j < arr_len) : (j += 1) {
-                        try self.readGgufArrayValue(&null_writer.interface, array_type, 0);
-                    }
-                } else {
-                    try writer.print("[", .{});
-
-                    var j: i64 = 0;
-                    while (j < arr_len) : (j += 1) {
-                        if (j > 0) try writer.print(", ", .{});
-                        try self.readGgufArrayValue(writer, array_type, 0);
-                    }
-
-                    try writer.print("]\n", .{});
-                    try writer.print("\n", .{});
-                }
-            },
-        }
+                try writer.writeAll("]");
+            }
+        },
+        .object => |o| {
+            try writer.writeAll("{ ");
+            var it = o.iterator();
+            var first = true;
+            while (it.next()) |entry| {
+                if (!first) try writer.writeAll(", ");
+                first = false;
+                try writer.print("\"{s}\": ", .{entry.key_ptr.*});
+                try self.printJsonValue(writer, entry.value_ptr.*, depth + 1);
+            }
+            try writer.writeAll(" }");
+        },
+        .null => try writer.writeAll("null"),
+        .number_string => |s| try writer.print("\"{s}\"", .{s}),
     }
 }
 
 pub fn readGgufTensorHeader(self: Gguf, stdout: *std.io.Writer) !void {
-    var tensors = try self.getTensors();
-    defer {
-        for (tensors.items) |t| {
-            self.allocator.free(t.name);
-            self.allocator.free(t.dims);
-        }
-        tensors.deinit(self.allocator);
-    }
-
-    try stdout.print("Tensor count: {}\n", .{tensors.items.len});
+    try stdout.print("Tensor count: {}\n", .{self.tensors.items.len});
 
     var type_counts = std.AutoHashMap(GgmlType, usize).init(self.allocator);
     defer type_counts.deinit();
 
     var bad_size_count: u64 = 0;
 
-    for (tensors.items, 0..) |tensor, i| {
+    for (self.tensors.items, 0..) |tensor, i| {
         const tensor_type = std.meta.stringToEnum(GgmlType, tensor.type);
 
         var bad_size = false;
@@ -409,23 +484,37 @@ pub fn readGgufTensorHeader(self: Gguf, stdout: *std.io.Writer) !void {
             // calculate the total size in bytes for this tensor
             const total_bytes = tt.calcSizeInBytes(tensor_elements);
 
-            // Validate against next tensor offset
-            if (i < tensors.items.len - 1) {
-                const next_offset = tensors.items[i + 1].offset;
+            const alignment = self.metadata.get("general.alignment") orelse std.json.Value{ .integer = 32 };
+            const align_val: u64 = @intCast(alignment.integer);
+
+            var expected_padded_size = total_bytes;
+            if (expected_padded_size % align_val != 0) {
+                expected_padded_size += align_val - (expected_padded_size % align_val);
+            }
+
+            // Validate against next tensor offset or end of file
+            if (i < self.tensors.items.len - 1) {
+                const next_offset = self.tensors.items[i + 1].offset;
                 const allocated_size = next_offset - tensor.offset;
 
-                // GGUF usually aligns to 32 bytes.
-                // (Realistically we should read general.alignment from metadata, but 32 is standard)
-                const alignment = 32;
-                var expected_size = total_bytes;
-                if (expected_size % alignment != 0) {
-                    expected_size += alignment - (expected_size % alignment);
-                }
-
-                if (allocated_size != expected_size) {
+                if (allocated_size != expected_padded_size) {
                     bad_size = true;
                     bad_size_count += 1;
                 }
+            } else if (self.file_size > 0 and self.data_offset > 0) {
+                // Total data section size available on disk from this tensor's start
+                const disk_size_remaining = self.file_size - (self.data_offset + tensor.offset);
+
+                // For the last tensor, the GGUF file should end exactly after the
+                // tensor data (optionally including its specific alignment padding).
+                // If disk_size_remaining is larger than expected_padded_size,
+                // there is extra data/garbage at the end of the file.
+                if (disk_size_remaining != total_bytes and disk_size_remaining != expected_padded_size) {
+                    bad_size = true;
+                    bad_size_count += 1;
+                }
+            } else {
+                try stdout.print("Could not check size of last tensor: file size ({}) or data offset ({}) not set!\n", .{ self.file_size, self.data_offset });
             }
 
             if (tt.isUnsupported()) {
@@ -458,6 +547,122 @@ pub fn readGgufTensorHeader(self: Gguf, stdout: *std.io.Writer) !void {
     if (bad_size_count > 0) {
         try stdout.print("\nTensors found with a bad size (tensor data + alignment doesn't match size on disk): {}", .{bad_size_count});
     }
+}
+
+pub fn writeTemplate(self: Gguf, writer: *std.io.Writer) !void {
+    var root_obj = std.json.ObjectMap.init(self.allocator);
+    defer root_obj.deinit();
+
+    // Metadata - we need to deep copy because the value will be owned by root_obj
+    // and stringify might deinit it depending on usage, or we just point to existing.
+    // Actually, std.json.Value doesn't have an easy deep copy.
+    // We can just construct it manually or use a wrapper.
+
+    try root_obj.put("metadata", std.json.Value{ .object = self.metadata });
+
+    // Tensors
+    var tensors_obj = std.json.ObjectMap.init(self.allocator);
+    errdefer tensors_obj.deinit();
+
+    for (self.tensors.items) |t| {
+        var t_obj = std.json.ObjectMap.init(self.allocator);
+        errdefer t_obj.deinit();
+
+        var shape_arr = std.json.Array.init(self.allocator);
+        errdefer shape_arr.deinit();
+        for (t.dims) |dim| {
+            try shape_arr.append(std.json.Value{ .integer = @intCast(dim) });
+        }
+        try t_obj.put("shape", std.json.Value{ .array = shape_arr });
+        try t_obj.put("type", std.json.Value{ .string = t.type });
+
+        try tensors_obj.put(try self.allocator.dupe(u8, t.name), std.json.Value{ .object = t_obj });
+    }
+    try root_obj.put("tensors", std.json.Value{ .object = tensors_obj });
+
+    // Stringify without taking ownership
+    var stringifier = std.json.Stringify{
+        .writer = writer,
+        .options = .{
+            .whitespace = .indent_2,
+        },
+    };
+
+    try stringifier.write(std.json.Value{ .object = root_obj });
+
+    // Remove metadata and tensors from root_obj so they don't get double-freed
+    _ = root_obj.swapRemove("metadata");
+    // tensors_obj keys were duped, but values were newly created so they are fine to deinit.
+    // However we must be careful with tensors_obj deinit.
+}
+
+fn readGgufValueAsJson(self: Gguf, value_type: GgufValueType) !std.json.Value {
+    return switch (value_type) {
+        .bool => {
+            const buf = try self.reader.readAlloc(self.allocator, 1);
+            return std.json.Value{ .bool = buf[0] != 0 };
+        },
+        .uint8 => {
+            const buf = try self.reader.readAlloc(self.allocator, 1);
+            return std.json.Value{ .integer = buf[0] };
+        },
+        .int8 => {
+            const buf = try self.reader.readAlloc(self.allocator, 1);
+            return std.json.Value{ .integer = @as(i8, @bitCast(buf[0])) };
+        },
+        .uint16 => {
+            const buf = try self.reader.readAlloc(self.allocator, 2);
+            return std.json.Value{ .integer = std.mem.readInt(u16, buf[0..2], .little) };
+        },
+        .int16 => {
+            const buf = try self.reader.readAlloc(self.allocator, 2);
+            return std.json.Value{ .integer = std.mem.readInt(i16, buf[0..2], .little) };
+        },
+        .uint32 => {
+            const buf = try self.reader.readAlloc(self.allocator, 4);
+            return std.json.Value{ .integer = std.mem.readInt(u32, buf[0..4], .little) };
+        },
+        .int32 => {
+            const buf = try self.reader.readAlloc(self.allocator, 4);
+            return std.json.Value{ .integer = std.mem.readInt(i32, buf[0..4], .little) };
+        },
+        .float32 => {
+            const buf = try self.reader.readAlloc(self.allocator, 4);
+            return std.json.Value{ .float = @as(f32, @bitCast(std.mem.readInt(u32, buf[0..4], .little))) };
+        },
+        .uint64 => {
+            const buf = try self.reader.readAlloc(self.allocator, 8);
+            return std.json.Value{ .integer = @intCast(std.mem.readInt(u64, buf[0..8], .little)) };
+        },
+        .int64 => {
+            const buf = try self.reader.readAlloc(self.allocator, 8);
+            return std.json.Value{ .integer = std.mem.readInt(i64, buf[0..8], .little) };
+        },
+        .float64 => {
+            const buf = try self.reader.readAlloc(self.allocator, 8);
+            return std.json.Value{ .float = @as(f64, @bitCast(std.mem.readInt(u64, buf[0..8], .little))) };
+        },
+        .string => {
+            const buf = try self.reader.readAlloc(self.allocator, 8);
+            const str_len = std.mem.readInt(i64, buf[0..8], .little);
+            const str = try self.reader.readAlloc(self.allocator, @intCast(str_len));
+            return std.json.Value{ .string = str };
+        },
+        .array => {
+            const type_buf = try self.reader.readAlloc(self.allocator, 4);
+            const array_type = @as(GgufValueType, @enumFromInt(std.mem.readInt(u32, type_buf[0..4], .little)));
+            var len_buf = try self.reader.readAlloc(self.allocator, 8);
+            const arr_len = std.mem.readInt(i64, len_buf[0..8], .little);
+
+            var arr = std.json.Array.init(self.allocator);
+            errdefer arr.deinit();
+            var j: i64 = 0;
+            while (j < arr_len) : (j += 1) {
+                try arr.append(try self.readGgufValueAsJson(array_type));
+            }
+            return std.json.Value{ .array = arr };
+        },
+    };
 }
 
 fn readGgufArrayValue(self: Gguf, writer: *std.io.Writer, value_type: GgufValueType, depth: usize) !void {
