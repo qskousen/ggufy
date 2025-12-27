@@ -534,7 +534,7 @@ pub fn printHeader(self: Safetensors, writer: *std.io.Writer) !void {
             try writer.print("{}", .{d});
         }
         try writer.print("],\n", .{});
-        try writer.print("    \"data_offsets\": [{}, {}]\n", .{ t.offset, t.offset + t.size });
+        try writer.print("    \"offset_from_data_start_and_file_start\": [{}, {}]\n", .{ t.offset, t.offset + self.current_data_begin });
         try writer.print("  }}", .{});
         if (i < self.tensors.items.len - 1) try writer.print(",", .{});
         try writer.print("\n", .{});

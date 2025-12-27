@@ -2,6 +2,7 @@ const std = @import("std");
 const nw = @import("NullWriter.zig");
 const types = @import("types.zig");
 const st = @import("Safetensor.zig");
+const DataTransform = @import("DataTransform.zig");
 
 path: []const u8,
 allocator: std.mem.Allocator,
@@ -361,7 +362,7 @@ pub fn saveWithSTData(self: Gguf, source: *st, stdout: *std.io.Writer) !void {
     try stdout.flush();
     var offset: u64 = 0;
     for (self.tensors.items) |t| {
-        const d_type = try GgmlType.fromSafetensorsType(t.type);
+        const d_type = try GgmlType.fromString(t.type);
         bytes_written += try Gguf.writeTensorInfoTracked(&writer.interface, t.name, t.dims, d_type, offset);
         // TODO: when we start converting, the size is going to change maybe? or that may be already determined at this point
         var next_offset = offset + t.size;
@@ -392,10 +393,13 @@ pub fn saveWithSTData(self: Gguf, source: *st, stdout: *std.io.Writer) !void {
                     matched = true;
                     try stdout.print("Writing tensor data for tensor {s}\n", .{t.name});
                     try stdout.flush();
+                    // convert source tensor type to gguf type
+                    const source_dtype = try GgmlType.fromSafetensorsType(source_tensor.type);
+
                     // get a reader from the source
                     var reader = try source.getReaderForTensor(source_tensor.name, &read_buffer);
                     try reader.seekTo(source_tensor.offset + source.current_data_begin);
-                    try self.writeTensorData(t, &reader.interface, &writer.interface);
+                    try self.writeTensorData(t, source_dtype, &reader.interface, &writer.interface);
 
                     // write padding for alignment if needed
                     const size = try Gguf.calculateTensorSize(t);
@@ -429,26 +433,41 @@ fn maybeWritePadding(self: Gguf, size: u64, writer: *std.io.Writer) !void {
     }
 }
 
-pub fn writeTensorData(self: Gguf, t: types.Tensor, reader: *std.io.Reader, writer: *std.io.Writer) !void {
+pub fn writeTensorData(self: Gguf, t: types.Tensor, source_dtype: GgmlType, reader: *std.io.Reader, writer: *std.io.Writer) !void {
     try self.file.seekTo(self.data_offset + t.offset);
 
-    const size = try Gguf.calculateTensorSize(t);
+    const target_dtype = try GgmlType.fromString(t.type);
 
-    var buf = try self.allocator.alloc(u8, 1024 * 1024);
-    defer self.allocator.free(buf);
+    // Calculate the source tensor size based on source type
+    var n_elements: u64 = 1;
+    for (t.dims) |d| n_elements *= d;
 
-    var left = size;
-    while (left > 0) {
-        const n = try reader.readSliceShort(buf);
-        if (n == 0) return error.UnexpectedEof;
-        const take = @min(left, n);
-        try writer.writeAll(buf[0..take]);
-        left -= take;
+    const source_size = source_dtype.calcSizeInBytes(n_elements);
+
+    // Read source data
+    const source_data = try reader.readAlloc(self.allocator, source_size);
+    defer self.allocator.free(source_data);
+
+    // Convert if types differ, otherwise write directly
+    if (source_dtype == target_dtype) {
+        try writer.writeAll(source_data);
+    } else {
+        // Use DataTransform to convert the data
+        const converted_data = try DataTransform.Quantizer.convertTensorData(
+            self.allocator,
+            source_data,
+            source_dtype,
+            target_dtype,
+            n_elements,
+        );
+        defer self.allocator.free(converted_data);
+
+        try writer.writeAll(converted_data);
     }
 }
 
 pub fn calculateTensorSize(t: types.Tensor) !u64 {
-    const ggml_type = try GgmlType.fromSafetensorsType(t.type);
+    const ggml_type = try GgmlType.fromString(t.type);
     var n_elements: u64 = 1;
     for (t.dims) |d| n_elements *= d;
     return ggml_type.calcSizeInBytes(n_elements);
@@ -949,4 +968,20 @@ fn writeIndent(writer: *std.io.Writer, depth: usize) !void {
     while (i < depth * 2) : (i += 1) {
         try writer.writeAll(" ");
     }
+}
+
+test "calculates f64 size in bytes correctly" {
+    var t = try GgmlType.fromSafetensorsType("f64");
+    
+    const calculatedSize = t.calcSizeInBytes(12);
+    
+    try std.testing.expectEqual(96, calculatedSize);
+}
+
+test "calculates f16 size in bytes correctly" {
+    var t = try GgmlType.fromSafetensorsType("f16");
+
+    const calculatedSize = t.calcSizeInBytes(12);
+
+    try std.testing.expectEqual(24, calculatedSize);
 }
