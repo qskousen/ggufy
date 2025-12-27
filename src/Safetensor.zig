@@ -9,6 +9,10 @@ json_data: std.json.Parsed(std.json.Value),
 tensors: std.ArrayList(types.Tensor),
 metadata: ?std.json.ObjectMap = null,
 
+current_file_handle: ?std.fs.File = null,
+current_open_path: []const u8 = "",
+current_data_begin: u64 = 0,
+
 pub const formatType = types.FileType.safetensors;
 
 const Safetensors = @This();
@@ -24,6 +28,9 @@ pub fn init(path: []const u8, allocator: std.mem.Allocator) !Safetensors {
         .json_data = undefined,
         .tensors = try std.ArrayList(types.Tensor).initCapacity(allocator, 200),
         .metadata = null,
+        .current_file_handle = null,
+        .current_open_path = "",
+        .current_data_begin = 0,
     };
 
     // Determine effective path (if directory provided, look for index or single file)
@@ -60,6 +67,7 @@ pub fn init(path: []const u8, allocator: std.mem.Allocator) !Safetensors {
 }
 
 pub fn deinit(self: *Safetensors) void {
+    if (self.current_file_handle) |h| h.close();
     self.json_data.deinit();
     for (self.tensors.items) |t| {
         self.allocator.free(t.name);
@@ -213,6 +221,33 @@ fn extractTensorsFromObject(self: *Safetensors, root: std.json.ObjectMap, source
     }
 }
 
+pub fn getReaderForTensor(self: *Safetensors, name: []const u8, buffer: []u8) !std.fs.File.Reader {
+    for (self.tensors.items) |t| {
+        if (std.mem.eql(u8, t.name, name)) {
+            const tensor_path = t.source_path orelse self.path;
+
+            if (!std.mem.eql(u8, self.current_open_path, tensor_path)) {
+                if (self.current_file_handle) |h| h.close();
+
+                const new_file = try std.fs.cwd().openFile(tensor_path, .{});
+                self.current_file_handle = new_file;
+                self.current_open_path = tensor_path;
+
+                var len_bytes: [8]u8 = undefined;
+                _ = try new_file.readAll(&len_bytes);
+                const st_len = std.mem.readInt(u64, len_bytes[0..8], .little);
+                self.current_data_begin = 8 + st_len;
+            }
+
+            if (self.current_file_handle) |h| {
+                try h.seekTo(self.current_data_begin + t.offset);
+                return h.reader(buffer);
+            }
+        }
+    }
+    return error.TensorNotFound;
+}
+
 pub fn printMetadata(self: Safetensors, writer: *std.io.Writer) !void {
     if (self.metadata) |meta| {
         var it = meta.iterator();
@@ -236,7 +271,7 @@ pub fn printMetadata(self: Safetensors, writer: *std.io.Writer) !void {
                 else => {
                     var w: std.json.Stringify = .{ .writer = writer, .options = .{ .whitespace = .indent_2 } };
                     try w.write(entry.value_ptr.*);
-                }
+                },
             }
             try writer.writeAll("\n");
         }
@@ -421,9 +456,9 @@ pub fn printTensorTree(self: Safetensors, writer: *std.io.Writer) !void {
         // Populate leaf
         current.dtype = try DType.fromString(t.type);
         current.shape = t.dims; // Note: referencing slice in `t`, careful if t moves/reallocs?
-                                // ArrayList reallocs invalidate pointers, but slices point to heap?
-                                // t.dims is []usize allocated on heap. It's safe as long as we don't free t.
-        current.data_offsets = .{t.offset, t.offset + t.size};
+        // ArrayList reallocs invalidate pointers, but slices point to heap?
+        // t.dims is []usize allocated on heap. It's safe as long as we don't free t.
+        current.data_offsets = .{ t.offset, t.offset + t.size };
     }
 
     try self.printNode(root, writer, 0);
@@ -499,7 +534,7 @@ pub fn printHeader(self: Safetensors, writer: *std.io.Writer) !void {
             try writer.print("{}", .{d});
         }
         try writer.print("],\n", .{});
-        try writer.print("    \"data_offsets\": [{}, {}]\n", .{t.offset, t.offset + t.size});
+        try writer.print("    \"data_offsets\": [{}, {}]\n", .{ t.offset, t.offset + t.size });
         try writer.print("  }}", .{});
         if (i < self.tensors.items.len - 1) try writer.print(",", .{});
         try writer.print("\n", .{});

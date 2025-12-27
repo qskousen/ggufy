@@ -1,22 +1,57 @@
 const std = @import("std");
 const nw = @import("NullWriter.zig");
 const types = @import("types.zig");
+const st = @import("Safetensor.zig");
 
 path: []const u8,
 allocator: std.mem.Allocator,
+file: std.fs.File,
 
 tensors: std.ArrayList(types.Tensor),
 metadata: std.json.ObjectMap,
 version: u32 = 0,
 
+alignment: u32 = 32,
 data_offset: u64 = 0,
 file_size: u64 = 0,
 
+pub const formatType = types.FileType.gguf;
+
 const Gguf = @This();
 
-pub fn init(path: []const u8, mem_allocator: std.mem.Allocator) !Gguf {
-    const file = try std.fs.cwd().openFile(path, .{ .mode = .read_only });
-    defer file.close();
+pub fn init(path: []const u8, mem_allocator: std.mem.Allocator, overwrite: bool) !Gguf {
+    var file: std.fs.File = undefined;
+    var is_new_file = false;
+
+    if (overwrite) {
+        file = try std.fs.cwd().createFile(path, .{ .read = true, .truncate = true });
+        is_new_file = true;
+    } else {
+        if (std.fs.cwd().openFile(path, .{ .mode = .read_write })) |f| {
+            file = f;
+        } else |err| {
+            if (err == error.FileNotFound) {
+                file = try std.fs.cwd().createFile(path, .{ .read = true });
+                is_new_file = true;
+            } else {
+                    file = try std.fs.cwd().openFile(path, .{ .mode = .read_only });
+            }
+        }
+    }
+    errdefer file.close();
+
+    if (is_new_file) {
+        return Gguf{
+            .path = path,
+            .allocator = mem_allocator,
+            .file = file,
+            .tensors = try std.ArrayList(types.Tensor).initCapacity(mem_allocator, 200),
+            .metadata = std.json.ObjectMap.init(mem_allocator),
+            .version = 3,
+            .data_offset = 0,
+            .file_size = 0,
+        };
+    }
 
     const file_size = try file.getEndPos();
 
@@ -37,6 +72,7 @@ pub fn init(path: []const u8, mem_allocator: std.mem.Allocator) !Gguf {
     var self = Gguf{
         .path = path,
         .allocator = mem_allocator,
+        .file = file,
         .tensors = try std.ArrayList(types.Tensor).initCapacity(mem_allocator, 200),
         .metadata = std.json.ObjectMap.init(mem_allocator),
         .version = 0,
@@ -128,6 +164,7 @@ pub fn init(path: []const u8, mem_allocator: std.mem.Allocator) !Gguf {
 }
 
 pub fn deinit(self: *Gguf) void {
+    self.file.close();
     self.metadata.deinit();
     for (self.tensors.items) |t| {
         self.allocator.free(t.name);
@@ -199,6 +236,10 @@ pub const GgmlType = enum(u32) {
         return std.meta.intToEnum(GgmlType, value) catch error.InvalidGgmlType;
     }
 
+    pub fn fromString(value: []const u8) !GgmlType {
+        return std.meta.stringToEnum(GgmlType, value) orelse error.InvalidGgmlType;
+    }
+
     pub fn isUnsupported(self: GgmlType) bool {
         return switch (self) {
             .q4_2, .q4_3, .q4_0_4_4, .q4_0_4_8, .q4_0_8_8, .iq4_nl_4_4, .iq4_nl_4_8, .iq4_nl_8_8 => true,
@@ -215,7 +256,7 @@ pub const GgmlType = enum(u32) {
         if (std.ascii.eqlIgnoreCase(str, "I8")) return .i8;
         if (std.ascii.eqlIgnoreCase(str, "F64")) return .f64;
         if (std.ascii.eqlIgnoreCase(str, "I64")) return .i64;
-        return error.UnsupportedSafetensorType;
+        return error.InvalidGgmlType;
     }
 
     pub fn getBlockSize(self: GgmlType) u64 {
@@ -297,168 +338,129 @@ const GgufMetadata = struct {
     }
 };
 
+pub fn saveWithSTData(self: Gguf, source: *st, stdout: *std.io.Writer) !void {
+    // we need to track bytes written for calculating alignment for the starting tensor
+    var bytes_written: u64 = 0;
+
+    // writer for ourselves
+    var write_buffer: [1024 * 1024]u8 = undefined;
+    var writer = self.file.writer(&write_buffer);
+
+    try stdout.print("Writing GGUF header\n", .{});
+    try stdout.flush();
+    bytes_written += try Gguf.writeHeaderTracked(&writer.interface, self.tensors.items.len, self.metadata.count());
+
+    try stdout.print("Writing {} metadata entries\n", .{self.metadata.count()});
+    try stdout.flush();
+    var meta_it = self.metadata.iterator();
+    while (meta_it.next()) |meta| {
+        bytes_written += try Gguf.writeMetadataKVJsonTracked(&writer.interface, meta.key_ptr.*, meta.value_ptr.*);
+    }
+
+    try stdout.print("Writing tensor info for {} tensors\n", .{self.tensors.items.len});
+    try stdout.flush();
+    var offset: u64 = 0;
+    for (self.tensors.items) |t| {
+        const d_type = try GgmlType.fromSafetensorsType(t.type);
+        bytes_written += try Gguf.writeTensorInfoTracked(&writer.interface, t.name, t.dims, d_type, offset);
+        // TODO: when we start converting, the size is going to change maybe? or that may be already determined at this point
+        var next_offset = offset + t.size;
+        // add alignment bytes if needed
+        const remainder = next_offset % self.alignment;
+        if (remainder != 0) next_offset += (self.alignment - remainder);
+        offset = next_offset;
+    }
+
+    // write any additional alignment bytes needed
+    try self.maybeWritePadding(bytes_written, &writer.interface);
+
+    try stdout.print("Writing tensor data for {} tensors\n", .{self.tensors.items.len});
+    try stdout.flush();
+    // write the tensor data itself
+    // we need to write them in the order of our tensors, but there is no guarantee that the source tensors will be in the same order
+    // the names might also be different, so we have to do some matching
+    var read_buffer: [1024 * 1024]u8 = undefined;
+    for (self.tensors.items) |t| {
+        // try to find the matching tensor in the source
+        var matched = false;
+        for (source.tensors.items) |source_tensor| {
+            if (std.mem.eql(u8, source_tensor.name, t.name) or
+                (source_tensor.name.len > t.name.len and
+                    source_tensor.name[source_tensor.name.len - t.name.len - 1] == '.' and
+                    std.mem.endsWith(u8, source_tensor.name, t.name)))
+                {
+                    matched = true;
+                    try stdout.print("Writing tensor data for tensor {s}\n", .{t.name});
+                    try stdout.flush();
+                    // get a reader from the source
+                    var reader = try source.getReaderForTensor(source_tensor.name, &read_buffer);
+                    try reader.seekTo(source_tensor.offset + source.current_data_begin);
+                    try self.writeTensorData(t, &reader.interface, &writer.interface);
+
+                    // write padding for alignment if needed
+                    const size = try Gguf.calculateTensorSize(t);
+                    try self.maybeWritePadding(size, &writer.interface);
+
+                }
+        }
+        if (! matched) {
+            try stdout.print("Could not find source tensor match for tensor {s}!\n", .{t.name});
+            return error.NoMatchingSourceTensor;
+        }
+    }
+
+    // don't forget to flush!
+    try writer.interface.flush();
+}
+
 pub fn readGgufVersion(self: Gguf) !u32 {
     return self.version;
 }
 
-pub fn getTensors(self: Gguf) !std.ArrayList(types.Tensor) {
-    const count_buf = try self.reader.readAlloc(self.allocator, 8);
-    const tensor_count = std.mem.readInt(u64, count_buf[0..8], .little);
-
-    // skip all the metadata
-    var null_buffer: [1]u8 = undefined;
-    var nullwrite = nw.NullWriter.init(&null_buffer);
-    try self.readGgufMetadata(&nullwrite.interface);
-
-    var tensors = try std.ArrayList(types.Tensor).initCapacity(self.allocator, 200);
-    errdefer {
-        for (tensors.items) |t| {
-            self.allocator.free(t.name);
-            self.allocator.free(t.dims);
-        }
-        tensors.deinit(self.allocator);
-    }
-
-    var i: u64 = 0;
-    while (i < tensor_count) : (i += 1) {
-        // tensor name string
-        const str_len_buf = try self.reader.readAlloc(self.allocator, 8);
-        const str_len = std.mem.readInt(i64, str_len_buf[0..8], .little);
-        const str = try self.reader.readAlloc(self.allocator, @intCast(str_len));
-        errdefer self.allocator.free(str);
-
-        // number of dimensions
-        const dim_count_buf = try self.reader.readAlloc(self.allocator, 4);
-        const dim_count = std.mem.readInt(u32, dim_count_buf[0..4], .little);
-
-        // Allocate a slice for the dimensions
-        var dims = try self.allocator.alloc(usize, dim_count);
-        errdefer self.allocator.free(dims);
-
-        var j: u64 = 0;
-        while (j < dim_count) : (j += 1) {
-            const buf = try self.reader.readAlloc(self.allocator, 8);
-            dims[j] = @intCast(std.mem.readInt(u64, buf[0..8], .little));
-        }
-
-        // type of tensor
-        const type_buf = try self.reader.readAlloc(self.allocator, 4);
-        const tensor_type = try GgmlType.fromInt(std.mem.readInt(u32, type_buf[0..4], .little));
-
-        // offset for tensor
-        const offset_buf = try self.reader.readAlloc(self.allocator, 8);
-        const tensor_offset = std.mem.readInt(u64, offset_buf[0..8], .little);
-
-        try tensors.append(self.allocator, .{
-            .name = str,
-            .type = @tagName(tensor_type),
-            .dims = dims,
-            .size = 0,
-            .offset = tensor_offset,
-        });
-    }
-
-    return tensors;
-}
-
-pub fn writeHeader(writer: *std.io.Writer, tensor_count: u64, metadata_count: u64) !void {
-    _ = try writer.write("GGUF");
-    try writer.writeInt(u32, 3, .little); // Version 3
-    try writer.writeInt(u64, tensor_count, .little);
-    try writer.writeInt(u64, metadata_count, .little);
-}
-
-pub fn writeString(writer: *std.io.Writer, str: []const u8) !void {
-    try writer.writeInt(u64, str.len, .little);
-    _ = try writer.write(str);
-}
-
-pub fn writeMetadataKVString(writer: *std.io.Writer, key: []const u8, value: []const u8) !void {
-    try writeString(writer, key);
-    try writer.writeInt(u32, @intFromEnum(GgufValueType.string), .little);
-    try writeString(writer, value);
-}
-
-pub fn writeMetadataKVU32(writer: *std.io.Writer, key: []const u8, value: u32) !void {
-    try writeString(writer, key);
-    try writer.writeInt(u32, @intFromEnum(GgufValueType.uint32), .little);
-    try writer.writeInt(u32, value, .little);
-}
-
-pub fn writeMetadataKVJson(writer: *std.io.Writer, key: []const u8, value: std.json.Value) !void {
-    try writeString(writer, key);
-    switch (value) {
-        .bool => |b| {
-            try writer.writeInt(u32, @intFromEnum(GgufValueType.bool), .little);
-            try writer.writeByte(if (b) 1 else 0);
-        },
-        .integer => |i| {
-            // Heuristic: default to u32 for small positive integers if not specified
-            // GGUF expects specific types. For now we assume u32 or i64 based on size.
-            if (i >= 0 and i <= std.math.maxInt(u32)) {
-                try writer.writeInt(u32, @intFromEnum(GgufValueType.uint32), .little);
-                try writer.writeInt(u32, @intCast(i), .little);
-            } else {
-                try writer.writeInt(u32, @intFromEnum(GgufValueType.int64), .little);
-                try writer.writeInt(i64, i, .little);
-            }
-        },
-        .float => |f| {
-            try writer.writeInt(u32, @intFromEnum(GgufValueType.float32), .little);
-            try writer.writeInt(u32, @bitCast(@as(f32, @floatCast(f))), .little);
-        },
-        .string => |s| {
-            try writer.writeInt(u32, @intFromEnum(GgufValueType.string), .little);
-            try writeString(writer, s);
-        },
-        .array => |a| {
-            try writer.writeInt(u32, @intFromEnum(GgufValueType.array), .little);
-            // Assume all elements in array have same type as first element
-            if (a.items.len == 0) return error.EmptyMetadataArray;
-            const first = a.items[0];
-            const array_type: GgufValueType = switch (first) {
-                .bool => .bool,
-                .integer => .int32, // Heuristic
-                .float => .float32,
-                .string => .string,
-                else => return error.UnsupportedMetadataArrayType,
-            };
-            try writer.writeInt(u32, @intFromEnum(array_type), .little);
-            try writer.writeInt(u64, a.items.len, .little);
-            for (a.items) |item| {
-                switch (item) {
-                    .bool => |b| try writer.writeByte(if (b) 1 else 0),
-                    .integer => |i| try writer.writeInt(u32, @intCast(i), .little),
-                    .float => |f| try writer.writeInt(u32, @bitCast(@as(f32, @floatCast(f))), .little),
-                    .string => |s| try writeString(writer, s),
-                    else => unreachable,
-                }
-            }
-        },
-        else => return error.UnsupportedMetadataType,
+fn maybeWritePadding(self: Gguf, size: u64, writer: *std.io.Writer) !void {
+    var padding_len = (self.alignment - (size % self.alignment)) % self.alignment;
+    while (padding_len > 0) {
+        // to work with any alignment value, we will iteratively write 0's
+        // typically this is 32 though, so in most cases this will be a single loop
+        const zeros = [_]u8{0} ** 32;
+        const lt = @min(padding_len, 32);
+        try writer.writeAll(zeros[0..lt]);
+        padding_len -= lt;
     }
 }
 
-pub fn writeTensorInfo(writer: *std.io.Writer, name: []const u8, dims: []const usize, type_: GgmlType, offset: u64) !void {
-    try writeString(writer, name);
-    try writer.writeInt(u32, @intCast(dims.len), .little);
-    // GGUF expects dimensions in reverse order (e.g. [width, height, channels, batch])
-    var i = dims.len;
-    while (i > 0) {
-        i -= 1;
-        try writer.writeInt(u64, @intCast(dims[i]), .little);
+pub fn writeTensorData(self: Gguf, t: types.Tensor, reader: *std.io.Reader, writer: *std.io.Writer) !void {
+    try self.file.seekTo(self.data_offset + t.offset);
+
+    const size = try Gguf.calculateTensorSize(t);
+
+    var buf = try self.allocator.alloc(u8, 1024 * 1024);
+    defer self.allocator.free(buf);
+
+    var left = size;
+    while (left > 0) {
+        const n = try reader.readSliceShort(buf);
+        if (n == 0) return error.UnexpectedEof;
+        const take = @min(left, n);
+        try writer.writeAll(buf[0..take]);
+        left -= take;
     }
-    try writer.writeInt(u32, @intFromEnum(type_), .little);
-    try writer.writeInt(u64, offset, .little);
+}
+
+pub fn calculateTensorSize(t: types.Tensor) !u64 {
+    const ggml_type = try GgmlType.fromSafetensorsType(t.type);
+    var n_elements: u64 = 1;
+    for (t.dims) |d| n_elements *= d;
+    return ggml_type.calcSizeInBytes(n_elements);
 }
 
 pub fn writeHeaderTracked(writer: *std.io.Writer, tensor_count: u64, metadata_count: u64) !u64 {
     _ = try writer.write("GGUF");
     try writer.writeInt(u32, 3, .little); // Version 3
-        try writer.writeInt(u64, tensor_count, .little);
+    try writer.writeInt(u64, tensor_count, .little);
     try writer.writeInt(u64, metadata_count, .little);
     return 4 + 4 + 8 + 8; // magic + version + tensor_count + metadata_count
-    }
+}
 
 pub fn writeStringTracked(writer: *std.io.Writer, str: []const u8) !u64 {
     try writer.writeInt(u64, str.len, .little);
@@ -571,7 +573,7 @@ pub fn writeTensorInfoTracked(writer: *std.io.Writer, name: []const u8, dims: []
     bytes += 4;
 
     // GGUF expects dimensions in reverse order
-        var i = dims.len;
+    var i = dims.len;
     while (i > 0) {
         i -= 1;
         try writer.writeInt(u64, @intCast(dims[i]), .little);
@@ -656,12 +658,9 @@ pub fn readGgufTensorHeader(self: Gguf, stdout: *std.io.Writer) !void {
             // calculate the total size in bytes for this tensor
             const total_bytes = tt.calcSizeInBytes(tensor_elements);
 
-            const alignment = self.metadata.get("general.alignment") orelse std.json.Value{ .integer = 32 };
-            const align_val: u64 = @intCast(alignment.integer);
-
             var expected_padded_size = total_bytes;
-            if (expected_padded_size % align_val != 0) {
-                expected_padded_size += align_val - (expected_padded_size % align_val);
+            if (expected_padded_size % self.alignment != 0) {
+                expected_padded_size += self.alignment - (expected_padded_size % self.alignment);
             }
 
             // Validate against next tensor offset or end of file
@@ -677,7 +676,19 @@ pub fn readGgufTensorHeader(self: Gguf, stdout: *std.io.Writer) !void {
                 }
             } else if (self.file_size > 0 and self.data_offset > 0) {
                 // Total data section size available on disk from this tensor's start
-                const disk_size_remaining = self.file_size - (self.data_offset + tensor.offset);
+                    const start_pos = std.math.add(u64, self.data_offset, tensor.offset) catch |err| {
+                    try stdout.print("Warning: Overflow calculating tensor start position for {s}: {}\n", .{ tensor.name, err });
+                    bad_size = true;
+                    bad_size_count += 1;
+                    continue;
+                };
+
+                const disk_size_remaining = std.math.sub(u64, self.file_size, start_pos) catch {
+                    try stdout.print("Warning: Tensor {s} start position {} is beyond file size {}\n", .{ tensor.name, start_pos, self.file_size });
+                    bad_size = true;
+                    bad_size_count += 1;
+                    continue;
+                };
                 actual_size = disk_size_remaining;
 
                 // For the last tensor, the GGUF file should end exactly after the
@@ -709,7 +720,7 @@ pub fn readGgufTensorHeader(self: Gguf, stdout: *std.io.Writer) !void {
                 try stdout.print(", ", .{});
             }
         }
-        try stdout.print("] offset {}, offset from start {}\n", .{tensor.offset, tensor.offset + self.data_offset});
+        try stdout.print("] offset from tensor data start {}, offset from file start {}\n", .{ tensor.offset, tensor.offset + self.data_offset });
     }
 
     if (type_counts.count() > 0) {

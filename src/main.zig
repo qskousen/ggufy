@@ -141,12 +141,9 @@ pub fn main() !void {
                             try stdout.print("Filtering out tensor: {s}\n", .{t.name});
                         }
                     }
-                    f.tensors = model_tensors;
                     // Strip prefixes from tensor names
-                    for (f.tensors.items) |*t| {
+                    for (model_tensors.items) |*t| {
                         const stripped_name = try stripPrefix(t.name, arena_alloc);
-                        // Free the old name if it was allocated
-                        // (in this case it's from the safetensors file so we don't free)
                         t.name = stripped_name;
                     }
 
@@ -162,7 +159,7 @@ pub fn main() !void {
                         }
 
                         const t_tensors = t_json.value.object.get("tensors") orelse return error.InvalidTemplate;
-                        var filtered_tensors = try std.ArrayList(types.Tensor).initCapacity(arena_alloc, f.tensors.items.len);
+                        var filtered_tensors = try std.ArrayList(types.Tensor).initCapacity(arena_alloc, model_tensors.items.len);
 
                         var it = t_tensors.object.iterator();
                         while (it.next()) |entry| {
@@ -171,7 +168,7 @@ pub fn main() !void {
 
                             // Find source tensor using fuzzy matching (ends_with)
                             var source_tensor: ?types.Tensor = null;
-                            for (f.tensors.items) |st_tensor| {
+                            for (model_tensors.items) |st_tensor| {
                                 if (std.mem.eql(u8, st_tensor.name, target_name) or
                                     (st_tensor.name.len > target_name.len and
                                         st_tensor.name[st_tensor.name.len - target_name.len - 1] == '.' and
@@ -209,7 +206,7 @@ pub fn main() !void {
                                 try stdout.print("Warning: Template tensor {s} not found in source file.\n", .{target_name});
                             }
                         }
-                        f.tensors = filtered_tensors;
+                        model_tensors = filtered_tensors;
                     }
 
                     // Shape Fix Logic (similar to convert.py for SDXL/SD1)
@@ -222,7 +219,7 @@ pub fn main() !void {
                     const enable_shape_fix = true;
 
                     if (enable_shape_fix) {
-                        for (f.tensors.items) |*t| {
+                        for (model_tensors.items) |*t| {
                             var n_elements: u64 = 1;
                             for (t.dims) |d| n_elements *= @intCast(d);
 
@@ -255,6 +252,14 @@ pub fn main() !void {
                             }
                         }
                     }
+                    try stdout.flush();
+
+                    // Sort tensors
+                    std.sort.block(types.Tensor, model_tensors.items, {}, struct {
+                        fn lessThan(_: void, a: types.Tensor, b: types.Tensor) bool {
+                            return std.mem.lessThan(u8, a.name, b.name);
+                        }
+                    }.lessThan);
 
                     // TODO: if the target datatype is higher precision than the source, print an error warning the user
                     // of the dangers of upcasting not resulting in higher precision/less perplexity and exit, unless
@@ -279,132 +284,50 @@ pub fn main() !void {
                             };
 
                             const out_filename = try std.fs.path.join(arena_alloc, &[_][]const u8{ dir_path, try std.fmt.allocPrint(arena_alloc, "{s}.gguf", .{base_name}) });
-                            const out_file = try std.fs.cwd().createFile(out_filename, .{ .truncate = true });
-                            defer out_file.close();
-                            var writer_buffer: [1024]u8 = undefined;
-                            var out_writer = out_file.writer(&writer_buffer);
-                            var writer = &out_writer.interface;
-                            var bytes_written: u64 = 0;
 
-                            // Sort tensors
-                            std.sort.block(types.Tensor, f.tensors.items, {}, struct {
-                                fn lessThan(_: void, a: types.Tensor, b: types.Tensor) bool {
-                                    return std.mem.lessThan(u8, a.name, b.name);
-                                }
-                            }.lessThan);
+                            var out_gguf = try gguf.init(out_filename, arena_alloc, true);
+                            defer out_gguf.deinit();
 
-                            // Metadata count - updated to include 3 general metadata entries instead of 1
-                            var metadata_count: u64 = 3; // general.architecture, general.quantization_version, general.file_type
-                            // Add count for our extra metadata
-                            metadata_count += extra_metadata.count();
+                            out_gguf.tensors = model_tensors;
 
-                            if (template_metadata) |meta| {
-                                metadata_count += @intCast(meta.count());
-                            } else if (f.metadata) |meta| {
-                                var it = meta.iterator();
-                                while (it.next()) |entry| {
-                                    if (entry.value_ptr.* == .string) metadata_count += 1;
-                                }
-                            }
+                            // standard metadata
+                            // TODO: determine from the source type
+                            try out_gguf.metadata.put("general.architecture", .{ .string = "sdxl" });
+                            try out_gguf.metadata.put("general.quantization_version", .{ .integer = 2 });
+                            // TODO: determine from the target dtype
+                            try out_gguf.metadata.put("general.file_type", .{ .integer = 1 });
 
-                            bytes_written += try gguf.writeHeaderTracked(writer, @intCast(f.tensors.items.len), metadata_count);
-
-                            // Write required GGUF metadata
-                            bytes_written += try gguf.writeMetadataKVStringTracked(writer, "general.architecture", "sdxl");
-                            bytes_written += try gguf.writeMetadataKVU32Tracked(writer, "general.quantization_version", 2);
-                            bytes_written += try gguf.writeMetadataKVU32Tracked(writer, "general.file_type", 1);
-
-                            // Write extra metadata (orig_shapes)
-                            var extra_it = extra_metadata.iterator();
-                            while (extra_it.next()) |entry| {
-                                bytes_written += try gguf.writeMetadataKVJsonTracked(writer, entry.key_ptr.*, entry.value_ptr.*);
-                            }
-
+                            // for all following metadata we use getOrPut so we don't overwrite
+                            // any metadata from the template
                             if (template_metadata) |meta| {
                                 var it = meta.iterator();
                                 while (it.next()) |entry| {
-                                    bytes_written += try gguf.writeMetadataKVJsonTracked(writer, entry.key_ptr.*, entry.value_ptr.*);
+                                    if (!out_gguf.metadata.contains(entry.key_ptr.*)) {
+                                        try out_gguf.metadata.put(entry.key_ptr.*, entry.value_ptr.*);
+                                    }
                                 }
                             } else {
+                                // any metadata from the source file
                                 if (f.metadata) |meta| {
                                     var it = meta.iterator();
                                     while (it.next()) |entry| {
-                                        if (entry.value_ptr.* == .string) {
-                                            bytes_written += try gguf.writeMetadataKVStringTracked(writer, entry.key_ptr.*, entry.value_ptr.string);
+                                        if (!out_gguf.metadata.contains(entry.key_ptr.*)) {
+                                            try out_gguf.metadata.put(entry.key_ptr.*, entry.value_ptr.*);
                                         }
                                     }
                                 }
                             }
 
-                            var current_offset: u64 = 0;
-                            for (f.tensors.items) |t| {
-                                const ggml_type = try gguf.GgmlType.fromSafetensorsType(t.type);
-                                bytes_written += try gguf.writeTensorInfoTracked(writer, t.name, t.dims, ggml_type, current_offset);
-
-                                const byte_size = t.size;
-                                var next_offset = current_offset + byte_size;
-                                const remainder = next_offset % 32;
-                                if (remainder != 0) next_offset += (32 - remainder);
-                                current_offset = next_offset;
-                            }
-
-                            try writer.flush();
-
-                            // Padding for data start - use tracked bytes instead of getPos()
-                            const padding_len = (32 - (bytes_written % 32)) % 32;
-                            if (padding_len > 0) {
-                                const zeros = [_]u8{0} ** 32;
-                                try writer.writeAll(zeros[0..padding_len]);
-                                bytes_written += padding_len;
-                                try writer.flush();
-                            }
-
-                            // Data Copy
-                            var copy_buf = try arena_alloc.alloc(u8, 1024 * 1024);
-                            var current_open_path: []const u8 = "";
-                            var current_file_handle: ?std.fs.File = null;
-                            var current_data_begin: u64 = 0;
-                            defer if (current_file_handle) |h| h.close();
-
-                            for (f.tensors.items) |t| {
-                                try stdout.print("Converting tensor {s}\n", .{t.name});
-                                try stdout.flush();
-                                const tensor_path = t.source_path orelse path;
-
-                                if (!std.mem.eql(u8, current_open_path, tensor_path)) {
-                                    if (current_file_handle) |h| h.close();
-
-                                    try stdout.print("Opening file {s}\n", .{tensor_path});
-                                    try stdout.flush();
-                                    const new_file = try std.fs.cwd().openFile(tensor_path, .{});
-                                    current_file_handle = new_file;
-                                    current_open_path = tensor_path;
-
-                                    var len_bytes: [8]u8 = undefined;
-                                    _ = try new_file.readAll(&len_bytes);
-                                    const st_len = std.mem.readInt(u64, len_bytes[0..8], .little);
-                                    current_data_begin = 8 + st_len;
-                                }
-
-                                if (current_file_handle) |h| {
-                                    try h.seekTo(current_data_begin + t.offset);
-                                    var left = t.size;
-                                    while (left > 0) {
-                                        const n = try h.read(copy_buf);
-                                        if (n == 0) return error.UnexpectedEof;
-                                        const take = @min(left, n);
-                                        try writer.writeAll(copy_buf[0..take]);
-                                        left -= take;
-                                    }
-                                }
-
-                                const padding = (32 - (t.size % 32)) % 32;
-                                if (padding > 0) {
-                                    const zeros = [_]u8{0} ** 32;
-                                    try writer.writeAll(zeros[0..padding]);
+                            // any extra metadata such as shape fix
+                            var extra_it = extra_metadata.iterator();
+                            while (extra_it.next()) |entry| {
+                                if (!out_gguf.metadata.contains(entry.key_ptr.*)) {
+                                    try out_gguf.metadata.put(entry.key_ptr.*, entry.value_ptr.*);
                                 }
                             }
-                            try writer.flush();
+
+                            try out_gguf.saveWithSTData(&f, stdout);
+
                             try stdout.print("Converted to {s}\n", .{out_filename});
                         },
                         .safetensors => {
@@ -418,7 +341,7 @@ pub fn main() !void {
             }
         },
         .gguf => {
-            var f = try gguf.init(path, arena_alloc);
+            var f = try gguf.init(path, arena_alloc, false);
             defer f.deinit();
 
             try stdout.print("GGUF format version {}\n", .{f.version});
