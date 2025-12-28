@@ -112,30 +112,33 @@ pub const Quantizer = struct {
     // Specific implementation for Q8_0
     // Reference: llama.cpp k_quantize_q8_0
     fn quantizeBlockQ8_0(src: []const f32, dst: []u8) void {
-        var amax: f32 = 0.0;
-        for (src) |v| {
-            const abs_v = @abs(v);
-            if (abs_v > amax) amax = abs_v;
+        const block_size = 32; // Number of elements per block in Q8_0 format
+        if (src.len != block_size) return; // Ensure the input length matches the expected block size
+
+        var amax: f32 = 0.0; // Absolute max value in the block
+
+        for (src) |value| {
+            amax = @max(@abs(value), amax);
         }
 
-        const d = amax / 127.0;
-        const id = if (d != 0) 1.0 / d else 0.0;
+        const d = amax / ((1 << 7) - 1);
+        // TODO: set this as f16 right off the bat rather than converting below?
+        const id: f32 = if (d != 0.0) 1.0 / d else 0.0;
 
-        // Store 'd' as f16 at the beginning
-        const d_f16: f16 = @floatCast(d);
-        const d_bytes = std.mem.asBytes(&d_f16);
-        dst[0] = d_bytes[0];
-        dst[1] = d_bytes[1];
+        // Store the scale factor in the first 2 bytes of the destination block
+        var dst_slice = std.mem.bytesAsSlice(f16, dst[0..2]);
+        const d_f16: f16 = @floatCast(d); // Cast f32 to f16 directly
+        dst_slice[0] = d_f16;
 
-        // Store quantized values
-        for (src, 0..) |v, j| {
-            // Round to nearest integer
-            const val = v * id;
-            // Clamp to -127..127
-            // Note: Zig's float -> int cast with @intFromFloat does truncation, so we round manually
-            const rounded = @round(val);
-            const clamped = std.math.clamp(rounded, -127.0, 127.0);
-            dst[2 + j] = @bitCast(@as(i8, @intFromFloat(clamped)));
+        // start at 2 so we don't overwrite the scale factor
+        var i: usize = 2;
+        for (src) |value| {
+            // Quantize the value
+            const quantized_val = value * id;
+            // round and cast to int
+            const qv: i8 = @intFromFloat(@round(quantized_val));
+            dst[i] = @bitCast(qv);
+            i += 1;
         }
     }
 };

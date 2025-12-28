@@ -189,7 +189,7 @@ pub fn main() !void {
                     } else {
                         if (datatype) |dtype| {
                             // set the data type of all the tensors to the passed in datatype
-                            try stdout.print("Will convert all tensors to type {s}\n", .{@tagName(dtype)});
+                            try stdout.print("Will convert all eligible tensors to type {s}\n", .{@tagName(dtype)});
                             try stdout.flush();
                             var offset: u64 = 0;
                             for (model_tensors.items) |*t| {
@@ -199,10 +199,16 @@ pub fn main() !void {
                                     // this one is too small to quantize, default to f32
                                     // TODO: prevent this from upcasting f16 and such
                                     t.type = "f32";
+                                    const fat_type = try gguf.GgmlType.fromString(t.type);
+                                    t.size = fat_type.calcSizeInBytes(num_elements);
                                 } else {
                                     t.type = @tagName(dtype);
+                                    t.size = dtype.calcSizeInBytes(num_elements);
                                 }
-                                t.size = dtype.calcSizeInBytes(num_elements);
+                                try stdout.print("Calculated size {} for type {s} with num elements {} with dims [", .{t.size, t.type, num_elements});
+                                for (t.dims) |d| try stdout.print("{}, ", .{d});
+                                try stdout.print("]\n", .{});
+                                try stdout.flush();
                                 // TODO: make this work with configurable alignment!
                                 const padding_len = (32 - (t.size % 32)) % 32;
                                 t.offset = offset;
