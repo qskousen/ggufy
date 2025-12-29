@@ -6,6 +6,7 @@ pub const FileType = enum {
 
     pub fn detect_from_file(reader: *std.io.Reader, allocator: std.mem.Allocator) !FileType {
         const file_header = try reader.readAlloc(allocator, 8);
+        defer allocator.free(file_header);
 
         // Check for GGUF magic "GGUF" followed by version (2 bytes) and tensor count
         if (std.mem.eql(u8, file_header[0..4], "GGUF")) {
@@ -39,4 +40,15 @@ pub const Tensor = struct {
     size: u64,
     offset: u64,
     source_path: ?[]const u8 = null,
+
+    pub fn dupe(self: Tensor, allocator: std.mem.Allocator) !Tensor {
+        return Tensor {
+            .name = try allocator.dupe(u8, self.name),
+            .type = try allocator.dupe(u8, self.type),
+            .dims = try allocator.dupe(usize, self.dims),
+            .size = self.size,
+            .offset = self.offset,
+            .source_path = allocator.dupe(u8, self.source_path.?) catch null,
+        };
+    }
 };

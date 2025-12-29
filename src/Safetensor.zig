@@ -3,6 +3,7 @@ const types = @import("types.zig");
 
 path: []const u8,
 allocator: std.mem.Allocator,
+arena_alloc: std.mem.Allocator,
 
 // We'll store parsed data here
 json_data: std.json.Parsed(std.json.Value),
@@ -17,7 +18,7 @@ pub const formatType = types.FileType.safetensors;
 
 const Safetensors = @This();
 
-pub fn init(path: []const u8, allocator: std.mem.Allocator) !Safetensors {
+pub fn init(path: []const u8, allocator: std.mem.Allocator, arena_alloc: std.mem.Allocator) !Safetensors {
     // 1. Detect if directory or file
     // 2. If directory (or index file), handle sharding logic
     // 3. Parse headers and populate tensors list
@@ -25,8 +26,9 @@ pub fn init(path: []const u8, allocator: std.mem.Allocator) !Safetensors {
     var self = Safetensors{
         .path = path,
         .allocator = allocator,
+        .arena_alloc = arena_alloc,
         .json_data = undefined,
-        .tensors = try std.ArrayList(types.Tensor).initCapacity(allocator, 200),
+        .tensors = try std.ArrayList(types.Tensor).initCapacity(arena_alloc, 200),
         .metadata = null,
         .current_file_handle = null,
         .current_open_path = "",
@@ -69,12 +71,7 @@ pub fn init(path: []const u8, allocator: std.mem.Allocator) !Safetensors {
 pub fn deinit(self: *Safetensors) void {
     if (self.current_file_handle) |h| h.close();
     self.json_data.deinit();
-    for (self.tensors.items) |t| {
-        self.allocator.free(t.name);
-        self.allocator.free(t.dims);
-        if (t.source_path) |p| self.allocator.free(p);
-    }
-    self.tensors.deinit(self.allocator);
+    // tensors and metadata are in an arena allocator, so we don't need to free them specifically
 }
 
 fn loadSingle(self: *Safetensors, path: []const u8) !void {
@@ -192,16 +189,15 @@ fn extractTensorsFromObject(self: *Safetensors, root: std.json.ObjectMap, source
     while (it.next()) |entry| {
         if (std.mem.eql(u8, entry.key_ptr.*, "__metadata__")) continue;
 
-        const name = try self.allocator.dupe(u8, entry.key_ptr.*);
-        errdefer self.allocator.free(name);
+        const name = try self.arena_alloc.dupe(u8, entry.key_ptr.*);
 
         const obj = entry.value_ptr.object;
         const dtype_str = obj.get("dtype").?.string;
         const dtype = try DType.fromString(dtype_str);
 
         const shape = obj.get("shape").?.array;
-        var dims = try self.allocator.alloc(usize, shape.items.len);
-        errdefer self.allocator.free(dims);
+        var dims = try self.arena_alloc.alloc(usize, shape.items.len);
+        errdefer self.arena_alloc.free(dims);
         for (shape.items, 0..) |item, i| {
             dims[i] = @intCast(item.integer);
         }
@@ -210,13 +206,13 @@ fn extractTensorsFromObject(self: *Safetensors, root: std.json.ObjectMap, source
         const start = @as(u64, @intCast(offsets.items[0].integer));
         const end = @as(u64, @intCast(offsets.items[1].integer));
 
-        try self.tensors.append(self.allocator, .{
+        try self.tensors.append(self.arena_alloc, .{
             .name = name,
             .type = @tagName(dtype),
             .dims = dims,
             .size = end - start,
             .offset = start,
-            .source_path = try self.allocator.dupe(u8, source_path),
+            .source_path = try self.arena_alloc.dupe(u8, source_path),
         });
     }
 }
@@ -390,7 +386,7 @@ pub const DType = enum {
 };
 
 pub fn buildTensorTree(self: Safetensors) !*TensorNode {
-    const root = try TensorNode.init(self.allocator, "root");
+    const root = try TensorNode.init(self.arena_alloc, "root");
     var json_data = try self.parseHeader();
     defer json_data.deinit();
 
@@ -409,7 +405,7 @@ pub fn buildTensorTree(self: Safetensors) !*TensorNode {
         while (parts.next()) |part| {
             const node = try current.children.getOrPut(part);
             if (!node.found_existing) {
-                node.value_ptr.* = try TensorNode.init(self.allocator, part);
+                node.value_ptr.* = try TensorNode.init(self.arena_alloc, part);
                 node.value_ptr.*.parent = current;
             }
             current = node.value_ptr.*;
@@ -420,11 +416,11 @@ pub fn buildTensorTree(self: Safetensors) !*TensorNode {
             current.dtype = try DType.fromString(dtype.string);
         }
         if (entry.value_ptr.*.object.get("shape")) |shape| {
-            var shape_list = try std.ArrayList(usize).initCapacity(self.allocator, shape.array.items.len);
+            var shape_list = try std.ArrayList(usize).initCapacity(self.arena_alloc, shape.array.items.len);
             for (shape.array.items) |item| {
-                try shape_list.append(self.allocator, @intCast(item.integer));
+                try shape_list.append(self.arena_alloc, @intCast(item.integer));
             }
-            current.shape = try shape_list.toOwnedSlice(self.allocator);
+            current.shape = try shape_list.toOwnedSlice(self.arena_alloc);
         }
         if (entry.value_ptr.*.object.get("data_offsets")) |offsets| {
             current.data_offsets = .{
@@ -438,8 +434,7 @@ pub fn buildTensorTree(self: Safetensors) !*TensorNode {
 }
 
 pub fn printTensorTree(self: Safetensors, writer: *std.io.Writer) !void {
-    const root = try TensorNode.init(self.allocator, "root");
-    defer root.deinit(self.allocator);
+    const root = try TensorNode.init(self.arena_alloc, "root");
 
     for (self.tensors.items) |t| {
         var parts = std.mem.splitAny(u8, t.name, ".");
@@ -447,7 +442,7 @@ pub fn printTensorTree(self: Safetensors, writer: *std.io.Writer) !void {
         while (parts.next()) |part| {
             const node = try current.children.getOrPut(part);
             if (!node.found_existing) {
-                node.value_ptr.* = try TensorNode.init(self.allocator, part);
+                node.value_ptr.* = try TensorNode.init(self.arena_alloc, part);
                 node.value_ptr.*.parent = current;
             }
             current = node.value_ptr.*;
@@ -559,29 +554,20 @@ pub fn getTensors(self: Safetensors) !std.ArrayList(types.Tensor) {
     const json_data = try self.parseHeader();
     defer json_data.deinit();
 
-    var tensors = try std.ArrayList(types.Tensor).initCapacity(self.allocator, 200);
-    errdefer {
-        for (tensors.items) |t| {
-            self.allocator.free(t.name);
-            self.allocator.free(t.dims);
-        }
-        tensors.deinit(self.allocator);
-    }
+    var tensors = try std.ArrayList(types.Tensor).initCapacity(self.arena_alloc, 200);
 
     var it = json_data.value.object.iterator();
     while (it.next()) |entry| {
         if (std.mem.eql(u8, entry.key_ptr.*, "__metadata__")) continue;
 
-        const name = try self.allocator.dupe(u8, entry.key_ptr.*);
-        errdefer self.allocator.free(name);
+        const name = try self.arena_alloc.dupe(u8, entry.key_ptr.*);
 
         const obj = entry.value_ptr.object;
         const dtype_str = obj.get("dtype").?.string;
         const dtype = try DType.fromString(dtype_str);
 
         const shape = obj.get("shape").?.array;
-        var dims = try self.allocator.alloc(usize, shape.items.len);
-        errdefer self.allocator.free(dims);
+        var dims = try self.arena_alloc.alloc(usize, shape.items.len);
         for (shape.items, 0..) |item, i| {
             dims[i] = @intCast(item.integer);
         }
@@ -590,7 +576,7 @@ pub fn getTensors(self: Safetensors) !std.ArrayList(types.Tensor) {
         const start = @as(u64, @intCast(offsets.items[0].integer));
         const end = @as(u64, @intCast(offsets.items[1].integer));
 
-        try tensors.append(self.allocator, .{
+        try tensors.append(self.arena_alloc, .{
             .name = name,
             .type = @tagName(dtype),
             .dims = dims,
@@ -602,10 +588,10 @@ pub fn getTensors(self: Safetensors) !std.ArrayList(types.Tensor) {
 }
 
 pub fn parseHeader(self: Safetensors) !std.json.Parsed(std.json.Value) {
-    const len = try self.reader.readAlloc(self.allocator, 8);
+    const len = try self.reader.readAlloc(self.arena_alloc, 8);
     const header_len = std.mem.readInt(u64, len[0..8], .little);
 
-    const data = try self.reader.readAlloc(self.allocator, header_len);
+    const data = try self.reader.readAlloc(self.arena_alloc, header_len);
 
-    return std.json.parseFromSlice(std.json.Value, self.allocator, data, .{});
+    return std.json.parseFromSlice(std.json.Value, self.arena_alloc, data, .{});
 }

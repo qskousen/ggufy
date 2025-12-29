@@ -6,6 +6,7 @@ const DataTransform = @import("DataTransform.zig");
 
 path: []const u8,
 allocator: std.mem.Allocator,
+arena_alloc: std.mem.Allocator,
 file: std.fs.File,
 
 tensors: std.ArrayList(types.Tensor),
@@ -20,7 +21,7 @@ pub const formatType = types.FileType.gguf;
 
 const Gguf = @This();
 
-pub fn init(path: []const u8, mem_allocator: std.mem.Allocator, overwrite: bool) !Gguf {
+pub fn init(path: []const u8, mem_allocator: std.mem.Allocator, arena_alloc: std.mem.Allocator, overwrite: bool) !Gguf {
     var file: std.fs.File = undefined;
     var is_new_file = false;
 
@@ -45,9 +46,10 @@ pub fn init(path: []const u8, mem_allocator: std.mem.Allocator, overwrite: bool)
         return Gguf{
             .path = path,
             .allocator = mem_allocator,
+            .arena_alloc = arena_alloc,
             .file = file,
-            .tensors = try std.ArrayList(types.Tensor).initCapacity(mem_allocator, 200),
-            .metadata = std.json.ObjectMap.init(mem_allocator),
+            .tensors = try std.ArrayList(types.Tensor).initCapacity(arena_alloc, 200),
+            .metadata = std.json.ObjectMap.init(arena_alloc),
             .version = 3,
             .data_offset = 0,
             .file_size = 0,
@@ -73,16 +75,17 @@ pub fn init(path: []const u8, mem_allocator: std.mem.Allocator, overwrite: bool)
     var self = Gguf{
         .path = path,
         .allocator = mem_allocator,
+        .arena_alloc = arena_alloc,
         .file = file,
-        .tensors = try std.ArrayList(types.Tensor).initCapacity(mem_allocator, 200),
-        .metadata = std.json.ObjectMap.init(mem_allocator),
+        .tensors = try std.ArrayList(types.Tensor).initCapacity(arena_alloc, 200),
+        .metadata = std.json.ObjectMap.init(arena_alloc),
         .version = 0,
         .data_offset = 0,
         .file_size = file_size,
     };
     errdefer {
         self.metadata.deinit();
-        self.tensors.deinit(mem_allocator);
+        self.tensors.deinit(arena_alloc);
     }
 
     const version_buffer = try reader.interface.readAlloc(mem_allocator, 4);
@@ -102,22 +105,21 @@ pub fn init(path: []const u8, mem_allocator: std.mem.Allocator, overwrite: bool)
 
     var i: u64 = 0;
     while (i < metadata_count) : (i += 1) {
-        var metadata = try GgufMetadata.read(&reader.interface, mem_allocator, &bytes_read);
-        defer metadata.deinit(mem_allocator);
+        var metadata = try GgufMetadata.read(&reader.interface, arena_alloc, &bytes_read);
+        defer metadata.deinit(arena_alloc);
 
         const val = try self.readGgufValueAsJson(&reader.interface, metadata.value_type, &bytes_read);
-        try self.metadata.put(try mem_allocator.dupe(u8, metadata.title), val);
+        try self.metadata.put(try arena_alloc.dupe(u8, metadata.title), val);
     }
 
-    try self.tensors.ensureTotalCapacity(self.allocator, tensor_count);
+    try self.tensors.ensureTotalCapacity(self.arena_alloc, tensor_count);
     var ti: u64 = 0;
     while (ti < tensor_count) : (ti += 1) {
         const str_len_buf = try reader.interface.readAlloc(mem_allocator, 8);
         defer mem_allocator.free(str_len_buf);
         bytes_read += 8;
         const str_len = std.mem.readInt(i64, str_len_buf[0..8], .little);
-        const name = try reader.interface.readAlloc(mem_allocator, @intCast(str_len));
-        errdefer mem_allocator.free(name);
+        const name = try reader.interface.readAlloc(arena_alloc, @intCast(str_len));
         bytes_read += @intCast(str_len);
 
         const dim_count_buf = try reader.interface.readAlloc(mem_allocator, 4);
@@ -125,8 +127,7 @@ pub fn init(path: []const u8, mem_allocator: std.mem.Allocator, overwrite: bool)
         bytes_read += 4;
         const dim_count = std.mem.readInt(u32, dim_count_buf[0..4], .little);
 
-        var dims = try mem_allocator.alloc(usize, dim_count);
-        errdefer mem_allocator.free(dims);
+        var dims = try arena_alloc.alloc(usize, dim_count);
 
         var j: u64 = 0;
         while (j < dim_count) : (j += 1) {
@@ -146,7 +147,7 @@ pub fn init(path: []const u8, mem_allocator: std.mem.Allocator, overwrite: bool)
         bytes_read += 8;
         const tensor_offset = std.mem.readInt(u64, offset_buf[0..8], .little);
 
-        try self.tensors.append(self.allocator, .{
+        try self.tensors.append(self.arena_alloc, .{
             .name = name,
             .type = @tagName(tensor_type),
             .dims = dims,
@@ -166,12 +167,7 @@ pub fn init(path: []const u8, mem_allocator: std.mem.Allocator, overwrite: bool)
 
 pub fn deinit(self: *Gguf) void {
     self.file.close();
-    self.metadata.deinit();
-    for (self.tensors.items) |t| {
-        self.allocator.free(t.name);
-        self.allocator.free(t.dims);
-    }
-    self.tensors.deinit(self.allocator);
+    // tensors info and metadata use arena allocation, so freeing them specifically is not needed
 }
 
 pub const GgufValueType = enum(u32) {
@@ -311,6 +307,7 @@ const GgufMetadata = struct {
 
     pub fn read(reader: *std.io.Reader, allocator: std.mem.Allocator, bytes_read: *u64) !GgufMetadata {
         var len_buffer = try reader.readAlloc(allocator, 8);
+        defer allocator.free(len_buffer);
         bytes_read.* += 8;
         const title_len = std.mem.readInt(u64, len_buffer[0..8], .little);
 
@@ -324,6 +321,7 @@ const GgufMetadata = struct {
         bytes_read.* += title_len;
 
         const type_buf = try reader.readAlloc(allocator, 4);
+        defer allocator.free(type_buf);
         bytes_read.* += 4;
         const value_type = @as(GgufValueType, @enumFromInt(std.mem.readInt(u32, type_buf[0..4], .little)));
 
@@ -766,14 +764,14 @@ pub fn writeTemplate(self: Gguf, writer: *std.io.Writer) !void {
     try root_obj.put("metadata", std.json.Value{ .object = self.metadata });
 
     // Tensors
-    var tensors_obj = std.json.ObjectMap.init(self.allocator);
+    var tensors_obj = std.json.ObjectMap.init(self.arena_alloc);
     errdefer tensors_obj.deinit();
 
     for (self.tensors.items) |t| {
-        var t_obj = std.json.ObjectMap.init(self.allocator);
+        var t_obj = std.json.ObjectMap.init(self.arena_alloc);
         errdefer t_obj.deinit();
 
-        var shape_arr = std.json.Array.init(self.allocator);
+        var shape_arr = std.json.Array.init(self.arena_alloc);
         errdefer shape_arr.deinit();
         for (t.dims) |dim| {
             try shape_arr.append(std.json.Value{ .integer = @intCast(dim) });
@@ -781,7 +779,7 @@ pub fn writeTemplate(self: Gguf, writer: *std.io.Writer) !void {
         try t_obj.put("shape", std.json.Value{ .array = shape_arr });
         try t_obj.put("type", std.json.Value{ .string = t.type });
 
-        try tensors_obj.put(try self.allocator.dupe(u8, t.name), std.json.Value{ .object = t_obj });
+        try tensors_obj.put(try self.arena_alloc.dupe(u8, t.name), std.json.Value{ .object = t_obj });
     }
     try root_obj.put("tensors", std.json.Value{ .object = tensors_obj });
 
@@ -804,77 +802,77 @@ pub fn writeTemplate(self: Gguf, writer: *std.io.Writer) !void {
 fn readGgufValueAsJson(self: Gguf, reader: *std.io.Reader, value_type: GgufValueType, bytes_read: *u64) !std.json.Value {
     return switch (value_type) {
         .bool => {
-            const buf = try reader.readAlloc(self.allocator, 1);
+            const buf = try reader.readAlloc(self.arena_alloc, 1);
             bytes_read.* += 1;
             return std.json.Value{ .bool = buf[0] != 0 };
         },
         .uint8 => {
-            const buf = try reader.readAlloc(self.allocator, 1);
+            const buf = try reader.readAlloc(self.arena_alloc, 1);
             bytes_read.* += 1;
             return std.json.Value{ .integer = buf[0] };
         },
         .int8 => {
-            const buf = try reader.readAlloc(self.allocator, 1);
+            const buf = try reader.readAlloc(self.arena_alloc, 1);
             bytes_read.* += 1;
             return std.json.Value{ .integer = @as(i8, @bitCast(buf[0])) };
         },
         .uint16 => {
-            const buf = try reader.readAlloc(self.allocator, 2);
+            const buf = try reader.readAlloc(self.arena_alloc, 2);
             bytes_read.* += 2;
             return std.json.Value{ .integer = std.mem.readInt(u16, buf[0..2], .little) };
         },
         .int16 => {
-            const buf = try reader.readAlloc(self.allocator, 2);
+            const buf = try reader.readAlloc(self.arena_alloc, 2);
             bytes_read.* += 2;
             return std.json.Value{ .integer = std.mem.readInt(i16, buf[0..2], .little) };
         },
         .uint32 => {
-            const buf = try reader.readAlloc(self.allocator, 4);
+            const buf = try reader.readAlloc(self.arena_alloc, 4);
             bytes_read.* += 4;
             return std.json.Value{ .integer = std.mem.readInt(u32, buf[0..4], .little) };
         },
         .int32 => {
-            const buf = try reader.readAlloc(self.allocator, 4);
+            const buf = try reader.readAlloc(self.arena_alloc, 4);
             bytes_read.* += 4;
             return std.json.Value{ .integer = std.mem.readInt(i32, buf[0..4], .little) };
         },
         .float32 => {
-            const buf = try reader.readAlloc(self.allocator, 4);
+            const buf = try reader.readAlloc(self.arena_alloc, 4);
             bytes_read.* += 4;
             return std.json.Value{ .float = @as(f32, @bitCast(std.mem.readInt(u32, buf[0..4], .little))) };
         },
         .uint64 => {
-            const buf = try reader.readAlloc(self.allocator, 8);
+            const buf = try reader.readAlloc(self.arena_alloc, 8);
             bytes_read.* += 8;
             return std.json.Value{ .integer = @intCast(std.mem.readInt(u64, buf[0..8], .little)) };
         },
         .int64 => {
-            const buf = try reader.readAlloc(self.allocator, 8);
+            const buf = try reader.readAlloc(self.arena_alloc, 8);
             bytes_read.* += 8;
             return std.json.Value{ .integer = std.mem.readInt(i64, buf[0..8], .little) };
         },
         .float64 => {
-            const buf = try reader.readAlloc(self.allocator, 8);
+            const buf = try reader.readAlloc(self.arena_alloc, 8);
             bytes_read.* += 8;
             return std.json.Value{ .float = @as(f64, @bitCast(std.mem.readInt(u64, buf[0..8], .little))) };
         },
         .string => {
-            const buf = try reader.readAlloc(self.allocator, 8);
+            const buf = try reader.readAlloc(self.arena_alloc, 8);
             bytes_read.* += 8;
             const str_len = std.mem.readInt(i64, buf[0..8], .little);
-            const str = try reader.readAlloc(self.allocator, @intCast(str_len));
+            const str = try reader.readAlloc(self.arena_alloc, @intCast(str_len));
             bytes_read.* += @intCast(str_len);
             return std.json.Value{ .string = str };
         },
         .array => {
-            const type_buf = try reader.readAlloc(self.allocator, 4);
+            const type_buf = try reader.readAlloc(self.arena_alloc, 4);
             bytes_read.* += 4;
             const array_type = @as(GgufValueType, @enumFromInt(std.mem.readInt(u32, type_buf[0..4], .little)));
-            var len_buf = try reader.readAlloc(self.allocator, 8);
+            var len_buf = try reader.readAlloc(self.arena_alloc, 8);
             bytes_read.* += 8;
             const arr_len = std.mem.readInt(i64, len_buf[0..8], .little);
 
-            var arr = std.json.Array.init(self.allocator);
+            var arr = std.json.Array.init(self.arena_alloc);
             errdefer arr.deinit();
             var j: i64 = 0;
             while (j < arr_len) : (j += 1) {

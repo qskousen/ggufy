@@ -84,11 +84,11 @@ pub fn main() !void {
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    const file_type = types.FileType.detect_from_file(&reader.interface, arena_alloc) catch types.FileType.safetensors;
+    const file_type = types.FileType.detect_from_file(&reader.interface, allocator) catch types.FileType.safetensors;
     try reader.seekTo(0);
     switch (file_type) {
         .safetensors => {
-            var f = try st.init(path, arena_alloc);
+            var f = try st.init(path, allocator, arena_alloc);
             defer f.deinit();
 
             switch (command) {
@@ -106,7 +106,7 @@ pub fn main() !void {
                     var model_tensors = try std.ArrayList(types.Tensor).initCapacity(arena_alloc, f.tensors.items.len);
 
                     // detect architecture
-                    const arch = try imagearch.detectArchFromTensorsOrError(f.tensors.items, allocator);
+                    const arch = try imagearch.detectArchFromTensorsOrError(f.tensors.items, arena_alloc);
                     try stdout.print("Detected architecture: {s}", .{arch.name});
                     try stdout.flush();
 
@@ -114,7 +114,7 @@ pub fn main() !void {
                     for (f.tensors.items) |t| {
                         if (std.mem.startsWith(u8, t.name, "model.")) {
                             if (! arch.shouldIgnore(t.name)) {
-                                try model_tensors.append(arena_alloc, t);
+                                try model_tensors.append(arena_alloc, try t.dupe(arena_alloc));
                             }
                         } else {
                             try stdout.print("Filtering out tensor: {s}\n", .{t.name});
@@ -123,7 +123,7 @@ pub fn main() !void {
                     // Strip prefixes from tensor names
                     for (model_tensors.items) |*t| {
                         const stripped_name = imagearch.stripPrefix(t.name);
-                        t.name = stripped_name;
+                        t.name = try arena_alloc.dupe(u8, stripped_name);
                     }
 
                     var template_metadata: ?std.json.ObjectMap = null;
@@ -160,7 +160,7 @@ pub fn main() !void {
 
                             if (source_tensor) |st_t| {
                                 const target_shape_arr = target_info.get("shape").?.array;
-                                var target_dims = try arena_alloc.alloc(usize, target_shape_arr.items.len);
+                                var target_dims = try allocator.alloc(usize, target_shape_arr.items.len);
                                 var target_elements: u64 = 1;
                                 for (target_shape_arr.items, 0..) |item, i| {
                                     // Templates generated from GGUF have reversed dimensions.
@@ -246,7 +246,6 @@ pub fn main() !void {
 
                                 // Reshape tensor to (N/256, 256)
                                 // Note: This changes the logical dimensions stored in GGUF.
-                                // It does NOT require reordering the raw bytes on disk (row-major standard).
                                 var new_dims = try arena_alloc.alloc(usize, 2);
                                 new_dims[0] = n_elements / 256;
                                 new_dims[1] = 256;
@@ -289,16 +288,16 @@ pub fn main() !void {
 
                             const out_filename = try std.fs.path.join(arena_alloc, &[_][]const u8{ dir_path, try std.fmt.allocPrint(arena_alloc, "{s}.gguf", .{base_name}) });
 
-                            var out_gguf = try gguf.init(out_filename, arena_alloc, true);
+                            var out_gguf = try gguf.init(out_filename, allocator, arena_alloc, true);
                             defer out_gguf.deinit();
 
                             out_gguf.tensors = model_tensors;
 
                             // standard metadata
-                            try out_gguf.metadata.put("general.architecture", .{ .string = arch.name });
-                            try out_gguf.metadata.put("general.quantization_version", .{ .integer = 2 });
+                            try out_gguf.metadata.put(try arena_alloc.dupe(u8, "general.architecture"), .{ .string = arch.name });
+                            try out_gguf.metadata.put(try arena_alloc.dupe(u8, "general.quantization_version"), .{ .integer = 2 });
                             // TODO: determine from the target dtype
-                            try out_gguf.metadata.put("general.file_type", .{ .integer = 1 });
+                            try out_gguf.metadata.put(try arena_alloc.dupe(u8, "general.file_type"), .{ .integer = 1 });
 
                             // for all following metadata we use getOrPut so we don't overwrite
                             // any metadata from the template
@@ -306,7 +305,7 @@ pub fn main() !void {
                                 var it = meta.iterator();
                                 while (it.next()) |entry| {
                                     if (!out_gguf.metadata.contains(entry.key_ptr.*)) {
-                                        try out_gguf.metadata.put(entry.key_ptr.*, entry.value_ptr.*);
+                                        try out_gguf.metadata.put(try arena_alloc.dupe(u8, entry.key_ptr.*), entry.value_ptr.*);
                                     }
                                 }
                             } else {
@@ -315,7 +314,7 @@ pub fn main() !void {
                                     var it = meta.iterator();
                                     while (it.next()) |entry| {
                                         if (!out_gguf.metadata.contains(entry.key_ptr.*)) {
-                                            try out_gguf.metadata.put(entry.key_ptr.*, entry.value_ptr.*);
+                                            try out_gguf.metadata.put(try arena_alloc.dupe(u8, entry.key_ptr.*), entry.value_ptr.*);
                                         }
                                     }
                                 }
@@ -325,7 +324,7 @@ pub fn main() !void {
                             var extra_it = extra_metadata.iterator();
                             while (extra_it.next()) |entry| {
                                 if (!out_gguf.metadata.contains(entry.key_ptr.*)) {
-                                    try out_gguf.metadata.put(entry.key_ptr.*, entry.value_ptr.*);
+                                    try out_gguf.metadata.put(try arena_alloc.dupe(u8, entry.key_ptr.*), entry.value_ptr.*);
                                 }
                             }
 
@@ -344,7 +343,7 @@ pub fn main() !void {
             }
         },
         .gguf => {
-            var f = try gguf.init(path, arena_alloc, false);
+            var f = try gguf.init(path, allocator, arena_alloc, false);
             defer f.deinit();
 
             try stdout.print("GGUF format version {}\n", .{f.version});
@@ -376,6 +375,6 @@ pub fn main() !void {
             }
         },
     }
-    try stdout.print("Total bytes used in arena allocator: {}\n", .{arena.queryCapacity()});
+    //try stdout.print("Total bytes used in arena allocator: {}\n", .{arena.queryCapacity()});
     try stdout.flush();
 }
