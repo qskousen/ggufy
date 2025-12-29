@@ -22,12 +22,13 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const params = comptime clap.parseParamsComptime(
-        \\-h, --help                 Display this help and exit.
-        \\-d, --datatype <DATATYPE>  When converting, the target datatype (default fp16).
-        \\-f, --filetype <FILETYPE>  When converting, the target filetype: gguf (default), safetensors.
-        \\-t, --template <FILENAME>  When converting, specify a template to use.
-        \\-o, --output-dir <DIR>     Output directory (default: same as source file).
+        \\-h, --help                     Display this help and exit.
+        \\-d, --datatype <DATATYPE>      When converting, the target datatype (default fp16).
+        \\-f, --filetype <FILETYPE>      When converting, the target filetype: gguf (default), safetensors.
+        \\-t, --template <FILENAME>      When converting, specify a template to use.
+        \\-o, --output-dir <DIR>         Output directory (default: same as source file).
         \\-n, --output-name <FILENAME>   Output filename without extension (default: source name + datatype).
+        \\-j, --threads <INT>            Threads to use when quantizing.
         \\<COMMAND>    Specify a command: header, tree, metadata, convert, template
         \\<FILENAME>   The file to use for input
     );
@@ -38,6 +39,7 @@ pub fn main() !void {
         .COMMAND = clap.parsers.enumeration(Command),
         .FILENAME = clap.parsers.string,
         .DIR = clap.parsers.string,
+        .INT = clap.parsers.int(usize, 10),
     };
 
     // Initialize our diagnostics, which can be used for reporting useful errors.
@@ -73,6 +75,7 @@ pub fn main() !void {
     const template_path = res.args.template;
     const output_dir = res.args.@"output-dir";
     const output_name = res.args.@"output-name";
+    const threads = res.args.threads orelse @max(1, try std.Thread.getCpuCount() - 2);
 
     const file = try std.fs.cwd().openFile(path, .{ .mode = .read_only });
     defer file.close();
@@ -328,7 +331,7 @@ pub fn main() !void {
                                 }
                             }
 
-                            try out_gguf.saveWithSTData(&f, stdout);
+                            try out_gguf.saveWithSTData(&f, stdout, threads);
 
                             try stdout.print("Converted to {s}\n", .{out_filename});
                         },

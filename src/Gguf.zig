@@ -337,7 +337,7 @@ const GgufMetadata = struct {
     }
 };
 
-pub fn saveWithSTData(self: Gguf, source: *st, stdout: *std.io.Writer) !void {
+pub fn saveWithSTData(self: Gguf, source: *st, stdout: *std.io.Writer, threads: usize) !void {
     // we need to track bytes written for calculating alignment for the starting tensor
     var bytes_written: u64 = 0;
 
@@ -379,6 +379,7 @@ pub fn saveWithSTData(self: Gguf, source: *st, stdout: *std.io.Writer) !void {
     // we need to write them in the order of our tensors, but there is no guarantee that the source tensors will be in the same order
     // the names might also be different, so we have to do some matching
     var read_buffer: [1024 * 1024]u8 = undefined;
+    var count: u64 = 1;
     for (self.tensors.items) |t| {
         // try to find the matching tensor in the source
         var matched = false;
@@ -389,7 +390,7 @@ pub fn saveWithSTData(self: Gguf, source: *st, stdout: *std.io.Writer) !void {
                     std.mem.endsWith(u8, source_tensor.name, t.name)))
                 {
                     matched = true;
-                    try stdout.print("Writing tensor data for tensor {s}\n", .{t.name});
+                    try stdout.print("Writing tensor data for tensor {}/{} {s}\n", .{count, self.tensors.items.len, t.name});
                     try stdout.flush();
                     // convert source tensor type to gguf type
                     const source_dtype = try GgmlType.fromSafetensorsType(source_tensor.type);
@@ -397,12 +398,12 @@ pub fn saveWithSTData(self: Gguf, source: *st, stdout: *std.io.Writer) !void {
                     // get a reader from the source
                     var reader = try source.getReaderForTensor(source_tensor.name, &read_buffer);
                     try reader.seekTo(source_tensor.offset + source.current_data_begin);
-                    try self.writeTensorData(t, source_dtype, &reader.interface, &writer.interface);
+                    try self.writeTensorData(t, source_dtype, &reader.interface, &writer.interface, threads);
 
                     // write padding for alignment if needed
                     const size = try Gguf.calculateTensorSize(t);
                     try self.maybeWritePadding(size, &writer.interface);
-
+                    count += 1;
                 }
         }
         if (! matched) {
@@ -431,7 +432,7 @@ fn maybeWritePadding(self: Gguf, size: u64, writer: *std.io.Writer) !void {
     }
 }
 
-pub fn writeTensorData(self: Gguf, t: types.Tensor, source_dtype: GgmlType, reader: *std.io.Reader, writer: *std.io.Writer) !void {
+pub fn writeTensorData(self: Gguf, t: types.Tensor, source_dtype: GgmlType, reader: *std.io.Reader, writer: *std.io.Writer, threads: usize) !void {
     try self.file.seekTo(self.data_offset + t.offset);
 
     const target_dtype = try GgmlType.fromString(t.type);
@@ -457,6 +458,7 @@ pub fn writeTensorData(self: Gguf, t: types.Tensor, source_dtype: GgmlType, read
             source_dtype,
             target_dtype,
             n_elements,
+            threads,
         );
         defer self.allocator.free(converted_data);
 

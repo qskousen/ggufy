@@ -2,15 +2,6 @@ const std = @import("std");
 const gguf = @import("Gguf.zig");
 
 pub const Quantizer = struct {
-    // Determine the size of the output buffer needed
-    pub fn calcOutputSize(dst_type: gguf.GgmlType, element_count: u64) usize {
-        const block_size = dst_type.getBlockSize();
-        const type_size = dst_type.getBytesPerBlock();
-        // Ensure we round up to full blocks if element_count isn't a perfect multiple
-        const blocks = (element_count + block_size - 1) / block_size;
-        return @intCast(blocks * type_size);
-    }
-
     // Main entry point: Source -> F32 -> Dest
     pub fn convertTensorData(
         allocator: std.mem.Allocator,
@@ -18,6 +9,7 @@ pub const Quantizer = struct {
         src_type: gguf.GgmlType,
         dst_type: gguf.GgmlType,
         element_count: u64,
+        threads: usize,
     ) ![]u8 {
         // Optimization: Direct copy if types match
         if (src_type == dst_type) {
@@ -38,7 +30,7 @@ pub const Quantizer = struct {
         const out_buffer = try allocator.alloc(u8, out_size);
         errdefer allocator.free(out_buffer); // Free on error, otherwise return ownership
 
-        try quantizeFromF32(f32_buffer, out_buffer, dst_type);
+        try quantizeFromF32(f32_buffer, out_buffer, dst_type, allocator, threads);
 
         return out_buffer;
     }
@@ -71,7 +63,7 @@ pub const Quantizer = struct {
         }
     }
 
-    fn quantizeFromF32(input_f32: []const f32, output_bytes: []u8, dst_type: gguf.GgmlType) !void {
+    fn quantizeFromF32(input_f32: []const f32, output_bytes: []u8, dst_type: gguf.GgmlType, allocator: std.mem.Allocator, threads: usize) !void {
         switch (dst_type) {
             .f32 => {
                 const out_slice = std.mem.bytesAsSlice(f32, output_bytes);
@@ -87,25 +79,53 @@ pub const Quantizer = struct {
                 // Q8_0: 32 values per block.
                 // Block structure: delta (f16), followed by 32 int8 quants.
                 // Total bytes: 2 + 32 = 34 bytes.
-                const block_size = 32;
+                const block_elements = 32;
+                const block_size = 34;
                 const element_count = input_f32.len;
-                const block_count = element_count / block_size;
+                const block_count = element_count / block_elements;
 
                 // Ensure output buffer is large enough
                 if (output_bytes.len < block_count * 34) return error.OutputBufferTooSmall;
 
+                var pool: std.Thread.Pool = undefined;
+                try pool.init(.{
+                    .allocator = allocator,
+                    .n_jobs = threads,
+                });
+                defer pool.deinit();
+
+                var wg: std.Thread.WaitGroup = .{};
+
+                // divide blocks up for threads
+                const blocks_per_thread = block_count / threads;
+                const leftover = block_count - (blocks_per_thread * threads);
+
                 var i: usize = 0;
-                while (i < block_count) : (i += 1) {
-                    const src_offset = i * block_size;
-                    const dst_offset = i * 34; // 2 bytes delta + 32 bytes data
-
-                    const src_block = input_f32[src_offset .. src_offset + block_size];
-                    const dst_block = output_bytes[dst_offset .. dst_offset + 34];
-
-                    quantizeBlockQ8_0(src_block, dst_block);
+                while (i < threads) : (i += 1) {
+                    const start = i * blocks_per_thread;
+                    var end = start + blocks_per_thread;
+                    if (i == threads - 1) {
+                        end += leftover;
+                    }
+                    std.log.debug("Spawning a task for blocks {} - {} of {}", .{start, end, block_count});
+                    pool.spawnWg(&wg, processBlocks, .{input_f32, output_bytes, start, end, block_elements, block_size, quantizeBlockQ8_0});
                 }
+                wg.wait();
             },
             else => return error.UnsupportedDestinationType,
+        }
+    }
+
+    fn processBlocks(input_f32: []const f32, output_bytes: []u8, start: usize, end: usize, block_elements: usize, block_size: usize, comptime func: anytype) void {
+        var i = start;
+        while (i < end) : (i += 1) {
+            const src_offset = i * block_elements;
+            const dst_offset = i * block_size; // 2 bytes delta + 32 bytes data
+
+            const src_block = input_f32[src_offset .. src_offset + block_elements];
+            const dst_block = output_bytes[dst_offset .. dst_offset + 34];
+
+            func(src_block, dst_block);
         }
     }
 
