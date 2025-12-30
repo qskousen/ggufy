@@ -234,7 +234,8 @@ pub const GgmlType = enum(u32) {
     }
 
     pub fn fromString(value: []const u8) !GgmlType {
-        return std.meta.stringToEnum(GgmlType, value) orelse error.InvalidGgmlType;
+        var lower: [12]u8 = [_]u8{0} ** 12;
+        return std.meta.stringToEnum(GgmlType, std.ascii.lowerString(&lower, value)) orelse error.InvalidGgmlType;
     }
 
     pub fn isUnsupported(self: GgmlType) bool {
@@ -360,6 +361,7 @@ pub fn saveWithSTData(self: Gguf, source: *st, stdout: *std.io.Writer, threads: 
     try stdout.flush();
     var offset: u64 = 0;
     for (self.tensors.items) |t| {
+        std.log.debug("Trying to convert {s} to GgmlType", .{t.type});
         const d_type = try GgmlType.fromString(t.type);
         bytes_written += try Gguf.writeTensorInfoTracked(&writer.interface, t.name, t.dims, d_type, offset);
         // TODO: when we start converting, the size is going to change maybe? or that may be already determined at this point

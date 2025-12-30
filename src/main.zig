@@ -109,14 +109,14 @@ pub fn main() !void {
                     var model_tensors = try std.ArrayList(types.Tensor).initCapacity(arena_alloc, f.tensors.items.len);
 
                     // detect architecture
-                    const arch = try imagearch.detectArchFromTensorsOrError(f.tensors.items, arena_alloc);
+                    const arch = try imagearch.detectArchFromTensorsOrError(f.tensors.items, allocator);
                     try stdout.print("Detected architecture: {s}", .{arch.name});
                     try stdout.flush();
 
                     // First, filter out any tensors that don't start with "model."
                     for (f.tensors.items) |t| {
                         if (std.mem.startsWith(u8, t.name, "model.")) {
-                            if (! arch.shouldIgnore(t.name)) {
+                            if (!arch.shouldIgnore(t.name)) {
                                 try model_tensors.append(arena_alloc, try t.dupe(arena_alloc));
                             }
                         } else {
@@ -190,35 +190,39 @@ pub fn main() !void {
                         }
                         model_tensors = filtered_tensors;
                     } else {
-                        if (datatype) |dtype| {
-                            // set the data type of all the tensors to the passed in datatype
-                            try stdout.print("Will convert all eligible tensors to type {s}\n", .{@tagName(dtype)});
-                            try stdout.flush();
-                            var offset: u64 = 0;
-                            for (model_tensors.items) |*t| {
-                                var num_elements: u64 = 1;
-                                for (t.dims) |d| num_elements *= d;
-                                if (num_elements < QUANTIZATION_THRESHOLD) {
-                                    // this one is too small to quantize, default to f32
-                                    // TODO: prevent this from upcasting f16 and such
-                                    t.type = "f32";
-                                    const fat_type = try gguf.GgmlType.fromString(t.type);
-                                    t.size = fat_type.calcSizeInBytes(num_elements);
-                                } else {
+                        try stdout.flush();
+                        var offset: u64 = 0;
+                        for (model_tensors.items) |*t| {
+                            var num_elements: u64 = 1;
+                            for (t.dims) |d| num_elements *= d;
+                            if (num_elements < QUANTIZATION_THRESHOLD) {
+                                // this one is too small to quantize
+                                // pass it through unchanged
+                            } else {
+                                if (datatype) |dtype| {
+                                    // set the data type of tensor to the passed in datatype
+                                    std.log.debug("Will convert tensor {s} to type {s}", .{t.name, @tagName(dtype)});
                                     t.type = @tagName(dtype);
                                     t.size = dtype.calcSizeInBytes(num_elements);
                                 }
-                                try stdout.print("Calculated size {} for type {s} with num elements {} with dims [", .{t.size, t.type, num_elements});
-                                for (t.dims) |d| try stdout.print("{}, ", .{d});
-                                try stdout.print("]\n", .{});
-                                try stdout.flush();
-                                // TODO: make this work with configurable alignment!
-                                const padding_len = (32 - (t.size % 32)) % 32;
-                                t.offset = offset;
-                                offset += t.size + padding_len;
                             }
+                            // comfyui gguf can't do f64 currently, need to downcast these to f32
+                            // TODO: make this optional
+                            if (std.mem.eql(u8, t.type, "f64") or std.mem.eql(u8, t.type, "F64")) {
+                                std.log.info("Downcasting unsupported f64 to f32 for tensor {s}", .{t.name});
+                                t.type = "f32";
+                                const fat_type = try gguf.GgmlType.fromString(t.type);
+                                t.size = fat_type.calcSizeInBytes(num_elements);
+                            }
+                            try stdout.print("Calculated size {} for type {s} with num elements {} with dims [", .{ t.size, t.type, num_elements });
+                            for (t.dims) |d| try stdout.print("{}, ", .{d});
+                            try stdout.print("]\n", .{});
+                            try stdout.flush();
+                            // TODO: make this work with configurable alignment!
+                            const padding_len = (32 - (t.size % 32)) % 32;
+                            t.offset = offset;
+                            offset += t.size + padding_len;
                         }
-                        // otherwise, we just pass through the types unchanged
                     }
 
                     // Initializes a map to hold extra metadata generated by the fix.
