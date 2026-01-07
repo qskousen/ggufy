@@ -34,7 +34,7 @@ pub fn main() !void {
     );
 
     const parsers = comptime .{
-        .DATATYPE = clap.parsers.enumeration(gguf.GgmlType),
+        .DATATYPE = clap.parsers.enumeration(types.DataType),
         .FILETYPE = clap.parsers.enumeration(types.FileType),
         .COMMAND = clap.parsers.enumeration(Command),
         .FILENAME = clap.parsers.string,
@@ -71,14 +71,13 @@ pub fn main() !void {
     const command = res.positionals[0] orelse return error.MissingCommand;
     const path = res.positionals[1] orelse return error.MissingModelPath;
     const filetype = res.args.filetype orelse types.FileType.gguf;
-    const datatype: ?gguf.GgmlType = res.args.datatype;
+    const datatype: ?types.DataType = res.args.datatype;
     const template_path = res.args.template;
     const output_dir = res.args.@"output-dir";
     const output_name = res.args.@"output-name";
     const threads = res.args.threads orelse @max(1, try std.Thread.getCpuCount() - 2);
 
     const file = try std.fs.cwd().openFile(path, .{ .mode = .read_only });
-    defer file.close();
 
     var read_buffer: [8]u8 = undefined;
     var reader = file.reader(&read_buffer);
@@ -88,7 +87,7 @@ pub fn main() !void {
     const arena_alloc = arena.allocator();
 
     const file_type = types.FileType.detect_from_file(&reader.interface, allocator) catch types.FileType.safetensors;
-    try reader.seekTo(0);
+    file.close();
     switch (file_type) {
         .safetensors => {
             var f = try st.init(path, allocator, arena_alloc);
@@ -110,7 +109,8 @@ pub fn main() !void {
 
                     // detect architecture
                     const arch = try imagearch.detectArchFromTensorsOrError(f.tensors.items, allocator);
-                    try stdout.print("Detected architecture: {s}", .{arch.name});
+                    const threshhold = arch.threshhold orelse QUANTIZATION_THRESHOLD;
+                    try stdout.print("Detected architecture: {s}\n", .{arch.name});
                     try stdout.flush();
 
                     // First, filter out any tensors that don't start with "model."
@@ -195,21 +195,30 @@ pub fn main() !void {
                         for (model_tensors.items) |*t| {
                             var num_elements: u64 = 1;
                             for (t.dims) |d| num_elements *= d;
-                            if (num_elements < QUANTIZATION_THRESHOLD) {
+                            if (num_elements < threshhold) {
                                 // this one is too small to quantize
                                 // pass it through unchanged
                             } else {
                                 if (datatype) |dtype| {
+                                    // convert from datatype to ggml type
+                                    const ggml_type = try gguf.GgmlType.fromString(@tagName(dtype));
                                     // set the data type of tensor to the passed in datatype
-                                    std.log.debug("Will convert tensor {s} to type {s}", .{t.name, @tagName(dtype)});
-                                    t.type = @tagName(dtype);
-                                    t.size = dtype.calcSizeInBytes(num_elements);
+                                    std.log.debug("Will convert tensor {s} to type {s}", .{t.name, @tagName(ggml_type)});
+                                    t.type = @tagName(ggml_type);
+                                    t.size = ggml_type.calcSizeInBytes(num_elements);
                                 }
                             }
                             // comfyui gguf can't do f64 currently, need to downcast these to f32
                             // TODO: make this optional
                             if (std.mem.eql(u8, t.type, "f64") or std.mem.eql(u8, t.type, "F64")) {
                                 std.log.info("Downcasting unsupported f64 to f32 for tensor {s}", .{t.name});
+                                t.type = "f32";
+                                const fat_type = try gguf.GgmlType.fromString(t.type);
+                                t.size = fat_type.calcSizeInBytes(num_elements);
+                            }
+                            if (std.mem.eql(u8, "x_pad_token", t.name) or std.mem.eql(u8, "cap_pad_token", t.name)) {
+                            //if (std.mem.eql(u8, t.type, "rf16") or std.mem.eql(u8, t.type, "RF16")) {
+                                std.log.info("Upcasting unsupported bf16 to f32 for tensor {s}", .{t.name});
                                 t.type = "f32";
                                 const fat_type = try gguf.GgmlType.fromString(t.type);
                                 t.size = fat_type.calcSizeInBytes(num_elements);
@@ -289,7 +298,7 @@ pub fn main() !void {
                             else blk: {
                                 const stem = std.fs.path.stem(path);
                                 // Append datatype to filename
-                                const dtype_str = @tagName(datatype orelse gguf.GgmlType.f16);
+                                const dtype_str = @tagName(datatype orelse types.DataType.F16);
                                 break :blk try std.fmt.allocPrint(arena_alloc, "{s}-{s}", .{ stem, dtype_str });
                             };
 
@@ -304,7 +313,7 @@ pub fn main() !void {
                             try out_gguf.metadata.put(try arena_alloc.dupe(u8, "general.architecture"), .{ .string = arch.name });
                             try out_gguf.metadata.put(try arena_alloc.dupe(u8, "general.quantization_version"), .{ .integer = 2 });
                             // TODO: determine from the target dtype
-                            try out_gguf.metadata.put(try arena_alloc.dupe(u8, "general.file_type"), .{ .integer = 1 });
+                            try out_gguf.metadata.put(try arena_alloc.dupe(u8, "general.file_type"), .{ .integer = 7 });
 
                             // for all following metadata we use getOrPut so we don't overwrite
                             // any metadata from the template

@@ -348,6 +348,8 @@ pub const TensorNode = struct {
 };
 
 pub const DType = enum {
+    F8_E4M3,
+    F8_E5M2,
     BF16,
     F16,
     F32,
@@ -371,15 +373,16 @@ pub const DType = enum {
                 return @field(DType, field.name);
             }
         }
+        std.log.debug("Unknown dtype: {s}", .{str});
         return error.UnknownDType;
     }
 
-    pub fn getSizeInBytes(self: DType) u8 {
+    pub fn getSizeInBytes(self: DType) usize {
         return switch (self) {
             .BF16, .F16 => 2,
             .F32, .I32, .U32 => 4,
             .F64, .I64, .U64 => 8,
-            .I8, .U8 => 1,
+            .I8, .U8, .F8_E4M3, .F8_E5M2, => 1,
             .I16, .U16 => 2,
         };
     }

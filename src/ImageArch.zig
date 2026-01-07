@@ -16,6 +16,8 @@ pub const Arch = struct {
     keys_hiprec: []const []const u8 = &.{},
     /// Key substrings to ignore when found
     keys_ignore: []const []const u8 = &.{},
+    /// Quantization threshhold specific to a model, or fall back to default
+    threshhold: ?u64,
 
     /// Check if this architecture matches the given tensor names
     pub fn matches(self: Arch, tensor_names: []const []const u8) ArchMatchResult {
@@ -121,6 +123,7 @@ pub const flux = Arch{
         &.{"double_blocks.0.img_attn.proj.weight"},
     },
     .keys_banned = &.{"transformer_blocks.0.attn.norm_added_k.weight"},
+    .threshhold = null,
 };
 
 pub const sd3 = Arch{
@@ -130,6 +133,7 @@ pub const sd3 = Arch{
         &.{"joint_blocks.0.x_block.attn.qkv.weight"},
     },
     .keys_banned = &.{"transformer_blocks.0.attn.add_q_proj.weight"},
+    .threshhold = null,
 };
 
 pub const aura = Arch{
@@ -139,6 +143,7 @@ pub const aura = Arch{
         &.{"joint_transformer_blocks.3.ff_context.out_projection.weight"},
     },
     .keys_banned = &.{"joint_transformer_blocks.3.ff_context.out_projection.weight"},
+    .threshhold = null,
 };
 
 pub const hidream = Arch{
@@ -153,6 +158,7 @@ pub const hidream = Arch{
         ".ff_i.gate.weight",
         "img_emb.emb_pos",
     },
+    .threshhold = null,
 };
 
 pub const cosmos = Arch{
@@ -165,6 +171,7 @@ pub const cosmos = Arch{
     },
     .keys_hiprec = &.{"pos_embedder"},
     .keys_ignore = &.{ "_extra_state", "accum_" },
+    .threshhold = null,
 };
 
 pub const hyvid = Arch{
@@ -175,6 +182,7 @@ pub const hyvid = Arch{
             "txt_in.individual_token_refiner.blocks.1.self_attn_qkv.weight",
         },
     },
+    .threshhold = null,
 };
 
 pub const wan = Arch{
@@ -187,6 +195,7 @@ pub const wan = Arch{
         },
     },
     .keys_hiprec = &.{".modulation"},
+    .threshhold = null,
 };
 
 pub const ltxv = Arch{
@@ -199,6 +208,7 @@ pub const ltxv = Arch{
         },
     },
     .keys_hiprec = &.{"scale_shift_table"},
+    .threshhold = null,
 };
 
 pub const sdxl = Arch{
@@ -215,6 +225,7 @@ pub const sdxl = Arch{
         },
         &.{"label_emb.0.0.weight"},
     },
+    .threshhold = null,
 };
 
 pub const sd1 = Arch{
@@ -232,6 +243,7 @@ pub const sd1 = Arch{
             "output_blocks.8.2.conv.weight",
         },
     },
+    .threshhold = null,
 };
 
 pub const lumina2 = Arch{
@@ -239,6 +251,10 @@ pub const lumina2 = Arch{
     .keys_detect = &.{
         &.{ "cap_embedder.1.weight", "context_refiner.0.attention.qkv.weight" },
     },
+    .keys_ignore = &.{
+        "norm_final.weight",
+    },
+    .threshhold = 8192,
 };
 
 /// List of all known architectures, in detection priority order

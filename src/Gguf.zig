@@ -392,10 +392,19 @@ pub fn saveWithSTData(self: Gguf, source: *st, stdout: *std.io.Writer, threads: 
                     std.mem.endsWith(u8, source_tensor.name, t.name)))
                 {
                     matched = true;
-                    try stdout.print("Writing tensor data for tensor {}/{} {s}\n", .{count, self.tensors.items.len, t.name});
+                    var elements: usize = 1;
+                    for (t.dims) |d| elements *= d;
+                    try stdout.print("Writing tensor data for tensor {}/{} {s} - {s} to {s}, {} elements\n", .{
+                        count,
+                        self.tensors.items.len,
+                        t.name,
+                        source_tensor.type,
+                        t.type,
+                        elements,
+                    });
                     try stdout.flush();
                     // convert source tensor type to gguf type
-                    const source_dtype = try GgmlType.fromSafetensorsType(source_tensor.type);
+                    const source_dtype = try types.DataType.fromString(source_tensor.type);
 
                     // get a reader from the source
                     var reader = try source.getReaderForTensor(source_tensor.name, &read_buffer);
@@ -434,7 +443,7 @@ fn maybeWritePadding(self: Gguf, size: u64, writer: *std.io.Writer) !void {
     }
 }
 
-pub fn writeTensorData(self: Gguf, t: types.Tensor, source_dtype: GgmlType, reader: *std.io.Reader, writer: *std.io.Writer, threads: usize) !void {
+pub fn writeTensorData(self: Gguf, t: types.Tensor, source_dtype: types.DataType, reader: *std.io.Reader, writer: *std.io.Writer, threads: usize) !void {
     try self.file.seekTo(self.data_offset + t.offset);
 
     const target_dtype = try GgmlType.fromString(t.type);
@@ -443,14 +452,24 @@ pub fn writeTensorData(self: Gguf, t: types.Tensor, source_dtype: GgmlType, read
     var n_elements: u64 = 1;
     for (t.dims) |d| n_elements *= d;
 
-    const source_size = source_dtype.calcSizeInBytes(n_elements);
+    // figure out source type
+    const source_size: usize = switch (source_dtype.formatType()) {
+        .safetensors => blk: {
+            const stype = try st.DType.fromString(@tagName(source_dtype));
+            break :blk stype.getSizeInBytes() * n_elements;
+        },
+        .gguf => blk: {
+            const stype = try GgmlType.fromString(@tagName(source_dtype));
+            break :blk stype.calcSizeInBytes(n_elements);
+        },
+    };
 
     // Read source data
     const source_data = try reader.readAlloc(self.allocator, source_size);
     defer self.allocator.free(source_data);
 
     // Convert if types differ, otherwise write directly
-    if (source_dtype == target_dtype) {
+    if (source_dtype.formatType() == .gguf and std.mem.eql(u8, @tagName(source_dtype), @tagName(target_dtype))) {
         try writer.writeAll(source_data);
     } else {
         // Use DataTransform to convert the data

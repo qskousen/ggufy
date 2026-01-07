@@ -1,4 +1,5 @@
 const std = @import("std");
+const ggml = @import("build_ggml.zig");
 
 // Although this function looks imperative, it does not perform the build
 // directly and instead it mutates the build graph (`b`) that will be then
@@ -21,6 +22,19 @@ pub fn build(b: *std.Build) void {
     // target and optimize options) will be listed when running `zig build --help`
     // in this directory.
 
+    var ggmlc = ggml.Context.init(b, .{
+        .target = target,
+        .optimize = optimize,
+        .shared = false,
+    });
+    const ggml_h_module = ggmlc.moduleGgml();
+    const imports: []const std.Build.Module.Import = &.{
+        .{
+            .name = "ggml.h",
+            .module = ggml_h_module,
+        },
+    };
+
     // This creates a module, which represents a collection of source files alongside
     // some compilation options, such as optimization mode and linked system libraries.
     // Zig modules are the preferred way of making Zig code available to consumers.
@@ -39,6 +53,7 @@ pub fn build(b: *std.Build) void {
         // Later on we'll use this module as the root module of a test executable
         // which requires us to specify a target.
         .target = target,
+        .imports = imports,
     });
 
     // Here we define an executable. An executable needs to have a root module
@@ -79,12 +94,17 @@ pub fn build(b: *std.Build) void {
                 // can be extremely useful in case of collisions (which can happen
                 // importing modules from different packages).
                 .{ .name = "ggufy", .module = mod },
+                .{ .name = "ggml.h", .module = ggml_h_module},
             },
         }),
     });
 
+
+
     const clap = b.dependency("clap", .{});
     exe.root_module.addImport("clap", clap.module("clap"));
+
+    ggmlc.link(exe);
 
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
