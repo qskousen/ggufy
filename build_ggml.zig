@@ -281,7 +281,18 @@ pub const Context = struct {
 
     fn flags(ctx: Context) []const []const u8 {
         _ = ctx;
-        return &.{"-fno-sanitize=undefined"};
+        return &.{
+            "-fno-sanitize=undefined",
+            "-mavx",
+            "-mavx2",
+            "-mfma",
+            "-mf16c",
+            "-mavx512f",
+            "-mavx512bw",
+            "-mavx512dq",
+            "-mavx512vl",
+            "-U__AVX512BF16__", // Undefine this to prevent using unsupported intrinsics -- causing compile issues
+        };
     }
 
     fn common(ctx: Context, lib: *CompileStep) void {

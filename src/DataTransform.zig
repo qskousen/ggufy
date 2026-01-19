@@ -13,6 +13,7 @@ pub const Quantizer = struct {
         element_count: u64,
         threads: usize,
     ) ![]u8 {
+        std.log.info("Converting tensor type {s} to {s}", .{@tagName(src_type), @tagName(dst_type)});
         // Optimization: Direct copy if types match
         if (src_type.formatType() == .gguf and std.mem.eql(u8, @tagName(src_type), @tagName(dst_type))) {
             const out = try allocator.alloc(u8, src_data.len);

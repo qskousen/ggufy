@@ -364,7 +364,6 @@ pub fn saveWithSTData(self: Gguf, source: *st, stdout: *std.io.Writer, threads: 
         std.log.debug("Trying to convert {s} to GgmlType", .{t.type});
         const d_type = try GgmlType.fromString(t.type);
         bytes_written += try Gguf.writeTensorInfoTracked(&writer.interface, t.name, t.dims, d_type, offset);
-        // TODO: when we start converting, the size is going to change maybe? or that may be already determined at this point
         var next_offset = offset + t.size;
         // add alignment bytes if needed
         const remainder = next_offset % self.alignment;
