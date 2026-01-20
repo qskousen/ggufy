@@ -123,8 +123,6 @@ pub const Quantizer = struct {
             },
             .q5_0 => {
                 // Q5_0: 32 values per block.
-                // Block structure: delta (f16), followed by 32 int8 quants.
-                // Total bytes: 2 + 32 = 34 bytes.
                 const block_elements = 32;
                 const block_size = 22;
                 try convertTypeQX_0(
@@ -133,6 +131,48 @@ pub const Quantizer = struct {
                     allocator,
                     threads,
                     quantizeBlockQ5_0,
+                    block_elements,
+                    block_size,
+                );
+            },
+            .q4_0 => {
+                // Q4_0: 32 values per block.
+                const block_elements = 32;
+                const block_size = 18;
+                try convertTypeQX_0(
+                    input_f32,
+                    output_bytes,
+                    allocator,
+                    threads,
+                    quantizeBlockQ4_0,
+                    block_elements,
+                    block_size,
+                );
+            },
+            .q5_1 => {
+                // Q5_1: 32 values per block.
+                const block_elements = 32;
+                const block_size = 24;
+                try convertTypeQX_0(
+                    input_f32,
+                    output_bytes,
+                    allocator,
+                    threads,
+                    quantizeBlockQ5_1,
+                    block_elements,
+                    block_size,
+                );
+            },
+            .q4_1 => {
+                // Q4_1: 32 values per block.
+                const block_elements = 32;
+                const block_size = 20;
+                try convertTypeQX_0(
+                    input_f32,
+                    output_bytes,
+                    allocator,
+                    threads,
+                    quantizeBlockQ4_1,
                     block_elements,
                     block_size,
                 );
@@ -207,6 +247,27 @@ pub const Quantizer = struct {
         if (src.len != block_size) return;
 
         _ = ggml.ggml_quantize_chunk(@intFromEnum(gguf.GgmlType.q5_0), src.ptr, dst.ptr, 0, 1, block_size, null);
+    }
+
+    fn quantizeBlockQ4_0(src: []const f32, dst: []u8) void {
+        const block_size = 32; // QK4_0
+        if (src.len != block_size) return;
+
+        _ = ggml.ggml_quantize_chunk(@intFromEnum(gguf.GgmlType.q4_0), src.ptr, dst.ptr, 0, 1, block_size, null);
+    }
+
+    fn quantizeBlockQ5_1(src: []const f32, dst: []u8) void {
+        const block_size = 32; // QK5_1
+        if (src.len != block_size) return;
+
+        _ = ggml.ggml_quantize_chunk(@intFromEnum(gguf.GgmlType.q5_1), src.ptr, dst.ptr, 0, 1, block_size, null);
+    }
+
+    fn quantizeBlockQ4_1(src: []const f32, dst: []u8) void {
+        const block_size = 32; // QK5_1
+        if (src.len != block_size) return;
+
+        _ = ggml.ggml_quantize_chunk(@intFromEnum(gguf.GgmlType.q4_1), src.ptr, dst.ptr, 0, 1, block_size, null);
     }
 
     fn fp8_e4m3_to_f32(x: u8) f32 {
