@@ -13,7 +13,6 @@ pub const Quantizer = struct {
         element_count: u64,
         threads: usize,
     ) ![]u8 {
-        std.log.info("Converting tensor type {s} to {s}", .{@tagName(src_type), @tagName(dst_type)});
         // Optimization: Direct copy if types match
         if (src_type.formatType() == .gguf and std.mem.eql(u8, @tagName(src_type), @tagName(dst_type))) {
             const out = try allocator.alloc(u8, src_data.len);
@@ -116,7 +115,7 @@ pub const Quantizer = struct {
                     output_bytes,
                     allocator,
                     threads,
-                    quantizeBlockQ8_0,
+                    gguf.GgmlType.q8_0,
                     block_elements,
                     block_size,
                 );
@@ -130,7 +129,7 @@ pub const Quantizer = struct {
                     output_bytes,
                     allocator,
                     threads,
-                    quantizeBlockQ5_0,
+                    gguf.GgmlType.q5_0,
                     block_elements,
                     block_size,
                 );
@@ -144,7 +143,7 @@ pub const Quantizer = struct {
                     output_bytes,
                     allocator,
                     threads,
-                    quantizeBlockQ4_0,
+                    gguf.GgmlType.q4_0,
                     block_elements,
                     block_size,
                 );
@@ -158,7 +157,7 @@ pub const Quantizer = struct {
                     output_bytes,
                     allocator,
                     threads,
-                    quantizeBlockQ5_1,
+                    gguf.GgmlType.q5_1,
                     block_elements,
                     block_size,
                 );
@@ -172,7 +171,77 @@ pub const Quantizer = struct {
                     output_bytes,
                     allocator,
                     threads,
-                    quantizeBlockQ4_1,
+                    gguf.GgmlType.q4_1,
+                    block_elements,
+                    block_size,
+                );
+            },
+            .q6_k => {
+                // Q6_K: 256 values per superblock.
+                const block_elements = 256;
+                const block_size = 210;
+                try convertTypeQX_0(
+                    input_f32,
+                    output_bytes,
+                    allocator,
+                    threads,
+                    gguf.GgmlType.q6_k,
+                    block_elements,
+                    block_size,
+                );
+            },
+            .q5_k => {
+                // Q5_K: 256 values per superblock.
+                const block_elements = 256;
+                const block_size = 176;
+                try convertTypeQX_0(
+                    input_f32,
+                    output_bytes,
+                    allocator,
+                    threads,
+                    gguf.GgmlType.q5_k,
+                    block_elements,
+                    block_size,
+                );
+            },
+            .q4_k => {
+                // Q4_K: 256 values per superblock.
+                const block_elements = 256;
+                const block_size = 144;
+                try convertTypeQX_0(
+                    input_f32,
+                    output_bytes,
+                    allocator,
+                    threads,
+                    gguf.GgmlType.q4_k,
+                    block_elements,
+                    block_size,
+                );
+            },
+            .q3_k => {
+                // Q3_K: 256 values per superblock.
+                const block_elements = 256;
+                const block_size = 110;
+                try convertTypeQX_0(
+                    input_f32,
+                    output_bytes,
+                    allocator,
+                    threads,
+                    gguf.GgmlType.q3_k,
+                    block_elements,
+                    block_size,
+                );
+            },
+            .q2_k => {
+                // Q2_K: 256 values per superblock.
+                const block_elements = 256;
+                const block_size = 84;
+                try convertTypeQX_0(
+                    input_f32,
+                    output_bytes,
+                    allocator,
+                    threads,
+                    gguf.GgmlType.q2_k,
                     block_elements,
                     block_size,
                 );
@@ -186,15 +255,20 @@ pub const Quantizer = struct {
         output_bytes: []u8,
         allocator: std.mem.Allocator,
         threads: usize,
-        comptime func: anytype,
-        block_elements: usize,
-        block_size: usize,
+        q_type: gguf.GgmlType,
+        block_elements: i64,
+        block_size: i64,
     ) !void {
-        const element_count = input_f32.len;
-        const block_count = element_count / block_elements;
+        const element_count: i64 = @intCast(input_f32.len);
+        const block_count = @divExact(element_count, block_elements);
+        const threads_i64: i64 = @intCast(threads);
 
         // Ensure output buffer is large enough
         if (output_bytes.len < block_count * block_size) return error.OutputBufferTooSmall;
+
+        // divide blocks up for threads
+        const blocks_per_thread = @divTrunc(block_count, threads_i64);
+        const leftover = block_count - (blocks_per_thread * threads_i64);
 
         var pool: std.Thread.Pool = undefined;
         try pool.init(.{
@@ -205,69 +279,28 @@ pub const Quantizer = struct {
 
         var wg: std.Thread.WaitGroup = .{};
 
-        // divide blocks up for threads
-        const blocks_per_thread = block_count / threads;
-        const leftover = block_count - (blocks_per_thread * threads);
-
-        var i: usize = 0;
-        while (i < threads) : (i += 1) {
+        var i: i64 = 0;
+        while (i < threads_i64) : (i += 1) {
             const start = i * blocks_per_thread;
             var end = start + blocks_per_thread;
-            if (i == threads - 1) {
+            if (i == threads_i64 - 1) {
                 end += leftover;
             }
             //std.log.debug("Spawning a task for blocks {} - {} of {}", .{ start, end, block_count });
-            pool.spawnWg(&wg, processBlocks, .{ input_f32, output_bytes, start, end, block_elements, block_size, func });
+            pool.spawnWg(&wg, processBlocks, .{ input_f32, output_bytes, start, end, block_elements, block_size, q_type });
         }
         wg.wait();
     }
 
-    fn processBlocks(input_f32: []const f32, output_bytes: []u8, start: usize, end: usize, block_elements: usize, block_size: usize, comptime func: anytype) void {
-        var i = start;
-        while (i < end) : (i += 1) {
-            const src_offset = i * block_elements;
-            const dst_offset = i * block_size;
-
-            const src_block = input_f32[src_offset .. src_offset + block_elements];
-            const dst_block = output_bytes[dst_offset .. dst_offset + block_size];
-
-            func(src_block, dst_block);
-        }
-    }
-
-    fn quantizeBlockQ8_0(src: []const f32, dst: []u8) void {
-        const block_size = 32; // Number of elements per block in Q8_0 format
-        if (src.len != block_size) return; // Ensure the input length matches the expected block size
-
-        _ = ggml.ggml_quantize_chunk(@intFromEnum(gguf.GgmlType.q8_0), src.ptr, dst.ptr, 0, 1, block_size, null);
-    }
-
-    fn quantizeBlockQ5_0(src: []const f32, dst: []u8) void {
-        const block_size = 32; // QK5_0
-        if (src.len != block_size) return;
-
-        _ = ggml.ggml_quantize_chunk(@intFromEnum(gguf.GgmlType.q5_0), src.ptr, dst.ptr, 0, 1, block_size, null);
-    }
-
-    fn quantizeBlockQ4_0(src: []const f32, dst: []u8) void {
-        const block_size = 32; // QK4_0
-        if (src.len != block_size) return;
-
-        _ = ggml.ggml_quantize_chunk(@intFromEnum(gguf.GgmlType.q4_0), src.ptr, dst.ptr, 0, 1, block_size, null);
-    }
-
-    fn quantizeBlockQ5_1(src: []const f32, dst: []u8) void {
-        const block_size = 32; // QK5_1
-        if (src.len != block_size) return;
-
-        _ = ggml.ggml_quantize_chunk(@intFromEnum(gguf.GgmlType.q5_1), src.ptr, dst.ptr, 0, 1, block_size, null);
-    }
-
-    fn quantizeBlockQ4_1(src: []const f32, dst: []u8) void {
-        const block_size = 32; // QK5_1
-        if (src.len != block_size) return;
-
-        _ = ggml.ggml_quantize_chunk(@intFromEnum(gguf.GgmlType.q4_1), src.ptr, dst.ptr, 0, 1, block_size, null);
+    fn processBlocks(input_f32: []const f32, output_bytes: []u8, start: i64, end: i64, block_elements: i64, block_size: i64, q_type: gguf.GgmlType) void {
+        const size = end - start;
+        const src_offset: usize = @intCast(start * block_elements);
+        const dst_offset: usize = @intCast(start * block_size);
+        const block_elements_usize: usize = @intCast(block_elements);
+        const block_size_usize: usize = @intCast(block_size);
+        const src_block = input_f32[src_offset .. src_offset + block_elements_usize];
+        const dst_block = output_bytes[dst_offset .. dst_offset + block_size_usize];
+        _ = ggml.ggml_quantize_chunk(@intFromEnum(q_type), src_block.ptr, dst_block.ptr, 0, size, block_elements, null);
     }
 
     fn fp8_e4m3_to_f32(x: u8) f32 {

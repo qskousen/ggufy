@@ -243,6 +243,30 @@ pub const sd1 = Arch{
             "output_blocks.8.2.conv.weight",
         },
     },
+    .keys_hiprec = &.{
+        // These are educated guesses on what layers are important and shouldn't be quantized
+        // Norm layers
+        ".norm",
+        "layer_norm",
+        "group_norm",
+        "rmsnorm",
+        "in_layers.0.weight", // specifically catches GroupNorm in SD1
+
+        // Biases
+        ".bias",
+
+        // Embeddings
+        "position_embedding",
+        "position_ids",
+        "token_embedding",
+
+        // 1x1 conv projections
+        "proj_in.weight",
+        "proj_out.weight",
+
+        // Optional modulation layers
+        ".modulation",
+    },
     .threshhold = null,
 };
 

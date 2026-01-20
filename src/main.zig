@@ -198,6 +198,9 @@ pub fn main() !void {
                             if (num_elements < threshhold) {
                                 // this one is too small to quantize
                                 // pass it through unchanged
+                            } else if (arch.isHighPrecision(t.name)) {
+                                // this one is sensitive to quantization
+                                // pass through unchanged
                             } else {
                                 if (datatype) |dtype| {
                                     // convert from datatype to ggml type

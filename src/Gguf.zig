@@ -361,7 +361,7 @@ pub fn saveWithSTData(self: Gguf, source: *st, stdout: *std.io.Writer, threads: 
     try stdout.flush();
     var offset: u64 = 0;
     for (self.tensors.items) |t| {
-        std.log.debug("Trying to convert {s} to GgmlType", .{t.type});
+        //std.log.debug("Trying to convert {s} to GgmlType", .{t.type});
         const d_type = try GgmlType.fromString(t.type);
         bytes_written += try Gguf.writeTensorInfoTracked(&writer.interface, t.name, t.dims, d_type, offset);
         var next_offset = offset + t.size;
