@@ -1,0 +1,52 @@
+
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Build for Linux x86-64
+        run: |
+          zig build --release=fast -Dtarget=x86_64-linux
+          mkdir -p dist/linux
+          cp zig-out/bin/ggufy dist/linux/ggufy
+          cd dist/linux
+          zip ../ggufy-linux-x86_64.zip ggufy
+          cd ../..
+
+      - name: Build for Windows x86-64
+        run: |
+          zig build --release=fast -Dtarget=x86_64-windows
+          mkdir -p dist/windows
+          cp zig-out/bin/ggufy.exe dist/windows/ggufy.exe
+          cd dist/windows
+          zip ../ggufy-windows-x86_64.zip ggufy.exe
+          cd ../..
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            dist/ggufy-linux-x86_64.zip
+            dist/ggufy-windows-x86_64.zip
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
