@@ -212,9 +212,18 @@ convert - Convert model format/quantization
 template - Export GGUF structure to JSON template
 ```
 
-### Building
+## Building
 
-ggufy is built with zig 0.15.2. To build, run `zig build`.
+ggufy is built with zig 0.15.2. Clone the repository, with submodules:
+
+```bash
+git clone --recurse-submodules https://github.com/qskousen/ggufy.git
+```
+
+Build with zig:
+```bash
+zig build
+```
 
 ## Acknowledgements
 
