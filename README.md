@@ -1,7 +1,7 @@
 # ggufy
 A lightweight and efficient tool to convert tensor formats.
 
-ggufy aims to be fast and memory efficient. For reference, on my 9800X3D, it can convert sd 1.5 from safetensors (4.9 GB checkpoint) to q3_k gguf (skipping sensitivity) in about 6 seconds, using a max of about 252 MB of memory.
+ggufy aims to be fast and memory efficient. For reference, on my 9800X3D, it can convert sd 1.5 from safetensors (4.9 GB checkpoint) to q3_k gguf (skipping sensitivity) in about 6 seconds, using a max of about 252 MB of memory. I would like to get this lower (maybe using `mmap`?) but other things are higher priority right now.
 
 ggufy currently supports safetensors and gguf files.
 
