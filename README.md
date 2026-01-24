@@ -212,6 +212,10 @@ convert - Convert model format/quantization
 template - Export GGUF structure to JSON template
 ```
 
+### Building
+
+ggufy is built with zig 0.15.2. To build, run `zig build`.
+
 ## Acknowledgements
 
 - [ggml](https://github.com/ggml-org/ggml) ggufy uses ggml for quantization
