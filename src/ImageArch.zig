@@ -18,6 +18,8 @@ pub const Arch = struct {
     keys_ignore: []const []const u8 = &.{},
     /// Quantization threshhold specific to a model, or fall back to default
     threshhold: ?u64,
+    /// Sensitivities filename; json dictionary of layer names and their relative sensitivity to quantization, 1-100
+    sensitivities: []const u8 = "",
 
     /// Check if this architecture matches the given tensor names
     pub fn matches(self: Arch, tensor_names: []const []const u8) ArchMatchResult {
@@ -118,6 +120,7 @@ pub fn hasBannedKeysInTensors(arch: *const Arch, tensors: []const types.Tensor) 
 
 pub const flux = Arch{
     .name = "flux",
+    .shape_fix = true,
     .keys_detect = &.{
         &.{"transformer_blocks.0.attn.norm_added_k.weight"},
         &.{"double_blocks.0.img_attn.proj.weight"},
@@ -243,31 +246,8 @@ pub const sd1 = Arch{
             "output_blocks.8.2.conv.weight",
         },
     },
-    .keys_hiprec = &.{
-        // These are educated guesses on what layers are important and shouldn't be quantized
-        // Norm layers
-        ".norm",
-        "layer_norm",
-        "group_norm",
-        "rmsnorm",
-        "in_layers.0.weight", // specifically catches GroupNorm in SD1
-
-        // Biases
-        ".bias",
-
-        // Embeddings
-        "position_embedding",
-        "position_ids",
-        "token_embedding",
-
-        // 1x1 conv projections
-        "proj_in.weight",
-        "proj_out.weight",
-
-        // Optional modulation layers
-        ".modulation",
-    },
     .threshhold = null,
+    .sensitivities = @embedFile("sensitivities/sd1.5.json"),
 };
 
 pub const lumina2 = Arch{
@@ -275,6 +255,7 @@ pub const lumina2 = Arch{
     .keys_detect = &.{
         &.{ "cap_embedder.1.weight", "context_refiner.0.attention.qkv.weight" },
     },
+    .shape_fix = true,
     .keys_ignore = &.{
         "norm_final.weight",
     },

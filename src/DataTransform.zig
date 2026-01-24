@@ -176,72 +176,16 @@ pub const Quantizer = struct {
                     block_size,
                 );
             },
-            .q6_k => {
-                // Q6_K: 256 values per superblock.
-                const block_elements = 256;
-                const block_size = 210;
+            .q6_k, .q5_k, .q4_k, .q3_k, .q2_k => {
+                const block_elements = dst_type.getBlockSize();
+                const block_size = dst_type.getBytesPerBlock();
+
                 try convertTypeQX_0(
                     input_f32,
                     output_bytes,
                     allocator,
                     threads,
-                    gguf.GgmlType.q6_k,
-                    block_elements,
-                    block_size,
-                );
-            },
-            .q5_k => {
-                // Q5_K: 256 values per superblock.
-                const block_elements = 256;
-                const block_size = 176;
-                try convertTypeQX_0(
-                    input_f32,
-                    output_bytes,
-                    allocator,
-                    threads,
-                    gguf.GgmlType.q5_k,
-                    block_elements,
-                    block_size,
-                );
-            },
-            .q4_k => {
-                // Q4_K: 256 values per superblock.
-                const block_elements = 256;
-                const block_size = 144;
-                try convertTypeQX_0(
-                    input_f32,
-                    output_bytes,
-                    allocator,
-                    threads,
-                    gguf.GgmlType.q4_k,
-                    block_elements,
-                    block_size,
-                );
-            },
-            .q3_k => {
-                // Q3_K: 256 values per superblock.
-                const block_elements = 256;
-                const block_size = 110;
-                try convertTypeQX_0(
-                    input_f32,
-                    output_bytes,
-                    allocator,
-                    threads,
-                    gguf.GgmlType.q3_k,
-                    block_elements,
-                    block_size,
-                );
-            },
-            .q2_k => {
-                // Q2_K: 256 values per superblock.
-                const block_elements = 256;
-                const block_size = 84;
-                try convertTypeQX_0(
-                    input_f32,
-                    output_bytes,
-                    allocator,
-                    threads,
-                    gguf.GgmlType.q2_k,
+                    dst_type,
                     block_elements,
                     block_size,
                 );
@@ -256,19 +200,19 @@ pub const Quantizer = struct {
         allocator: std.mem.Allocator,
         threads: usize,
         q_type: gguf.GgmlType,
-        block_elements: i64,
-        block_size: i64,
+        block_elements: u64,
+        block_size: u64,
     ) !void {
-        const element_count: i64 = @intCast(input_f32.len);
+        const element_count: u64 = @intCast(input_f32.len);
         const block_count = @divExact(element_count, block_elements);
-        const threads_i64: i64 = @intCast(threads);
+        const threads_u64: u64 = @intCast(threads);
 
         // Ensure output buffer is large enough
         if (output_bytes.len < block_count * block_size) return error.OutputBufferTooSmall;
 
         // divide blocks up for threads
-        const blocks_per_thread = @divTrunc(block_count, threads_i64);
-        const leftover = block_count - (blocks_per_thread * threads_i64);
+        const blocks_per_thread = @divTrunc(block_count, threads_u64);
+        const leftover = block_count - (blocks_per_thread * threads_u64);
 
         var pool: std.Thread.Pool = undefined;
         try pool.init(.{
@@ -279,11 +223,11 @@ pub const Quantizer = struct {
 
         var wg: std.Thread.WaitGroup = .{};
 
-        var i: i64 = 0;
-        while (i < threads_i64) : (i += 1) {
+        var i: u64 = 0;
+        while (i < threads_u64) : (i += 1) {
             const start = i * blocks_per_thread;
             var end = start + blocks_per_thread;
-            if (i == threads_i64 - 1) {
+            if (i == threads_u64 - 1) {
                 end += leftover;
             }
             //std.log.debug("Spawning a task for blocks {} - {} of {}", .{ start, end, block_count });
@@ -292,7 +236,7 @@ pub const Quantizer = struct {
         wg.wait();
     }
 
-    fn processBlocks(input_f32: []const f32, output_bytes: []u8, start: i64, end: i64, block_elements: i64, block_size: i64, q_type: gguf.GgmlType) void {
+    fn processBlocks(input_f32: []const f32, output_bytes: []u8, start: u64, end: u64, block_elements: u64, block_size: u64, q_type: gguf.GgmlType) void {
         const size = end - start;
         const src_offset: usize = @intCast(start * block_elements);
         const dst_offset: usize = @intCast(start * block_size);
@@ -300,7 +244,7 @@ pub const Quantizer = struct {
         const block_size_usize: usize = @intCast(block_size);
         const src_block = input_f32[src_offset .. src_offset + block_elements_usize];
         const dst_block = output_bytes[dst_offset .. dst_offset + block_size_usize];
-        _ = ggml.ggml_quantize_chunk(@intFromEnum(q_type), src_block.ptr, dst_block.ptr, 0, size, block_elements, null);
+        _ = ggml.ggml_quantize_chunk(@intFromEnum(q_type), src_block.ptr, dst_block.ptr, 0, @intCast(size), @intCast(block_elements), null);
     }
 
     fn fp8_e4m3_to_f32(x: u8) f32 {
