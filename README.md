@@ -7,7 +7,10 @@ ggufy currently supports safetensors and gguf files.
 
 ggufy is currently very targeted towards image diffusion models, specifically converting from safetensors to various gguf quantizations.
 
-ggufy is a work in progress, in the early stages. It can convert the most common types of image models from safetensors ("checkpoint" style or unet style), but "sensitivity" files only exist for sd 1.5 so far.
+ggufy is a work in progress, in the early stages.
+It can convert the most common types of image models from safetensors ("checkpoint" style or unet style), but [sensitivity](https://github.com/qskousen/ggufy#sensitivity-aware-quantization) files only exist for sd 1.5 so far.
+Generating the sensitivity files involves generating tens of thousands of images per model, and my GPU is old, so this is a slow process.
+If you are able to provide GPU resources to help with this, please contact me.
 
 ### Todos:
 
@@ -160,10 +163,12 @@ This is useful when you need to match a specific model format exactly.
 
 ### Sensitivity-Aware Quantization
 
-For supported architectures (currently SD1.5), ggufy can use sensitivity data to apply different quantization levels to different layers (for supported models, sensitivity is enabled by default:
+For supported architectures (currently SD1.5), ggufy can use sensitivity data to apply different quantization levels to different layers.
+This can significantly improve the quality of the model at the cost of slightly larger file sizes.
+For supported models, sensitivity is enabled by default.
 
 ```bash
-ggufy convert --datatype q4_k model.safetensors
+ggufy convert --datatype q4_k sd1.5.safetensors
 ```
 
 When sensitivity data is available:
@@ -176,7 +181,15 @@ The `--aggressiveness` option (default: 50) controls how aggressively layers are
 - Higher values (50-100): More aggressive, most layers stay near target quantization (whatever quantization you passed in -- e.g. Q4_K)
 - Higher values (1-50): More conservative, sensitive layers quickly upgraded to higher precision
 
-Sensitivity quantization can be turned off with `--skip-sensitivity` or `-s`.
+```bash
+ggufy convert --datatype q4_k sd1.5.safetensors --aggressiveness 25
+```
+
+Sensitivity quantization can be turned off with `--skip-sensitivity` or `-s` if you want to use the default quantization levels for all layers.
+
+```bash
+ggufy convert --datatype q4_k sd1.5.safetensors --skip-sensitivity
+```
 
 ### Complete Examples
 
