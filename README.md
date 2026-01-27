@@ -25,7 +25,8 @@ I initially intended to have this all in pure zig, but now it includes ggml c/c+
 
 ## Installation
 
-ggufy is a single binary, available for download from the [releases page](https://github.com/qskousen/ggufy/releases). Simply download the version appropriate for your system and place it somewhere in your PATH, or run it directly from that location.
+ggufy is a single binary, available for download from the [releases page](https://github.com/qskousen/ggufy/releases).
+Download the version appropriate for your system, extract it, and place it somewhere in your PATH; alternatively, run it directly from that location.
 
 ## Usage
 
