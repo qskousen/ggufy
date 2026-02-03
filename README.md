@@ -186,7 +186,7 @@ The `--aggressiveness` option (default: 50) controls how aggressively layers are
 ggufy convert --datatype q4_k sd1.5.safetensors --aggressiveness 25
 ```
 
-Sensitivity quantization can be turned off with `--skip-sensitivity` or `-s` if you want to use the default quantization levels for all layers.
+Sensitivity quantization can be turned off with `--skip-sensitivity` or `-x` if you want to use the default quantization levels for all layers.
 
 ```bash
 ggufy convert --datatype q4_k sd1.5.safetensors --skip-sensitivity

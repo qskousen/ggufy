@@ -15,49 +15,27 @@ const Command = enum {
 };
 
 const QUANTIZATION_THRESHOLD = 1024;
-/// 1-100 level of quantization with sensitivities file - 1 is most aggressive, 100 least
-const QUANTIZATION_AGGRESSIVENESS = 65;
 
 /// Quantization type hierarchy from lowest to highest precision
 const QuantizationLevel = enum(u8) {
     q2_k = 0,
     q3_k = 1,
     q4_0 = 2,
-    q4_k = 3,
-    q5_0 = 4,
-    q5_k = 5,
-    q6_k = 6,
-    q8_0 = 7,
-    f16 = 8,
-    f32 = 9,
-
-    pub fn toString(self: QuantizationLevel) []const u8 {
-        return switch (self) {
-            .q2_k => "q2_k",
-            .q3_k => "q3_k",
-            .q4_0 => "q4_0",
-            .q4_k => "q4_k",
-            .q5_0 => "q5_0",
-            .q5_k => "q5_k",
-            .q6_k => "q6_k",
-            .q8_0 => "q8_0",
-            .f16 => "f16",
-            .f32 => "f32",
-        };
-    }
+    q4_1 = 3,
+    q4_k = 4,
+    q5_0 = 5,
+    q5_1 = 6,
+    q5_k = 7,
+    q6_k = 8,
+    q8_0 = 9,
+    f16 = 10,
+    bf16 = 11,
+    f32 = 12,
+    f64 = 13,
 
     pub fn fromString(s: []const u8) !QuantizationLevel {
-        if (std.mem.eql(u8, s, "q2_k")) return .q2_k;
-        if (std.mem.eql(u8, s, "q3_k")) return .q3_k;
-        if (std.mem.eql(u8, s, "q4_0")) return .q4_0;
-        if (std.mem.eql(u8, s, "q4_k")) return .q4_k;
-        if (std.mem.eql(u8, s, "q5_0")) return .q5_0;
-        if (std.mem.eql(u8, s, "q5_k")) return .q5_k;
-        if (std.mem.eql(u8, s, "q6_k")) return .q6_k;
-        if (std.mem.eql(u8, s, "q8_0")) return .q8_0;
-        if (std.mem.eql(u8, s, "f16")) return .f16;
-        if (std.mem.eql(u8, s, "f32")) return .f32;
-        return error.UnknownQuantizationType;
+        var lower: [12]u8 = [_]u8{0} ** 12;
+        return std.meta.stringToEnum(QuantizationLevel, std.ascii.lowerString(&lower, s)) orelse error.UnknownQuantizationType;
     }
 };
 
@@ -77,7 +55,7 @@ fn calculateQuantizationLevel(
     const hard = std.math.clamp(aggressiveness, 1.0, 100.0);
 
     // Get source and target level indices
-    const source_level = QuantizationLevel.fromString(source_type) catch .f16;
+    const source_level = try QuantizationLevel.fromString(source_type);
     const target_idx: f32 = @floatFromInt(@intFromEnum(target_level));
     const source_idx: f32 = @floatFromInt(@intFromEnum(source_level));
 
@@ -120,7 +98,7 @@ pub fn main() !void {
         \\-n, --output-name <FILENAME>   Output filename without extension (default: source name + datatype).
         \\-j, --threads <INT>            Threads to use when quantizing. Defaults to number of cores - 2.
         \\-a, --aggressiveness <INT>     How aggressive to quantize layers when using sensitivity. 1 is most aggressive, 100 is least.
-        \\-s, --skip-sensitivity         Pass this to not use a built-in layer sensitivity file and just blindly quantize to target type.
+        \\-x, --skip-sensitivity         Pass this to not use a built-in layer sensitivity file and just blindly quantize to target type.
         \\<COMMAND>    Specify a command: header, tree, metadata, convert, template
         \\<FILENAME>   The file to use for input
     );
@@ -148,9 +126,6 @@ pub fn main() !void {
     };
     defer res.deinit();
 
-    if (res.args.help != 0)
-        return clap.helpToFile(.stderr(), clap.Help, &params, .{});
-
     var stderr_buffer: [256]u8 = undefined;
     var err_writer = std.fs.File.stderr().writer(&stderr_buffer);
     const stderr = &err_writer.interface;
@@ -160,8 +135,28 @@ pub fn main() !void {
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
     const stdout = &stdout_writer.interface;
 
-    const command = res.positionals[0] orelse return error.MissingCommand;
-    const path = res.positionals[1] orelse return error.MissingModelPath;
+    if (res.args.help != 0) {
+        try stdout.print("ggufy is a tool for LLM model files, particularly for converting between file types.\n\n", .{});
+        try stdout.print("Usage: ggufy <COMMAND> <FILENAME> [options]\n\n", .{});
+        try stdout.print("Possible commands:\n", .{});
+        try stdout.print("  header         Shows header information for the specified file\n", .{});
+        try stdout.print("  tree           Output tensor data in a tree format (SafeTensors only)\n", .{});
+        try stdout.print("  metadata       Shows metadata information for the specified file\n", .{});
+        try stdout.print("  convert        Convert the specified file into a different format or datatype\n", .{});
+        try stdout.print("  template       Creates a json template from the specified file\n\n", .{});
+        try stdout.print("Options:\n", .{});
+        try stdout.flush();
+        return clap.helpToFile(.stderr(), clap.Help, &params, .{});
+    }
+
+    const command = res.positionals[0] orelse {
+        std.log.err("No command given. Use --help to get more information.", .{});
+        return;
+    };
+    const path = res.positionals[1] orelse {
+        std.log.err("No model file specified.", .{});
+        return;
+    };
     const filetype = res.args.filetype orelse types.FileType.gguf;
     const datatype: ?types.DataType = res.args.datatype;
     const template_path = res.args.template;
@@ -355,7 +350,7 @@ pub fn main() !void {
                                                 };
 
                                                 // Calculate the appropriate quantization level
-                                                    const target_level = try QuantizationLevel.fromString(@tagName(dtype));
+                                                const target_level = try QuantizationLevel.fromString(@tagName(dtype));
                                                 const quant_level = try calculateQuantizationLevel(
                                                     sens,
                                                     quantization_aggressiveness,
@@ -363,7 +358,7 @@ pub fn main() !void {
                                                     t.type,
                                                 );
 
-                                                const final_type_str = quant_level.toString();
+                                                const final_type_str = @tagName(quant_level);
                                                 const final_ggml_type = try gguf.GgmlType.fromString(final_type_str);
 
                                                 std.log.info("Layer {s}: sensitivity={d:.1}, hardness={d}, {s} -> {s}",
