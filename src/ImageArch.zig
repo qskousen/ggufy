@@ -229,6 +229,7 @@ pub const sdxl = Arch{
         &.{"label_emb.0.0.weight"},
     },
     .threshhold = null,
+    .sensitivities = @embedFile("sensitivities/sdxl.json"),
 };
 
 pub const sd1 = Arch{

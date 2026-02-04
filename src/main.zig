@@ -97,7 +97,7 @@ pub fn main() !void {
         \\-o, --output-dir <DIR>         Output directory (default: same as source file).
         \\-n, --output-name <FILENAME>   Output filename without extension (default: source name + datatype).
         \\-j, --threads <INT>            Threads to use when quantizing. Defaults to number of cores - 2.
-        \\-a, --aggressiveness <INT>     How aggressive to quantize layers when using sensitivity. 1 is most aggressive, 100 is least.
+        \\-a, --aggressiveness <INT>     How aggressively to quantize layers when using sensitivity. 100 is most aggressive, 1 is least.
         \\-x, --skip-sensitivity         Pass this to not use a built-in layer sensitivity file and just blindly quantize to target type.
         \\<COMMAND>    Specify a command: header, tree, metadata, convert, template
         \\<FILENAME>   The file to use for input

@@ -8,14 +8,16 @@ ggufy currently supports safetensors and gguf files.
 ggufy is currently very targeted towards image diffusion models, specifically converting from safetensors to various gguf quantizations.
 
 ggufy is a work in progress, in the early stages.
-It can convert the most common types of image models from safetensors ("checkpoint" style or unet style), but [sensitivity](https://github.com/qskousen/ggufy#sensitivity-aware-quantization) files only exist for sd 1.5 so far.
+It can convert the most common types of image models from safetensors ("checkpoint" style or unet style),
+but not all architectures are supported yet. Additionally, not all architectures have sensitivity data available yet.
+See [below](https://github.com/qskousen/ggufy#sensitivity-aware-quantization) for supported architectures.
 Generating the sensitivity files involves generating tens of thousands of images per model, and my GPU is old, so this is a slow process.
 If you are able to provide GPU resources to help with this, please contact me.
 
 ### Todos:
 
 - [ ] allow opening st or gguf non-existing path and use for writing (seperate instances for read and write) (gguf done)
-- [x] generate "quantization sensitivity" file, weight tensors 1-100 on how much quantization affects them (done for sd1.5, more to come)
+- [x] generate "quantization sensitivity" file, weight tensors 1-100 on how much quantization affects them (list of comepleted architectures below)
 - [x] allow to set output directory and output file when converting
 - [x] starting with q8_0, support actual quantization
 - [ ] allow converting model, encoders, vae by option
@@ -164,9 +166,16 @@ This is useful when you need to match a specific model format exactly.
 
 ### Sensitivity-Aware Quantization
 
-For supported architectures (currently SD1.5), ggufy can use sensitivity data to apply different quantization levels to different layers.
+For supported architectures, ggufy can use sensitivity data to apply different quantization levels to different layers.
 This can significantly improve the quality of the model at the cost of slightly larger file sizes.
 For supported models, sensitivity is enabled by default.
+
+Generating sensitivity data requires generating a large number of images, which can take a long time.
+More architectures will be added as the sensitivity data is generated for them.
+
+Currently supported architectures:
+- SD1.5
+- SDXL
 
 ```bash
 ggufy convert --datatype q4_k sd1.5.safetensors
