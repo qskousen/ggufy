@@ -10,14 +10,32 @@ ggufy is currently very targeted towards image diffusion models, specifically co
 ggufy is a work in progress, in the early stages.
 It can convert the most common types of image models from safetensors ("checkpoint" style or unet style),
 but not all architectures are supported yet. Additionally, not all architectures have sensitivity data available yet.
-See [below](https://github.com/qskousen/ggufy#sensitivity-aware-quantization) for supported architectures.
+See the table below for supported architectures.
 Generating the sensitivity files involves generating tens of thousands of images per model, and my GPU is old, so this is a slow process.
 If you are able to provide GPU resources to help with this, please contact me.
+
+### Supported architectures
+
+This table lists the architectures that ggufy can convert, and whether they have sensitivity data available.
+
+| Architecture       | Supported | Sensitivity Data |
+|--------------------|-----------|------------------|
+| SD1.5              | ✅         | ✅                |
+| SDXL               | ✅         | ✅                |
+| Flux               | ✅         | ❌                |
+| Lumina2 (ZiT, ZiB) | ✅         | ❌                |
+| Aura               | ✅         | ❌                |
+| HiDream            | ✅         | ❌                |
+| Cosmos             | ✅         | ❌                |
+| LTXV               | ✅         | ❌                |
+| Hyvid              | ✅         | ❌                |
+| WAN                | ✅         | ❌                |
+| SD3                | ✅         | ❌                |
 
 ### Todos:
 
 - [ ] allow opening st or gguf non-existing path and use for writing (seperate instances for read and write) (gguf done)
-- [x] generate "quantization sensitivity" file, weight tensors 1-100 on how much quantization affects them (list of comepleted architectures below)
+- [x] generate "quantization sensitivity" file, weight tensors 1-100 on how much quantization affects them
 - [x] allow to set output directory and output file when converting
 - [x] starting with q8_0, support actual quantization
 - [ ] allow converting model, encoders, vae by option
@@ -172,10 +190,6 @@ For supported models, sensitivity is enabled by default.
 
 Generating sensitivity data requires generating a large number of images, which can take a long time.
 More architectures will be added as the sensitivity data is generated for them.
-
-Currently supported architectures:
-- SD1.5
-- SDXL
 
 ```bash
 ggufy convert --datatype q4_k sd1.5.safetensors
