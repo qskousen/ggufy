@@ -328,7 +328,13 @@ pub fn main() !void {
                         for (model_tensors.items) |*t| {
                             var num_elements: u64 = 1;
                             for (t.dims) |d| num_elements *= d;
-                            if (num_elements < threshhold) {
+                            if (std.mem.eql(u8, arch.name, "lumina2") and (std.mem.eql(u8, t.name, "x_pad_token") or std.mem.eql(u8, t.name, "cap_pad_token"))) {
+                                // force to f32
+                                std.log.info("Forcing layer {s} to f32 for compatability", .{t.name});
+                                const ggml_type = gguf.GgmlType.f32;
+                                t.type = @tagName(ggml_type);
+                                t.size = ggml_type.calcSizeInBytes(num_elements);
+                            } else if (num_elements < threshhold) {
                                 // this one is too small to quantize
                                 // pass it through unchanged
                             } else if (arch.isHighPrecision(t.name)) {

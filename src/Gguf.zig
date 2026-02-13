@@ -463,6 +463,7 @@ pub fn writeTensorData(self: Gguf, t: types.Tensor, source_dtype: types.DataType
         },
     };
 
+
     // Read source data
     const source_data = try reader.readAlloc(self.allocator, source_size);
     defer self.allocator.free(source_data);
