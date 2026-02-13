@@ -43,12 +43,32 @@ jobs:
           zip ../ggufy-windows-x86_64.zip ggufy.exe
           cd ../..
 
+      - name: Build for macOS x86-64
+        run: |
+          zig build --release=fast -Dtarget=x86_64-macos
+          mkdir -p dist/macos-x86_64
+          cp zig-out/bin/ggufy dist/macos-x86_64/ggufy
+          cd dist/macos-x86_64
+          zip ../ggufy-macos-x86_64.zip ggufy
+          cd ../..
+
+      - name: Build for macOS aarch64
+        run: |
+          zig build --release=fast -Dtarget=aarch64-macos
+          mkdir -p dist/macos-aarch64
+          cp zig-out/bin/ggufy dist/macos-aarch64/ggufy
+          cd dist/macos-aarch64
+          zip ../ggufy-macos-aarch64.zip ggufy
+          cd ../..
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/ggufy-linux-x86_64.zip
             dist/ggufy-windows-x86_64.zip
+            dist/ggufy-macos-x86_64.zip
+            dist/ggufy-macos-aarch64.zip
           draft: false
           prerelease: false
           generate_release_notes: true

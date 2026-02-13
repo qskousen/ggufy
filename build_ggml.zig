@@ -185,14 +185,22 @@ pub const Context = struct {
         sources.appendSlice(ctx.b.allocator, &.{
             ctx.path(&.{ "src", "ggml-cpu", "ggml-cpu.c" }),
             ctx.path(&.{ "src", "ggml-cpu", "ggml-cpu.cpp" }),
-            //ctx.path(&.{ "src", "ggml-cpu", "ggml-cpu-aarch64.cpp" }),
-            //ctx.path(&.{ "src", "ggml-cpu", "ggml-cpu-hbm.cpp" }),
-            //ctx.path(&.{ "src", "ggml-cpu", "ggml-cpu-quants.c" }),
-            ctx.path(&.{ "src", "ggml-cpu", "arch", "x86", "cpu-feats.cpp" }),
-            ctx.path(&.{ "src", "ggml-cpu", "arch", "x86", "quants.c" }),
-            ctx.path(&.{ "src", "ggml-cpu", "amx/amx.cpp" }),
-            ctx.path(&.{ "src", "ggml-cpu", "amx/mmq.cpp" }),
         }) catch unreachable;
+
+        const arch = ctx.options.target.result.cpu.arch;
+        if (arch == .x86_64 or arch == .x86) {
+            sources.appendSlice(ctx.b.allocator, &.{
+                ctx.path(&.{ "src", "ggml-cpu", "arch", "x86", "cpu-feats.cpp" }),
+                ctx.path(&.{ "src", "ggml-cpu", "arch", "x86", "quants.c" }),
+                ctx.path(&.{ "src", "ggml-cpu", "amx/amx.cpp" }),
+                ctx.path(&.{ "src", "ggml-cpu", "amx/mmq.cpp" }),
+            }) catch unreachable;
+        } else if (arch == .aarch64) {
+            sources.appendSlice(ctx.b.allocator, &.{
+                ctx.path(&.{ "src", "ggml-cpu", "arch", "arm", "cpu-feats.cpp" }),
+                ctx.path(&.{ "src", "ggml-cpu", "arch", "arm", "quants.c" }),
+            }) catch unreachable;
+        }
 
         for (sources.items) |src| compile.addCSourceFile(.{ .file = src, .flags = ctx.flags() });
     }
@@ -280,19 +288,25 @@ pub const Context = struct {
     }
 
     fn flags(ctx: Context) []const []const u8 {
-        _ = ctx;
-        return &.{
-            "-fno-sanitize=undefined",
-            "-mavx",
-            "-mavx2",
-            "-mfma",
-            "-mf16c",
-            "-mavx512f",
-            "-mavx512bw",
-            "-mavx512dq",
-            "-mavx512vl",
-            "-U__AVX512BF16__", // Undefine this to prevent using unsupported intrinsics -- causing compile issues
-        };
+        const arch = ctx.options.target.result.cpu.arch;
+        if (arch == .x86_64 or arch == .x86) {
+            return &.{
+                "-fno-sanitize=undefined",
+                "-mavx",
+                "-mavx2",
+                "-mfma",
+                "-mf16c",
+                "-mavx512f",
+                "-mavx512bw",
+                "-mavx512dq",
+                "-mavx512vl",
+                "-U__AVX512BF16__",
+            };
+        } else {
+            return &.{
+                "-fno-sanitize=undefined",
+            };
+        }
     }
 
     fn common(ctx: Context, lib: *CompileStep) void {
