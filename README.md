@@ -3,6 +3,8 @@ A lightweight and efficient tool to convert tensor formats.
 
 ggufy aims to be fast and memory efficient. For reference, on my 9800X3D, it can convert sd 1.5 from safetensors (4.9 GB checkpoint) to q3_k gguf (skipping sensitivity) in about 6 seconds, using a max of about 252 MB of memory. I would like to get this lower (maybe using `mmap`?) but other things are higher priority right now.
 
+ggufy is available as a [pre-built binary](https://github.com/qskousen/ggufy/releases) for Linux, MacOS (arm64 and x86_64), and Windows.
+
 ggufy currently supports safetensors and gguf files.
 
 ggufy is currently very targeted towards image diffusion models, specifically converting from safetensors to various gguf quantizations.
@@ -272,3 +274,4 @@ zig build
 - [ComfyUI-GGUF by city96](https://github.com/city96/ComfyUI-GGUF) for helping me to understand a lot about how the quantization works, as well as architecture detection
 - [llama.cpp.zig](https://github.com/Deins/llama.cpp.zig) for helping get ggml compiling in zig
 - [gguf-docs](https://github.com/iuliaturc/gguf-docs) for helping me understand quantization
+- Random German who helped to get ggufy working on MacOS for arm64 and x86_64
