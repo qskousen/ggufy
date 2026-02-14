@@ -1,20 +1,14 @@
 # ggufy
 A lightweight and efficient tool to convert tensor formats.
 
-ggufy aims to be fast and memory efficient. For reference, on my 9800X3D, it can convert sd 1.5 from safetensors (4.9 GB checkpoint) to q3_k gguf (skipping sensitivity) in about 6 seconds, using a max of about 252 MB of memory. I would like to get this lower (maybe using `mmap`?) but other things are higher priority right now.
+ggufy:
+- is a single-file executable written in zig, for linux, windows, and macos (arm64 and x86_64)
+- is fast and memory efficient
+- supports converting from safetensors to various gguf quantizations
+- supports converting with "[quantization sensitivity](https://github.com/qskousen/ggufy#sensitivity-aware-quantization)" files (some architectures built-in)
+- currently targets image diffusion models (SD1.5, SDXL, etc.)
 
-ggufy is available as a [pre-built binary](https://github.com/qskousen/ggufy/releases) for Linux, MacOS (arm64 and x86_64), and Windows.
-
-ggufy currently supports safetensors and gguf files.
-
-ggufy is currently very targeted towards image diffusion models, specifically converting from safetensors to various gguf quantizations.
-
-ggufy is a work in progress, in the early stages.
-It can convert the most common types of image models from safetensors ("checkpoint" style or unet style),
-but not all architectures are supported yet. Additionally, not all architectures have sensitivity data available yet.
-See the table below for supported architectures.
-Generating the sensitivity files involves generating tens of thousands of images per model, and my GPU is old, so this is a slow process.
-If you are able to provide GPU resources to help with this, please contact me.
+Download pre-built executables [on the releases page](https://github.com/qskousen/ggufy/releases)
 
 ### Supported architectures
 
@@ -47,14 +41,61 @@ I initially intended to have this all in pure zig, but now it includes ggml c/c+
 
 ## Installation
 
-ggufy is a single binary, available for download from the [releases page](https://github.com/qskousen/ggufy/releases).
-Download the version appropriate for your system, extract it, and place it somewhere in your PATH; alternatively, run it directly from that location.
+ggufy is a single-file executable, available for download from the [releases page](https://github.com/qskousen/ggufy/releases).
+Download the version appropriate for your system, extract it, and place it somewhere in your PATH; alternatively, run it directly from wherever you extracted it.
 
 ## Usage
 
-### Basic Commands
+The primary use case for ggufy is converting models from safetensors to gguf format.
 
-ggufy supports several commands for inspecting and converting model files:
+There are three main ways to do that:
+- Using the `convert` command by itself,
+- Using the `template` command to generate a JSON template for a model and using it with `convert`,
+- Using the `convert` command with a sensitivity file to perform sensitivity-aware quantization.
+
+### `Convert` command
+
+```bash
+ggufy convert [OPTIONS] <input-file>
+# Example:
+ggufy convert model.safetensors -d q4_k
+```
+The `convert` command takes a single required argument, the input file to convert.
+It can also take several optional arguments, such as `-d` for specifying the quantization type, `-n` for specifying an output file, and `-o` for specifying the output directory.
+
+```bash
+ggufy convert model.safetensors -d q4_k -n my-model-q4-k -o ./converted/
+```
+
+### `Template` command
+
+You can create a JSON template from an existing GGUF file that you want to copy, and use it with the `convert` command to ensure that the output file has the same structure and metadata as the template.
+This can be useful when ggufy doesn't recognize a model architecture, or you want a specific quantization level for each layer.
+
+```bash
+ggufy template existing.gguf
+# exports to `template.json`; now you can use it to convert another model:
+ggufy convert model.safetensors -t template.json
+```
+
+### `convert` with sensitivity
+
+Sensitivity-aware quantization is enabled by default for supported architectures.
+You can disable it with the `--skip-sensitivity` or `-x` flag.
+You can also specify an aggressiveness level with the `--aggressiveness` or `-a` flag, from 0-100.
+
+Read more about sensitivity-aware quantization [below](#sensitivity-aware-quantization).
+
+```bash
+# less aggressive; more precision, larger filesize
+ggufy convert sdxl.safetensors -d q4_k -a 25
+# more aggressive; less precision, smaller filesize
+ggufy convert sdxl.safetensors -d q4_k -a 75
+```
+
+## Other Commands
+
+ggufy supports several other commands for inspecting model files:
 
 #### View File Header
 
@@ -88,51 +129,22 @@ ggufy metadata model.safetensors
 ggufy metadata model.gguf
 ```
 
+### Quantization Level
 
-#### Generate Template
-
-Export a GGUF model's structure as a JSON template (useful for conversion verification or copying quantization levels and metadata from a known working file):
-
-```bash
-ggufy template model.gguf
-```
-
-
-This creates a `template.json` file containing the tensor names, shapes, and types, as well as metadata.
-
-### Converting Models
-
-The `convert` command is the main feature of ggufy, allowing you to convert safetensors models to GGUF format with various quantization levels.
-
-#### Basic Conversion
-
-Convert a safetensors model to GGUF with default settings:
-
-```bash
-ggufy convert model.safetensors
-```
-
-This will:
-- Auto-detect the model architecture (SD1.5, SDXL, Flux, etc.)
-- Leave the tensor data types unchanged where possible
-- Save to `model-F16.gguf` in the same directory
-
-#### Specify Quantization Level
-
-Convert to a specific quantization type:
+ggufy supports converting models to a variety of quantization levels via the `--datatype` (`-d`) flag.
 
 ```bash
 # Convert to Q4_K (good balance of quality/size)
 ggufy convert --datatype q4_k model.safetensors
 # Convert to Q8_0 (near-lossless)
-ggufy convert --datatype q8_0 model.safetensors
-# Convert to Q2_K (maximum compression)
-ggufy convert --datatype q2_k model.safetensors
+ggufy convert -d q8_0 model.safetensors
+# Convert to Q2_K (maximum compression, highest quality loss)
+ggufy convert -d q2_k model.safetensors
 ```
 
 Available output types:
 - `f32` - 32-bit float (uncompressed)
-- `bf16` - 16-bit float (brainfloat 16, less precision loss than f16)
+- `bf16` - 16-bit float (brainfloat 16, higher precision than f16)
 - `f16` - 16-bit float (half precision)
 - `q8_0` - 8-bit quantization (equivalent to f16 quality)
 - `q5_0` - 5-bit quantization
@@ -144,6 +156,8 @@ Available output types:
 - `q4_k` - 4-bit quantization
 - `q3_k` - 3-bit quantization
 - `q2_k` - 2-bit quantization
+
+The `_k` types have a higher compression ratio than their non-k counterparts, at a small cost of quality.
 
 Importance matrix quantization (`iq2_xxs`, `iq4_xs`, etc) is not yet supported. `f64` is not supported and is automatically downcast to `f32` when converting because ComfyUI, at least, does not support f64 values in gguf files at this time.
 
@@ -170,19 +184,6 @@ ggufy convert --datatype q4_k --threads 8 model.safetensors
 # Use single thread
 ggufy convert --datatype q4_k --threads 1 model.safetensors
 ```
-
-#### Template-based Conversion
-
-Use a pre-defined template to ensure specific tensor shapes and types:
-
-```bash
-# First, generate a template from a working GGUF
-ggufy template reference-model.gguf
-# Then use it to convert another model
-ggufy convert --template template.json model.safetensors
-```
-
-This is useful when you need to match a specific model format exactly.
 
 ### Sensitivity-Aware Quantization
 
@@ -234,7 +235,7 @@ ggufy template converted-model.gguf
 ggufy convert --template template.json --datatype q4_k source-model.safetensors
 ```
 
-### Options Reference
+### Options and Commands Reference
 
 ```
 -h, --help              Display help and exit
