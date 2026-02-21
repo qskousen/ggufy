@@ -24,6 +24,66 @@ pub const ConvertOptions = struct {
     skip_sensitivity: bool,
     quantization_aggressiveness: f32,
     sensitivities_path: ?[]const u8 = null,
+    /// Which quantization families are permitted when sensitivity-scaling.
+    /// Non-quantized types (f16, bf16, f32, f64) and q8_0 are always allowed.
+    /// Defaults to null, meaning "infer from datatype".
+    allowed_quant_families: ?QuantizationFamilies = null,
+};
+
+/// Which sub-families of quantized types may be used during sensitivity-aware
+/// quantization.  Non-quantized types (f16, bf16, f32, f64) and q8_0 are always
+/// permitted regardless of this setting.
+pub const QuantizationFamilies = struct {
+    allow_0: bool = false, // qX_0
+    allow_1: bool = false, // qX_1
+    allow_k: bool = false, // qX_k
+
+    /// Parse a comma-separated string of "0", "1", "k".
+    /// E.g. "0,k" enables qX_0 and qX_k families.
+    pub fn parse(s: []const u8) !QuantizationFamilies {
+        var result = QuantizationFamilies{};
+        var it = std.mem.splitScalar(u8, s, ',');
+        while (it.next()) |tok| {
+            const trimmed = std.mem.trim(u8, tok, " \t");
+            if (std.mem.eql(u8, trimmed, "0")) {
+                result.allow_0 = true;
+            } else if (std.mem.eql(u8, trimmed, "1")) {
+                result.allow_1 = true;
+            } else if (std.mem.eql(u8, trimmed, "k")) {
+                result.allow_k = true;
+            } else {
+                return error.InvalidQuantizationFamily;
+            }
+        }
+        if (!result.allow_0 and !result.allow_1 and !result.allow_k) {
+            return error.InvalidQuantizationFamily;
+        }
+        return result;
+    }
+
+    /// Derive the default families from a datatype — matches the family of
+    /// the requested type so the output stays "within family" by default.
+    pub fn fromDataType(dtype: types.DataType) QuantizationFamilies {
+        const name = @tagName(dtype);
+        return .{
+            .allow_0 = std.mem.endsWith(u8, name, "_0"),
+            .allow_1 = std.mem.endsWith(u8, name, "_1"),
+            .allow_k = std.mem.endsWith(u8, name, "_k"),
+        };
+    }
+
+    /// Returns true when the given QuantizationLevel is permitted.
+    /// Non-quantized levels are always permitted.
+    pub fn allows(self: QuantizationFamilies, level: QuantizationLevel) bool {
+        return switch (level) {
+            // Non-quantized (and q8_0) — always permitted.
+            .q8_0, .f16, .bf16, .f32, .f64 => true,
+            // Quantized — check family.
+            .q2_k, .q3_k, .q4_k, .q5_k, .q6_k => self.allow_k,
+            .q4_0, .q5_0 => self.allow_0,
+            .q4_1, .q5_1 => self.allow_1,
+        };
+    }
 };
 
 /// Entry point: convert a SafeTensors file according to `opts`.
@@ -111,38 +171,64 @@ pub const QuantizationLevel = enum(u8) {
 /// Calculate an appropriate quantization level for one tensor given its
 /// sensitivity score and the user's aggressiveness setting.
 ///
-/// - `sensitivity`:   1–100, 1 = least sensitive, 100 = most sensitive.
-/// - `aggressiveness`: 1–100, 1 = most aggressive (lower precision), 100 = most conservative.
-/// - `target_level`:  the base type requested by the user (e.g. q2_k).
-/// - `source_type`:   the tensor's current type string (e.g. "f16").
+/// Builds a filtered list of only the permitted levels (from target up to
+/// source precision), then interpolates directly within that list so the
+/// full sensitivity range maps evenly across all allowed levels.
+///
+/// - `sensitivity`:    1–100, 1 = least sensitive, 100 = most sensitive.
+/// - `aggressiveness`: 1–100, higher = more aggressive (stays near target).
+/// - `target_level`:   the base type requested by the user (e.g. q2_k).
+/// - `source_type`:    the tensor's current type string (e.g. "f16").
+/// - `families`:       which quantized sub-families are allowed.
 pub fn calculateQuantizationLevel(
     sensitivity: f32,
     aggressiveness: f32,
     target_level: QuantizationLevel,
     source_type: []const u8,
+    families: QuantizationFamilies,
 ) !QuantizationLevel {
     const sens = std.math.clamp(sensitivity, 1.0, 100.0);
     const hard = std.math.clamp(aggressiveness, 1.0, 100.0);
 
+    // Build the filtered level list: all allowed levels from target up to source.
+    // Maximum possible entries is the number of enum variants (14).
+    var allowed_buf: [14]QuantizationLevel = undefined;
+    var allowed_len: usize = 0;
+
     const source_level = try QuantizationLevel.fromString(source_type);
-    const target_idx: f32 = @floatFromInt(@intFromEnum(target_level));
-    const source_idx: f32 = @floatFromInt(@intFromEnum(source_level));
+    const source_idx: u8 = @intFromEnum(source_level);
 
-    // Normalise sensitivity to [0, 1].
+    // When source precision is strictly above f16 (i.e. bf16/f32/f64), selecting
+    // f16 as a "lossless" fallback wastes no space but silently loses precision
+    // compared to bf16.  Exclude it from the candidate set in that case so the
+    // sensitivity scaling skips straight to bf16.
+    const skip_f16 = source_idx > @intFromEnum(QuantizationLevel.f16);
+
+    var i: u8 = @intFromEnum(target_level);
+    while (i <= source_idx) : (i += 1) {
+        if (skip_f16 and i == @intFromEnum(QuantizationLevel.f16)) continue;
+        const candidate: QuantizationLevel = @enumFromInt(i);
+        if (families.allows(candidate)) {
+            allowed_buf[allowed_len] = candidate;
+            allowed_len += 1;
+        }
+    }
+
+    // If nothing matched (shouldn't happen given q8_0/f-types are always allowed),
+    // fall back to source precision.
+    if (allowed_len == 0) return source_level;
+
+    // Interpolate within the filtered list.
+    // norm_sens 0.0 → allowed_buf[0] (target/lowest), 1.0 → allowed_buf[last] (highest).
     const norm_sens = (sens - 1.0) / 99.0;
-
-    // Exponent range 0.5–3.5: lower hardness → stays near the aggressive target.
     const hardness_factor = hard / 100.0;
     const exponent = 0.5 + (hardness_factor * 3.0);
     const adjusted_sens = std.math.pow(f32, norm_sens, exponent);
 
-    // Interpolate between target and source precision indices.
-    const result_idx = target_idx + (adjusted_sens * (source_idx - target_idx));
-    const rounded_idx: u8 = @intFromFloat(@round(result_idx));
-
-    // Never exceed source precision.
-    const final_idx = @min(rounded_idx, @intFromEnum(source_level));
-    return @enumFromInt(final_idx);
+    const max_idx: f32 = @floatFromInt(allowed_len - 1);
+    const raw = adjusted_sens * max_idx;
+    const picked: usize = @intFromFloat(@round(raw));
+    return allowed_buf[@min(picked, allowed_len - 1)];
 }
 
 // ============================================================================
@@ -353,6 +439,18 @@ fn assignQuantTypes(
     }
 }
 
+/// Returns the effective QuantizationFamilies: user-supplied if present,
+/// otherwise inferred from the target datatype, otherwise all-enabled.
+fn resolvedFamilies(opts: ConvertOptions) QuantizationFamilies {
+    if (opts.allowed_quant_families) |f| return f;
+    if (opts.datatype) |dt| {
+        const derived = QuantizationFamilies.fromDataType(dt);
+        // If the datatype has no family suffix (e.g. f16), allow all quant families.
+        if (derived.allow_0 or derived.allow_1 or derived.allow_k) return derived;
+    }
+    return .{ .allow_0 = true, .allow_1 = true, .allow_k = true };
+}
+
 /// Decide the GGUF type for a single tensor and update its `type` and `size`
 /// fields in-place. Does not touch `offset` — that's done by the caller.
 fn assignTensorType(
@@ -392,7 +490,7 @@ fn assignTensorType(
     }
 
     if (use_sensitivity) {
-        try applySensitivityQuantization(t, num_elements, dtype, ggml_type, opts.quantization_aggressiveness, sensitivities.?);
+        try applySensitivityQuantization(t, num_elements, dtype, ggml_type, opts.quantization_aggressiveness, resolvedFamilies(opts), sensitivities.?);
     } else {
         std.log.debug("Will convert tensor {s} to type {s}", .{ t.name, @tagName(ggml_type) });
         t.type = @tagName(ggml_type);
@@ -407,6 +505,7 @@ fn applySensitivityQuantization(
     dtype: types.DataType,
     fallback_type: gguf.GgmlType,
     aggressiveness: f32,
+    families: QuantizationFamilies,
     sensitivities: *const std.json.Parsed(std.json.Value),
 ) !void {
     const sens_value = sensitivities.value.object.get(t.name);
@@ -418,7 +517,7 @@ fn applySensitivityQuantization(
         };
 
         const target_level = try QuantizationLevel.fromString(@tagName(dtype));
-        const quant_level = try calculateQuantizationLevel(sens, aggressiveness, target_level, t.type);
+        const quant_level = try calculateQuantizationLevel(sens, aggressiveness, target_level, t.type, families);
 
         const final_type_str = @tagName(quant_level);
         const final_ggml_type = try gguf.GgmlType.fromString(final_type_str);

@@ -83,6 +83,7 @@ ggufy convert model.safetensors -t template.json
 Sensitivity-aware quantization is enabled by default for supported architectures.
 You can disable it with the `--skip-sensitivity` or `-x` flag.
 You can also specify an aggressiveness level with the `--aggressiveness` or `-a` flag, from 0-100.
+You can also pass in a custom sensitivity file with the `--sensitivities` or `-s` flag.
 
 Read more about sensitivity-aware quantization [below](#sensitivity-aware-quantization).
 
@@ -91,6 +92,8 @@ Read more about sensitivity-aware quantization [below](#sensitivity-aware-quanti
 ggufy convert sdxl.safetensors -d q4_k -a 25
 # more aggressive; less precision, smaller filesize
 ggufy convert sdxl.safetensors -d q4_k -a 75
+# custom sensitivity file
+ggufy convert sdxl.safetensors -d q4_k -s custom-sensitivity.json
 ```
 
 ## Other Commands
@@ -216,6 +219,22 @@ Sensitivity quantization can be turned off with `--skip-sensitivity` or `-x` if 
 
 ```bash
 ggufy convert --datatype q4_k sd1.5.safetensors --skip-sensitivity
+```
+
+You can also specify a custom sensitivity file with `--sensitivities` or `-s`. For an example sensitivity file, look in the `src/sensitivities` directory.
+
+```bash
+ggufy convert --datatype q4_k sd1.5.safetensors --sensitivities custom-sensitivity.json
+```
+
+By default, the quantization levels will be chosen based on the target datatype: `QX_K` variants for a `_k` target datatype, `QX_1` variants for a `_1` target datatype, and `QX_0` variants for a `_0` target datatype.
+Non-quantized datatypes (up to the source datatype) and Q8_0 are allowed in all cases.
+You can override this by specifying which quantization types to enable with `--use-quant-types` or `-q` followed by a list seperated by commas. The choices are `0`, `1`, `k` to select those quantization types.
+
+For example, if you want to use K types and 0 types, you can do:
+
+```bash
+ggufy convert --datatype q4_k --use-quant-types k,0 sd1.5.safetensors
 ```
 
 ### Complete Examples

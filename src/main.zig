@@ -31,6 +31,7 @@ pub fn main() !void {
         \\-a, --aggressiveness <INT>     How aggressively to quantize layers when using sensitivity. 100 is most aggressive, 1 is least.
         \\-x, --skip-sensitivity         Pass this to not use a built-in layer sensitivity file and just blindly quantize to target type.
         \\-s, --sensitivities <FILENAME> Path to a sensitivities JSON file to use (overrides built-in sensitivities).
+        \\-q, --use-quant-types <QTYPES> Quantization families to use with sensitivity (e.g. "k", "0,k", "0,1,k"). Default: match datatype.
         \\<COMMAND>    Specify a command: header, tree, metadata, convert, template
         \\<FILENAME>   The file to use for input
     );
@@ -42,6 +43,7 @@ pub fn main() !void {
         .FILENAME = clap.parsers.string,
         .DIR = clap.parsers.string,
         .INT = clap.parsers.int(usize, 10),
+        .QTYPES = clap.parsers.string,
     };
 
     // Initialize our diagnostics, which can be used for reporting useful errors.
@@ -99,6 +101,14 @@ pub fn main() !void {
     const quantization_aggressiveness: f32 = @floatFromInt(res.args.aggressiveness orelse 50);
     const sensitivities_path = res.args.sensitivities;
 
+    const allowed_quant_families: ?conv.QuantizationFamilies = if (res.args.@"use-quant-types") |s|
+        conv.QuantizationFamilies.parse(s) catch {
+            std.log.err("Invalid --use-quant-types value '{s}'. Use a comma-separated list of: 0, 1, k", .{s});
+            return;
+        }
+    else
+        null;
+
     const file = try std.fs.cwd().openFile(path, .{ .mode = .read_only });
 
     var read_buffer: [8]u8 = undefined;
@@ -137,6 +147,7 @@ pub fn main() !void {
                         .skip_sensitivity = skip_sensitivity,
                         .quantization_aggressiveness = quantization_aggressiveness,
                         .sensitivities_path = sensitivities_path,
+                        .allowed_quant_families = allowed_quant_families,
                     }, allocator, arena_alloc);
                 },
                 .template => {
