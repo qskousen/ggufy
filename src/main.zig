@@ -134,7 +134,7 @@ pub fn main() !void {
                         .threads = threads,
                         .skip_sensitivity = skip_sensitivity,
                         .quantization_aggressiveness = quantization_aggressiveness,
-                    }, allocator, arena_alloc, stdout);
+                    }, allocator, arena_alloc);
                 },
                 .template => {
                     return error.Unimplimented;
@@ -145,11 +145,10 @@ pub fn main() !void {
             var f = try gguf.init(path, allocator, arena_alloc, false);
             defer f.deinit();
 
-            try stdout.print("GGUF format version {}\n", .{f.version});
-            try stdout.flush();
+            std.log.info("GGUF format version {}", .{f.version});
             switch (command) {
                 .header => {
-                    try f.readGgufTensorHeader(stdout);
+                    try f.readGgufTensorHeader();
                 },
                 .tree => {
                     return error.Unimplemented;
@@ -169,7 +168,7 @@ pub fn main() !void {
 
                     try f.writeTemplate(writer);
                     try writer.flush();
-                    try stdout.print("Template exported to template.json\n", .{});
+                    std.log.info("Template exported to template.json", .{});
                 },
             }
         },

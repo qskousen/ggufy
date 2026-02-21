@@ -27,13 +27,11 @@ pub const ConvertOptions = struct {
 
 /// Entry point: convert a SafeTensors file according to `opts`.
 /// `f` is the already-opened SafeTensors handle.
-/// `stdout` is used for progress output.
 pub fn convert(
     f: *st,
     opts: ConvertOptions,
     allocator: std.mem.Allocator,
     arena_alloc: std.mem.Allocator,
-    stdout: anytype,
 ) !void {
     // --- Detect architecture --------------------------------------------------
     const arch = try imagearch.detectArchFromTensorsOrError(f.tensors.items, allocator);
@@ -48,7 +46,7 @@ pub fn convert(
     if (opts.template_path) |tp| {
         template_metadata = try applyTemplate(tp, &model_tensors, arena_alloc);
     } else {
-        try assignQuantTypes(&model_tensors, arch, threshold, opts, arena_alloc, stdout);
+        try assignQuantTypes(&model_tensors, arch, threshold, opts, arena_alloc);
     }
 
     // --- Shape fix ------------------------------------------------------------
@@ -56,7 +54,6 @@ pub fn convert(
     if (arch.shape_fix) {
         try applyShapeFix(&model_tensors, &extra_metadata, arena_alloc);
     }
-    try stdout.flush();
 
     // --- Sort tensors alphabetically -----------------------------------------
     std.sort.block(types.Tensor, model_tensors.items, {}, struct {
@@ -76,7 +73,6 @@ pub fn convert(
             opts,
             allocator,
             arena_alloc,
-            stdout,
         ),
         .safetensors => return error.Unimplimented,
     }
@@ -308,7 +304,6 @@ fn assignQuantTypes(
     threshold: u64,
     opts: ConvertOptions,
     arena_alloc: std.mem.Allocator,
-    stdout: anytype,
 ) !void {
     // Load sensitivities if available and not skipped.
     var use_sensitivity = false;
@@ -335,10 +330,8 @@ fn assignQuantTypes(
             t.size = fat_type.calcSizeInBytes(num_elements);
         }
 
-        try stdout.print("Calculated size {} for type {s} with num elements {} with dims [", .{ t.size, t.type, num_elements });
-        for (t.dims) |d| try stdout.print("{}, ", .{d});
-        try stdout.print("]\n", .{});
-        try stdout.flush();
+        std.log.debug("Calculated size {} for type {s} with num elements {} with dims [", .{ t.size, t.type, num_elements });
+        for (t.dims) |d| std.log.debug("  {}", .{d});
 
         // TODO: make alignment configurable.
         const padding_len = (32 - (t.size % 32)) % 32;
@@ -488,7 +481,6 @@ fn writeGguf(
     opts: ConvertOptions,
     allocator: std.mem.Allocator,
     arena_alloc: std.mem.Allocator,
-    stdout: anytype,
 ) !void {
     // --- Resolve output path -------------------------------------------------
     const dir_path = if (opts.output_dir) |od| od else std.fs.path.dirname(opts.path) orelse ".";
@@ -541,6 +533,6 @@ fn writeGguf(
             try out_gguf.metadata.put(try arena_alloc.dupe(u8, entry.key_ptr.*), entry.value_ptr.*);
     }
 
-    try out_gguf.saveWithSTData(f, stdout, opts.threads);
-    try stdout.print("Converted to {s}\n", .{out_filename});
+    try out_gguf.saveWithSTData(f, opts.threads);
+    std.log.info("Converted to {s}", .{out_filename});
 }

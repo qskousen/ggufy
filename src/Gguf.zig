@@ -338,7 +338,7 @@ const GgufMetadata = struct {
     }
 };
 
-pub fn saveWithSTData(self: Gguf, source: *st, stdout: *std.io.Writer, threads: usize) !void {
+pub fn saveWithSTData(self: Gguf, source: *st, threads: usize) !void {
     // we need to track bytes written for calculating alignment for the starting tensor
     var bytes_written: u64 = 0;
 
@@ -346,19 +346,16 @@ pub fn saveWithSTData(self: Gguf, source: *st, stdout: *std.io.Writer, threads: 
     var write_buffer: [1024 * 1024]u8 = undefined;
     var writer = self.file.writer(&write_buffer);
 
-    try stdout.print("Writing GGUF header\n", .{});
-    try stdout.flush();
+    std.log.info("Writing GGUF header", .{});
     bytes_written += try Gguf.writeHeaderTracked(&writer.interface, self.tensors.items.len, self.metadata.count());
 
-    try stdout.print("Writing {} metadata entries\n", .{self.metadata.count()});
-    try stdout.flush();
+    std.log.info("Writing {} metadata entries", .{self.metadata.count()});
     var meta_it = self.metadata.iterator();
     while (meta_it.next()) |meta| {
         bytes_written += try Gguf.writeMetadataKVJsonTracked(&writer.interface, meta.key_ptr.*, meta.value_ptr.*);
     }
 
-    try stdout.print("Writing tensor info for {} tensors\n", .{self.tensors.items.len});
-    try stdout.flush();
+    std.log.info("Writing tensor info for {} tensors", .{self.tensors.items.len});
     var offset: u64 = 0;
     for (self.tensors.items) |t| {
         //std.log.debug("Trying to convert {s} to GgmlType", .{t.type});
@@ -374,8 +371,7 @@ pub fn saveWithSTData(self: Gguf, source: *st, stdout: *std.io.Writer, threads: 
     // write any additional alignment bytes needed
     try self.maybeWritePadding(bytes_written, &writer.interface);
 
-    try stdout.print("Writing tensor data for {} tensors\n", .{self.tensors.items.len});
-    try stdout.flush();
+    std.log.info("Writing tensor data for {} tensors", .{self.tensors.items.len});
     // write the tensor data itself
     // we need to write them in the order of our tensors, but there is no guarantee that the source tensors will be in the same order
     // the names might also be different, so we have to do some matching
@@ -393,7 +389,7 @@ pub fn saveWithSTData(self: Gguf, source: *st, stdout: *std.io.Writer, threads: 
                     matched = true;
                     var elements: usize = 1;
                     for (t.dims) |d| elements *= d;
-                    try stdout.print("Writing tensor data for tensor {}/{} {s} - {s} to {s}, {} elements\n", .{
+                    std.log.info("Writing tensor data for tensor {}/{} {s} - {s} to {s}, {} elements", .{
                         count,
                         self.tensors.items.len,
                         t.name,
@@ -401,7 +397,6 @@ pub fn saveWithSTData(self: Gguf, source: *st, stdout: *std.io.Writer, threads: 
                         t.type,
                         elements,
                     });
-                    try stdout.flush();
                     // convert source tensor type to gguf type
                     const source_dtype = try types.DataType.fromString(source_tensor.type);
 
@@ -417,7 +412,7 @@ pub fn saveWithSTData(self: Gguf, source: *st, stdout: *std.io.Writer, threads: 
                 }
         }
         if (! matched) {
-            try stdout.print("Could not find source tensor match for tensor {s}!\n", .{t.name});
+            std.log.warn("Could not find source tensor match for tensor {s}!", .{t.name});
             return error.NoMatchingSourceTensor;
         }
     }
@@ -672,8 +667,8 @@ fn printJsonValue(self: Gguf, writer: *std.io.Writer, val: std.json.Value, depth
     }
 }
 
-pub fn readGgufTensorHeader(self: Gguf, stdout: *std.io.Writer) !void {
-    try stdout.print("Tensor count: {}\n", .{self.tensors.items.len});
+pub fn readGgufTensorHeader(self: Gguf) !void {
+    std.log.info("Tensor count: {}", .{self.tensors.items.len});
 
     var type_counts = std.AutoHashMap(GgmlType, usize).init(self.allocator);
     defer type_counts.deinit();
@@ -717,14 +712,14 @@ pub fn readGgufTensorHeader(self: Gguf, stdout: *std.io.Writer) !void {
             } else if (self.file_size > 0 and self.data_offset > 0) {
                 // Total data section size available on disk from this tensor's start
                     const start_pos = std.math.add(u64, self.data_offset, tensor.offset) catch |err| {
-                    try stdout.print("Warning: Overflow calculating tensor start position for {s}: {}\n", .{ tensor.name, err });
+                    std.log.warn("Warning: Overflow calculating tensor start position for {s}: {}", .{ tensor.name, err });
                     bad_size = true;
                     bad_size_count += 1;
                     continue;
                 };
 
                 const disk_size_remaining = std.math.sub(u64, self.file_size, start_pos) catch {
-                    try stdout.print("Warning: Tensor {s} start position {} is beyond file size {}\n", .{ tensor.name, start_pos, self.file_size });
+                    std.log.warn("Warning: Tensor {s} start position {} is beyond file size {}", .{ tensor.name, start_pos, self.file_size });
                     bad_size = true;
                     bad_size_count += 1;
                     continue;
@@ -740,38 +735,38 @@ pub fn readGgufTensorHeader(self: Gguf, stdout: *std.io.Writer) !void {
                     bad_size_count += 1;
                 }
             } else {
-                try stdout.print("Could not check size of last tensor: file size ({}) or data offset ({}) not set!\n", .{ self.file_size, self.data_offset });
+                std.log.warn("Could not check size of last tensor: file size ({}) or data offset ({}) not set!", .{ self.file_size, self.data_offset });
             }
 
             if (tt.isUnsupported()) {
-                try stdout.print("{s}: {} (Unsupported type!!!) [", .{ tensor.name, tt });
+                std.log.warn("{s}: {} (Unsupported type!!!) [", .{ tensor.name, tt });
             } else if (bad_size) {
-                try stdout.print("{s}: {} (BAD SIZE: actual: {}, expected raw: {} expected with padding: {}) [", .{ tensor.name, tt, actual_size, total_bytes, expected_padded_size });
+                std.log.warn("{s}: {} (BAD SIZE: actual: {}, expected raw: {} expected with padding: {}) [", .{ tensor.name, tt, actual_size, total_bytes, expected_padded_size });
             } else {
-                try stdout.print("{s}: {} [", .{ tensor.name, tt });
+                std.log.info("{s}: {} [", .{ tensor.name, tt });
             }
         } else {
-            try stdout.print("{s}: Unknown Type [", .{tensor.name});
+            std.log.warn("{s}: Unknown Type [", .{tensor.name});
         }
 
         for (tensor.dims, 0..) |dim, j| {
-            try stdout.print("{}", .{dim});
+            std.log.info("{}", .{dim});
             if (j < tensor.dims.len - 1) {
-                try stdout.print(", ", .{});
+                std.log.info(", ", .{});
             }
         }
-        try stdout.print("] offset from tensor data start {}, offset from file start {}\n", .{ tensor.offset, tensor.offset + self.data_offset });
+        std.log.info("] offset from tensor data start {}, offset from file start {}", .{ tensor.offset, tensor.offset + self.data_offset });
     }
 
     if (type_counts.count() > 0) {
-        try stdout.print("\n\nTensor Type Statistics:\n", .{});
+        std.log.info("\n\nTensor Type Statistics:", .{});
         var stats_it = type_counts.iterator();
         while (stats_it.next()) |entry| {
-            try stdout.print("  {s}: {}\n", .{ @tagName(entry.key_ptr.*), entry.value_ptr.* });
+            std.log.info("  {s}: {}", .{ @tagName(entry.key_ptr.*), entry.value_ptr.* });
         }
     }
     if (bad_size_count > 0) {
-        try stdout.print("\nTensors found with a bad size (tensor data + alignment doesn't match size on disk): {}\n", .{bad_size_count});
+        std.log.info("\nTensors found with a bad size (tensor data + alignment doesn't match size on disk): {}\n", .{bad_size_count});
     }
 }
 
