@@ -23,6 +23,7 @@ pub const ConvertOptions = struct {
     threads: usize,
     skip_sensitivity: bool,
     quantization_aggressiveness: f32,
+    sensitivities_path: ?[]const u8 = null,
 };
 
 /// Entry point: convert a SafeTensors file according to `opts`.
@@ -308,10 +309,22 @@ fn assignQuantTypes(
     // Load sensitivities if available and not skipped.
     var use_sensitivity = false;
     var sensitivities: std.json.Parsed(std.json.Value) = undefined;
-    if (arch.sensitivities.len > 1 and !opts.skip_sensitivity) {
-        std.log.debug("Using sensitivities file for {s}", .{arch.name});
-        sensitivities = try std.json.parseFromSlice(std.json.Value, arena_alloc, arch.sensitivities, .{});
-        use_sensitivity = true;
+
+    if (!opts.skip_sensitivity) {
+        if (opts.sensitivities_path) |sp| {
+            // User-supplied file overrides the built-in one.
+            std.log.info("Using user-supplied sensitivities file: {s}", .{sp});
+            const sens_file = try std.fs.cwd().openFile(sp, .{});
+            defer sens_file.close();
+            const sens_content = try sens_file.readToEndAlloc(arena_alloc, 32 * 1024 * 1024);
+            sensitivities = try std.json.parseFromSlice(std.json.Value, arena_alloc, sens_content, .{});
+            use_sensitivity = true;
+        } else if (arch.sensitivities.len > 1) {
+            // Fall back to built-in sensitivities for this architecture.
+            std.log.debug("Using built-in sensitivities file for {s}", .{arch.name});
+            sensitivities = try std.json.parseFromSlice(std.json.Value, arena_alloc, arch.sensitivities, .{});
+            use_sensitivity = true;
+        }
     }
 
     var offset: u64 = 0;
