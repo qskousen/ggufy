@@ -265,7 +265,9 @@ ggufy convert --template template.json --datatype q4_k source-model.safetensors
 -n, --output-name       Output filename without extension (default: source name + datatype) 
 -j, --threads           Number of threads for quantization (default: CPU cores - 2)
 -a, --aggressiveness    Aggressiveness of sensitivity-aware quantization (default: 50)
--s, --skip-sensitivity  Skip sensitivity-aware quantization, quantizing all available layers to target datatype
+-x, --skip-sensitivity  Skip sensitivity-aware quantization, quantizing all available layers to target datatype
+-s, --sensitivities     Path to custom sensitivity file 
+-q, --use-quant-types   Comma-separated list of quantization types to use (0,1,k) (default: based on target datatype)
 
 Commands: 
 header - Display file header information 
