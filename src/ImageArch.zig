@@ -94,11 +94,6 @@ pub const Arch = struct {
     }
 };
 
-pub const ArchMatchResult = struct {
-    matched: bool,
-    invalid: bool,
-};
-
 fn allKeysPresent(key_set: []const []const u8, tensor_names: []const []const u8) bool {
     for (key_set) |key| {
         if (!containsKey(tensor_names, key)) {
