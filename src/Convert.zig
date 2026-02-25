@@ -429,8 +429,12 @@ fn assignQuantTypes(
             t.size = fat_type.calcSizeInBytes(num_elements);
         }
 
-        std.log.debug("Calculated size {} for type {s} with num elements {} with dims [", .{ t.size, t.type, num_elements });
-        for (t.dims) |d| std.log.debug("  {}", .{d});
+        var dims_buf = try std.ArrayList(u8).initCapacity(arena_alloc, 5);
+        for (t.dims, 0..) |d, i| {
+            if (i > 0) try dims_buf.appendSlice(arena_alloc, ", ");
+            try std.fmt.format(dims_buf.writer(arena_alloc), "{}", .{d});
+        }
+        std.log.debug("Calculated size {} for type {s} with num elements {} with dims [{s}]", .{ t.size, t.type, num_elements, dims_buf.items });
 
         // TODO: make alignment configurable.
         const padding_len = (32 - (t.size % 32)) % 32;
@@ -463,15 +467,13 @@ fn assignTensorType(
     sensitivities: ?*const std.json.Parsed(std.json.Value),
 ) !void {
     // Architecture-specific overrides first.
-    if (std.mem.eql(u8, arch.name, "lumina2") and
-        (std.mem.eql(u8, t.name, "x_pad_token") or std.mem.eql(u8, t.name, "cap_pad_token")))
-        {
-            std.log.info("Forcing layer {s} to f32 for compatability", .{t.name});
-            const ggml_type = gguf.GgmlType.f32;
-            t.type = @tagName(ggml_type);
-            t.size = ggml_type.calcSizeInBytes(num_elements);
-            return;
-        }
+    if (arch.shouldUpcast(t.name)) {
+        std.log.info("Forcing layer {s} to f32 for compatability", .{t.name});
+        const ggml_type = gguf.GgmlType.f32;
+        t.type = @tagName(ggml_type);
+        t.size = ggml_type.calcSizeInBytes(num_elements);
+        return;
+    }
 
     // Too small to quantize — leave it alone.
     if (num_elements < threshold) return;

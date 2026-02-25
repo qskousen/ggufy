@@ -20,21 +20,27 @@ pub const Arch = struct {
     threshhold: ?u64,
     /// Sensitivities filename; json dictionary of layer names and their relative sensitivity to quantization, 1-100
     sensitivities: []const u8 = "",
+    /// Keys that should be upcast from bf16 to fp32 (start with a dot for end match)
+    upcast_from_bf16: []const []const u8 = &.{},
 
     /// Check if this architecture matches the given tensor names
-    pub fn matches(self: Arch, tensor_names: []const []const u8) ArchMatchResult {
+    pub fn matches(self: Arch, tensor_names: []const []const u8) bool {
         for (self.keys_detect) |key_set| {
             if (allKeysPresent(key_set, tensor_names)) {
-                // Check if any banned keys are present
-                for (self.keys_banned) |banned| {
-                    if (containsKey(tensor_names, banned)) {
-                        return .{ .matched = false, .invalid = true };
+                // Check if any banned keys are present; if so, skip this key set
+                var banned = false;
+                for (self.keys_banned) |banned_key| {
+                    if (containsKey(tensor_names, banned_key)) {
+                        std.log.debug("Skipping key set for architecture {s}: found banned key {s}", .{ self.name, banned_key });
+                        banned = true;
+                        break;
                     }
                 }
-                return .{ .matched = true, .invalid = false };
+                if (banned) continue;
+                return true;
             }
         }
-        return .{ .matched = false, .invalid = false };
+        return false;
     }
 
     /// Check if a key should be kept in high precision
@@ -71,6 +77,20 @@ pub const Arch = struct {
     /// Check if any of the given tensor names are banned (returns bool)
     pub fn hasBannedKeys(self: Arch, tensor_names: []const []const u8) bool {
         return self.findBannedKey(tensor_names) != null;
+    }
+
+    /// Check if the key should be upcast from bf16
+    pub fn shouldUpcast(self: Arch, tensor_name: []const u8) bool {
+        for (self.upcast_from_bf16) |pattern| {
+            if (pattern.len > 0 and pattern[0] == '.') {
+                // Dot-prefixed: match if tensor_name ends with this pattern
+                if (std.mem.endsWith(u8, tensor_name, pattern)) return true;
+            } else {
+                // No dot: match if tensor_name equals this pattern
+                if (std.mem.eql(u8, tensor_name, pattern)) return true;
+            }
+        }
+        return false;
     }
 };
 
@@ -261,6 +281,30 @@ pub const lumina2 = Arch{
         "norm_final.weight",
     },
     .threshhold = 8192,
+    .upcast_from_bf16 = &.{
+        "cap_pad_token",
+        "x_pad_token",
+    },
+};
+
+pub const qwen = Arch{
+    .name = "qwen",
+    .keys_detect = &.{
+        &.{
+            "time_text_embed.timestep_embedder.linear_2.weight",
+            "transformer_blocks.0.attn.norm_added_q.weight",
+            "transformer_blocks.0.img_mlp.net.0.proj.weight",
+        },
+    },
+    .shape_fix = true,
+    .threshhold = null,
+    .upcast_from_bf16 = &.{
+        "txt_norm.weight",
+        ".norm_k.weight",
+        ".norm_q.weight",
+        ".norm_added_k.weight",
+        ".norm_added_q.weight",
+    },
 };
 
 /// List of all known architectures, in detection priority order
@@ -276,14 +320,14 @@ pub const arch_list = [_]*const Arch{
     &sdxl,
     &sd1,
     &lumina2,
+    &qwen,
 };
 
 /// Detect architecture from a list of tensor names
 /// Returns the matching Arch or null if unknown
 pub fn detectArch(tensor_names: []const []const u8) ?*const Arch {
     for (arch_list) |arch| {
-        const result = arch.matches(tensor_names);
-        if (result.matched) {
+        if (arch.matches(tensor_names)) {
             return arch;
         }
     }
@@ -304,11 +348,7 @@ pub fn detectArchFromTensors(tensors: []const types.Tensor, allocator: std.mem.A
 /// Detect architecture and return error if not found or invalid
 pub fn detectArchOrError(tensor_names: []const []const u8) ArchError!*const Arch {
     for (arch_list) |arch| {
-        const result = arch.matches(tensor_names);
-        if (result.invalid) {
-            return ArchError.InvalidModelFormat;
-        }
-        if (result.matched) {
+        if (arch.matches(tensor_names)) {
             return arch;
         }
     }
@@ -325,11 +365,7 @@ pub fn detectArchFromTensorsOrError(tensors: []const types.Tensor, allocator: st
     }
 
     for (arch_list) |arch| {
-        const result = arch.matches(names);
-        if (result.invalid) {
-            return ArchError.InvalidModelFormat;
-        }
-        if (result.matched) {
+        if (arch.matches(names)) {
             return arch;
         }
     }
@@ -401,6 +437,21 @@ test "detect sdxl architecture" {
     try std.testing.expect(arch.?.shape_fix);
 }
 
+test "detect qwen architecture" {
+    // this will match flux as well, but has a banned key, so it should skip flux and match qwen
+    const names = [_][]const u8{
+        "time_text_embed.timestep_embedder.linear_2.weight",
+        "transformer_blocks.0.attn.norm_added_q.weight",
+        "transformer_blocks.0.img_mlp.net.0.proj.weight",
+        "transformer_blocks.0.attn.norm_added_k.weight",
+        "transformer_blocks.0.attn.norm_added_k.weight",
+    };
+    const arch = detectArch(&names);
+    try std.testing.expect(arch != null);
+    try std.testing.expectEqualStrings("qwen", arch.?.name);
+    try std.testing.expect(arch.?.shape_fix);
+}
+
 test "detect architecture from tensors with allocator" {
     const allocator = std.testing.allocator;
     const tensors = [_]types.Tensor{
@@ -433,16 +484,34 @@ test "ignore key detection" {
 }
 
 test "banned key detection with allocator" {
-    const allocator = std.testing.allocator;
     const tensors_with_banned = [_]types.Tensor{
         .{ .name = "double_blocks.0.img_attn.proj.weight", .type = "F16", .dims = &.{}, .size = 0, .offset = 0 },
         .{ .name = "transformer_blocks.0.attn.norm_added_k.weight", .type = "F16", .dims = &.{}, .size = 0, .offset = 0 },
     };
-    try std.testing.expect(try hasBannedKeysInTensors(&flux, &tensors_with_banned, allocator));
+    try std.testing.expect(hasBannedKeysInTensors(&flux, &tensors_with_banned));
 
     const tensors_without_banned = [_]types.Tensor{
         .{ .name = "double_blocks.0.img_attn.proj.weight", .type = "F16", .dims = &.{}, .size = 0, .offset = 0 },
         .{ .name = "some.other.tensor", .type = "F16", .dims = &.{}, .size = 0, .offset = 0 },
     };
-    try std.testing.expect(!try hasBannedKeysInTensors(&flux, &tensors_without_banned, allocator));
+    try std.testing.expect(! hasBannedKeysInTensors(&flux, &tensors_without_banned));
+}
+
+test "qwen upcast from bf16 - exact match" {
+    try std.testing.expect(qwen.shouldUpcast("txt_norm.weight"));
+    try std.testing.expect(!qwen.shouldUpcast("txt_norm.bias"));
+    try std.testing.expect(!qwen.shouldUpcast("some.txt_norm.weight")); // not exact
+}
+
+test "qwen upcast from bf16 - suffix match" {
+    try std.testing.expect(qwen.shouldUpcast("transformer_blocks.0.attn.norm_k.weight"));
+    try std.testing.expect(qwen.shouldUpcast("transformer_blocks.5.attn.norm_q.weight"));
+    try std.testing.expect(qwen.shouldUpcast("transformer_blocks.0.attn.norm_added_k.weight"));
+    try std.testing.expect(qwen.shouldUpcast("transformer_blocks.0.attn.norm_added_q.weight"));
+}
+
+test "qwen upcast from bf16 - no false positives" {
+    try std.testing.expect(!qwen.shouldUpcast("transformer_blocks.0.attn.norm_k.bias"));
+    try std.testing.expect(!qwen.shouldUpcast("some.other.weight"));
+    try std.testing.expect(!qwen.shouldUpcast("norm_k.weight.extra")); // suffix only, not contains
 }

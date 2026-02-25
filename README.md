@@ -27,6 +27,7 @@ This table lists the architectures that ggufy can convert, and whether they have
 | Hyvid              | ✅         | ❌                |
 | WAN                | ✅         | ❌                |
 | SD3                | ✅         | ❌                |
+| Qwen               | ✅         | ❌                |
 
 ### Todos:
 

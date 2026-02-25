@@ -680,6 +680,12 @@ pub fn readGgufTensorHeader(self: Gguf) !void {
 
         var bad_size = false;
 
+        var dims_buf = try std.ArrayList(u8).initCapacity(self.arena_alloc, 5);
+        for (tensor.dims, 0..) |d, j| {
+            if (j > 0) try dims_buf.appendSlice(self.arena_alloc, ", ");
+            try std.fmt.format(dims_buf.writer(self.arena_alloc), "{}", .{d});
+        }
+
         if (tensor_type) |tt| {
             const g = try type_counts.getOrPut(tt);
             if (!g.found_existing) g.value_ptr.* = 0;
@@ -739,23 +745,27 @@ pub fn readGgufTensorHeader(self: Gguf) !void {
             }
 
             if (tt.isUnsupported()) {
-                std.log.warn("{s}: {} (Unsupported type!!!) [", .{ tensor.name, tt });
+                std.log.warn(
+                    "{s}: {} (Unsupported type!!!) [{s}] offset from tensor data start {}, offset from file start {}",
+                    .{ tensor.name, tt, dims_buf.items, tensor.offset, tensor.offset + self.data_offset }
+                );
             } else if (bad_size) {
-                std.log.warn("{s}: {} (BAD SIZE: actual: {}, expected raw: {} expected with padding: {}) [", .{ tensor.name, tt, actual_size, total_bytes, expected_padded_size });
+                std.log.warn(
+                    "{s}: {} (BAD SIZE: actual: {}, expected raw: {} expected with padding: {}) [{s}] offset from tensor data start {}, offset from file start {}",
+                    .{ tensor.name, tt, actual_size, total_bytes, expected_padded_size, dims_buf.items, tensor.offset, tensor.offset + self.data_offset }
+                );
             } else {
-                std.log.info("{s}: {} [", .{ tensor.name, tt });
+                std.log.info(
+                    "{s}: {} [{s}] offset from tensor data start {}, offset from file start {}",
+                    .{ tensor.name, tt, dims_buf.items, tensor.offset, tensor.offset + self.data_offset }
+                );
             }
         } else {
-            std.log.warn("{s}: Unknown Type [", .{tensor.name});
+            std.log.warn(
+                "{s}: Unknown Type [{s}] offset from tensor data start {}, offset from file start {}",
+                .{tensor.name, dims_buf.items, tensor.offset, tensor.offset + self.data_offset }
+            );
         }
-
-        for (tensor.dims, 0..) |dim, j| {
-            std.log.info("{}", .{dim});
-            if (j < tensor.dims.len - 1) {
-                std.log.info(", ", .{});
-            }
-        }
-        std.log.info("] offset from tensor data start {}, offset from file start {}", .{ tensor.offset, tensor.offset + self.data_offset });
     }
 
     if (type_counts.count() > 0) {
