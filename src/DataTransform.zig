@@ -85,6 +85,9 @@ pub const Quantizer = struct {
                 const out_slice = std.mem.bytesAsSlice(f32, output_bytes);
                 @memcpy(out_slice, input_f32);
             },
+            .BF16, .bf16 => {
+                try convertTypeSimple(input_f32, output_bytes, allocator, threads, .BF16);
+            },
             .f16, .F16 => {
                 try convertTypeSimple(input_f32, output_bytes, allocator, threads, dst_type);
             },
@@ -196,6 +199,12 @@ pub const Quantizer = struct {
 
     fn processSimple(input_f32: []const f32, output_bytes: []u8, start: usize, end: usize, dst_type: types.DataType) void {
         switch (dst_type) {
+            .BF16, .bf16 => {
+                const out_slice = std.mem.bytesAsSlice(u16, output_bytes);
+                for (input_f32[start..end], start..) |val, i| {
+                    out_slice[i] = f32_to_bf16(val);
+                }
+            },
             .F16, .f16 => {
                 const out_slice = std.mem.bytesAsSlice(f16, output_bytes);
                 for (input_f32[start..end], start..) |val, i| {
@@ -381,6 +390,11 @@ pub const Quantizer = struct {
     fn bf16_to_f32(x: u16) f32 {
         const bits = (@as(u32, x) << 16);
         return @bitCast(bits);
+    }
+
+    fn f32_to_bf16(x: f32) u16 {
+        const bits: u32 = @bitCast(x);
+        return @truncate(bits >> 16);
     }
 };
 

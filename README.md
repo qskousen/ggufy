@@ -5,6 +5,7 @@ ggufy:
 - is a single-file executable written in zig, for linux, windows, and macos (arm64 and x86_64)
 - is fast and memory efficient
 - supports converting from safetensors to various gguf quantizations
+- supports converting safetensors datatypes (F32, BF16, F16, F8 (E5M2 and E4M3))
 - supports converting with "[quantization sensitivity](https://github.com/qskousen/ggufy#sensitivity-aware-quantization)" files (some architectures built-in)
 - currently targets image diffusion models (SD1.5, SDXL, etc.)
 
