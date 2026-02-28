@@ -9,12 +9,12 @@ pub const Quantizer = struct {
         allocator: std.mem.Allocator,
         src_data: []const u8,
         src_type: types.DataType,
-        dst_type: gguf.GgmlType,
+        dst_type: types.DataType,
         element_count: u64,
         threads: usize,
     ) ![]u8 {
         // Optimization: Direct copy if types match
-        if (src_type.formatType() == .gguf and std.mem.eql(u8, @tagName(src_type), @tagName(dst_type))) {
+        if (src_type.equivalentType(@tagName(dst_type))) {
             const out = try allocator.alloc(u8, src_data.len);
             @memcpy(out, src_data);
             return out;
@@ -39,7 +39,7 @@ pub const Quantizer = struct {
 
     fn dequantizeToF32(input_bytes: []const u8, output_f32: []f32, src_type: types.DataType) !void {
         switch (src_type) {
-            .F8_E4M3 => {
+            .FP8_E4M3 => {
                 if (input_bytes.len != output_f32.len)
                     return error.InputSizeMismatch;
 
@@ -47,7 +47,7 @@ pub const Quantizer = struct {
                     output_f32[i] = fp8_e4m3_to_f32(b);
                 }
             },
-            .F8_E5M2 => {
+            .FP8_E5M2 => {
                 if (input_bytes.len != output_f32.len)
                     return error.InputSizeMismatch;
 
@@ -66,7 +66,7 @@ pub const Quantizer = struct {
                     output_f32[i] = bf16_to_f32(val);
                 }
             },
-            .F16, .f16 => {
+            .FP16, .f16 => {
                 const f16_count = input_bytes.len / 2;
                 if (f16_count != output_f32.len) return error.InputSizeMismatch;
 
@@ -75,11 +75,11 @@ pub const Quantizer = struct {
                     output_f32[i] = @floatCast(val);
                 }
             },
-            .F32, .f32 => {
+            .FP32, .f32 => {
                 const input_vals = std.mem.bytesAsSlice(f32, input_bytes);
                 @memcpy(output_f32, input_vals);
             },
-            .F64, .f64 => {
+            .FP64, .f64 => {
                 const f64_count = input_bytes.len / 8;
                 if (f64_count != output_f32.len) return error.InputSizeMismatch;
 
@@ -92,7 +92,7 @@ pub const Quantizer = struct {
         }
     }
 
-    fn quantizeFromF32(input_f32: []const f32, output_bytes: []u8, dst_type: gguf.GgmlType, allocator: std.mem.Allocator, threads: usize) !void {
+    fn quantizeFromF32(input_f32: []const f32, output_bytes: []u8, dst_type: types.DataType, allocator: std.mem.Allocator, threads: usize) !void {
         switch (dst_type) {
             .f32 => {
                 const out_slice = std.mem.bytesAsSlice(f32, output_bytes);
@@ -104,88 +104,19 @@ pub const Quantizer = struct {
                     out_slice[i] = @floatCast(val);
                 }
             },
-            .q8_0 => {
-                // Q8_0: 32 values per block.
-                // Block structure: delta (f16), followed by 32 int8 quants.
-                // Total bytes: 2 + 32 = 34 bytes.
-                const block_elements = 32;
-                const block_size = 34;
-                try convertTypeQX_0(
-                    input_f32,
-                    output_bytes,
-                    allocator,
-                    threads,
-                    gguf.GgmlType.q8_0,
-                    block_elements,
-                    block_size,
-                );
-            },
-            .q5_0 => {
-                // Q5_0: 32 values per block.
-                const block_elements = 32;
-                const block_size = 22;
-                try convertTypeQX_0(
-                    input_f32,
-                    output_bytes,
-                    allocator,
-                    threads,
-                    gguf.GgmlType.q5_0,
-                    block_elements,
-                    block_size,
-                );
-            },
-            .q4_0 => {
-                // Q4_0: 32 values per block.
-                const block_elements = 32;
-                const block_size = 18;
-                try convertTypeQX_0(
-                    input_f32,
-                    output_bytes,
-                    allocator,
-                    threads,
-                    gguf.GgmlType.q4_0,
-                    block_elements,
-                    block_size,
-                );
-            },
-            .q5_1 => {
-                // Q5_1: 32 values per block.
-                const block_elements = 32;
-                const block_size = 24;
-                try convertTypeQX_0(
-                    input_f32,
-                    output_bytes,
-                    allocator,
-                    threads,
-                    gguf.GgmlType.q5_1,
-                    block_elements,
-                    block_size,
-                );
-            },
-            .q4_1 => {
-                // Q4_1: 32 values per block.
-                const block_elements = 32;
-                const block_size = 20;
-                try convertTypeQX_0(
-                    input_f32,
-                    output_bytes,
-                    allocator,
-                    threads,
-                    gguf.GgmlType.q4_1,
-                    block_elements,
-                    block_size,
-                );
-            },
+            .q8_0, .q5_0, .q4_0,
+            .q5_1, .q4_1,
             .q6_k, .q5_k, .q4_k, .q3_k, .q2_k => {
-                const block_elements = dst_type.getBlockSize();
-                const block_size = dst_type.getBytesPerBlock();
+                const gguf_type = try gguf.GgmlType.fromString(@tagName(dst_type));
+                const block_elements = gguf_type.getBlockSize();
+                const block_size = gguf_type.getBytesPerBlock();
 
                 try convertTypeQX_0(
                     input_f32,
                     output_bytes,
                     allocator,
                     threads,
-                    dst_type,
+                    gguf_type,
                     block_elements,
                     block_size,
                 );

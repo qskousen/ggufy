@@ -198,6 +198,10 @@ For supported models, sensitivity is enabled by default.
 Generating sensitivity data requires generating a large number of images, which can take a long time.
 More architectures will be added as the sensitivity data is generated for them.
 
+To read more about sensitivity files and how they are generated, refer to the [wiki](https://github.com/qskousen/ggufy/wiki/Sensitivity-file-explanation).
+
+Example of conversion with sensitivity (SD1.5 has builtin sensitivity data):
+
 ```bash
 ggufy convert --datatype q4_k sd1.5.safetensors
 ```

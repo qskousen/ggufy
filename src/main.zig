@@ -16,6 +16,7 @@ const Command = enum {
 };
 
 pub fn main() !void {
+    var timer = std.time.Timer.start() catch null;
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -122,7 +123,7 @@ pub fn main() !void {
     file.close();
     switch (file_type) {
         .safetensors => {
-            var f = try st.init(path, allocator, arena_alloc);
+            var f = try st.init(path, allocator, arena_alloc, false, false);
             defer f.deinit();
 
             switch (command) {
@@ -187,6 +188,10 @@ pub fn main() !void {
             }
         },
     }
-    //try stdout.print("Total bytes used in arena allocator: {}\n", .{arena.queryCapacity()});
     try stdout.flush();
+    std.log.info("Total bytes used in arena allocator: {}", .{arena.queryCapacity()});
+    if (timer) |*t| {
+        const elapsed = t.read();
+        std.log.info("Completed in {d:.2} seconds.", .{@as(f64, @floatFromInt(elapsed)) / std.time.ns_per_s});
+    }
 }

@@ -246,13 +246,13 @@ pub const GgmlType = enum(u32) {
     }
 
     pub fn fromSafetensorsType(str: []const u8) !GgmlType {
-        if (std.ascii.eqlIgnoreCase(str, "F32")) return .f32;
-        if (std.ascii.eqlIgnoreCase(str, "F16")) return .f16;
+        if (std.ascii.eqlIgnoreCase(str, "FP32")) return .f32;
+        if (std.ascii.eqlIgnoreCase(str, "FP16")) return .f16;
         if (std.ascii.eqlIgnoreCase(str, "BF16")) return .bf16;
         if (std.ascii.eqlIgnoreCase(str, "I32")) return .i32;
         if (std.ascii.eqlIgnoreCase(str, "I16")) return .i16;
         if (std.ascii.eqlIgnoreCase(str, "I8")) return .i8;
-        if (std.ascii.eqlIgnoreCase(str, "F64")) return .f64;
+        if (std.ascii.eqlIgnoreCase(str, "FP64")) return .f64;
         if (std.ascii.eqlIgnoreCase(str, "I64")) return .i64;
         return error.InvalidGgmlType;
     }
@@ -440,7 +440,7 @@ fn maybeWritePadding(self: Gguf, size: u64, writer: *std.io.Writer) !void {
 pub fn writeTensorData(self: Gguf, t: types.Tensor, source_dtype: types.DataType, reader: *std.io.Reader, writer: *std.io.Writer, threads: usize) !void {
     try self.file.seekTo(self.data_offset + t.offset);
 
-    const target_dtype = try GgmlType.fromString(t.type);
+    const target_dtype = try types.DataType.fromString(t.type);
 
     // Calculate the source tensor size based on source type
     var n_elements: u64 = 1;
@@ -464,10 +464,12 @@ pub fn writeTensorData(self: Gguf, t: types.Tensor, source_dtype: types.DataType
     defer self.allocator.free(source_data);
 
     // Convert if types differ, otherwise write directly
-    if (source_dtype.formatType() == .gguf and std.mem.eql(u8, @tagName(source_dtype), @tagName(target_dtype))) {
+    if (source_dtype.equivalentType(@tagName(target_dtype))) {
+        std.log.debug("Using direct data copy for {s} to {s}.", .{@tagName(source_dtype), @tagName(target_dtype)});
         try writer.writeAll(source_data);
     } else {
         // Use DataTransform to convert the data
+        std.log.debug("Converting data from {s} to {s}.", .{@tagName(source_dtype), @tagName(target_dtype)});
         const converted_data = try DataTransform.Quantizer.convertTensorData(
             self.allocator,
             source_data,

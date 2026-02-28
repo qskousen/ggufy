@@ -112,16 +112,18 @@ pub fn convert(
 
     // --- Shape fix ------------------------------------------------------------
     var extra_metadata = std.StringArrayHashMap(std.json.Value).init(arena_alloc);
-    if (arch.shape_fix) {
+    if (arch.shape_fix and opts.filetype == .gguf) {
         try applyShapeFix(&model_tensors, &extra_metadata, arena_alloc);
     }
 
     // --- Sort tensors alphabetically -----------------------------------------
-    std.sort.block(types.Tensor, model_tensors.items, {}, struct {
-        fn lessThan(_: void, a: types.Tensor, b: types.Tensor) bool {
-            return std.mem.lessThan(u8, a.name, b.name);
-        }
-    }.lessThan);
+    if (opts.filetype == .gguf) {
+        std.sort.block(types.Tensor, model_tensors.items, {}, struct {
+            fn lessThan(_: void, a: types.Tensor, b: types.Tensor) bool {
+                return std.mem.lessThan(u8, a.name, b.name);
+            }
+        }.lessThan);
+    }
 
     // --- Write output ---------------------------------------------------------
     switch (opts.filetype) {
@@ -135,7 +137,16 @@ pub fn convert(
             allocator,
             arena_alloc,
         ),
-        .safetensors => return error.Unimplimented,
+        .safetensors => try writeSafetensors(
+            f,
+            model_tensors,
+            arch,
+            template_metadata,
+            extra_metadata,
+            opts,
+            allocator,
+            arena_alloc,
+        ),
     }
 }
 
@@ -467,7 +478,7 @@ fn assignTensorType(
     sensitivities: ?*const std.json.Parsed(std.json.Value),
 ) !void {
     // Architecture-specific overrides first.
-    if (arch.shouldUpcast(t.name)) {
+    if (arch.shouldUpcast(t.name) and opts.filetype == .gguf) {
         std.log.info("Forcing layer {s} to f32 for compatability", .{t.name});
         const ggml_type = gguf.GgmlType.f32;
         t.type = @tagName(ggml_type);
@@ -582,10 +593,6 @@ fn applyShapeFix(
     }
 }
 
-// ============================================================================
-// Step 4 — Write GGUF output
-// ============================================================================
-
 fn writeGguf(
     f: *st,
     model_tensors: std.ArrayList(types.Tensor),
@@ -605,7 +612,7 @@ fn writeGguf(
 
     const base_name = if (opts.output_name) |on| on else blk: {
         const stem = std.fs.path.stem(opts.path);
-        const dtype_str = @tagName(opts.datatype orelse types.DataType.F16);
+        const dtype_str = @tagName(opts.datatype orelse types.DataType.f16);
         break :blk try std.fmt.allocPrint(arena_alloc, "{s}-{s}", .{ stem, dtype_str });
     };
 
@@ -649,4 +656,69 @@ fn writeGguf(
 
     try out_gguf.saveWithSTData(f, opts.threads);
     std.log.info("Converted to {s}", .{out_filename});
+}
+
+fn writeSafetensors(
+    f: *st,
+    model_tensors: std.ArrayList(types.Tensor),
+    arch: *const imagearch.Arch,
+    template_metadata: ?std.json.ObjectMap,
+    extra_metadata: std.StringArrayHashMap(std.json.Value),
+    opts: ConvertOptions,
+    allocator: std.mem.Allocator,
+    arena_alloc: std.mem.Allocator,
+) !void {
+    // --- Resolve output path -------------------------------------------------
+    const dir_path = if (opts.output_dir) |od| od else std.fs.path.dirname(opts.path) orelse ".";
+
+    var cwd = std.fs.cwd();
+    const dir_result = try cwd.makePathStatus(dir_path);
+    if (dir_result == .created) std.log.info("Created directory {s}", .{dir_path});
+
+    const base_name = if (opts.output_name) |on| on else blk: {
+        const stem = std.fs.path.stem(opts.path);
+        const dtype_str = @tagName(opts.datatype orelse types.DataType.FP16);
+        break :blk try std.fmt.allocPrint(arena_alloc, "{s}-{s}", .{ stem, dtype_str });
+    };
+
+    const out_filename = try std.fs.path.join(
+        arena_alloc,
+        &[_][]const u8{ dir_path, try std.fmt.allocPrint(arena_alloc, "{s}.safetensors", .{base_name}) },
+    );
+
+    // --- Initialise Safetensors writer ----------------------------------------------
+    var out_st = try st.init(out_filename, allocator, arena_alloc, true, true);
+    defer out_st.deinit();
+    out_st.tensors = model_tensors;
+
+    // Copy any metadata from the source, if there is any
+    out_st.metadata = try f.metadata.?.clone();
+
+    // Template metadata takes priority over source-file metadata.
+    if (template_metadata) |meta| {
+        var it = meta.iterator();
+        while (it.next()) |entry| {
+            if (!out_st.metadata.?.contains(entry.key_ptr.*))
+                try out_st.metadata.?.put(try arena_alloc.dupe(u8, entry.key_ptr.*), entry.value_ptr.*);
+        }
+    } else if (f.metadata) |meta| {
+        var it = meta.iterator();
+        while (it.next()) |entry| {
+            if (!out_st.metadata.?.contains(entry.key_ptr.*))
+                try out_st.metadata.?.put(try arena_alloc.dupe(u8, entry.key_ptr.*), entry.value_ptr.*);
+        }
+    }
+
+    // Extra metadata
+    var extra_it = extra_metadata.iterator();
+    while (extra_it.next()) |entry| {
+        if (!out_st.metadata.?.contains(entry.key_ptr.*))
+            try out_st.metadata.?.put(try arena_alloc.dupe(u8, entry.key_ptr.*), entry.value_ptr.*);
+    }
+
+    try out_st.saveWithSTData(f, opts.threads);
+    std.log.info("Converted to {s}", .{out_filename});
+
+
+    _ = arch;
 }
