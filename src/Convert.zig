@@ -493,21 +493,23 @@ fn assignTensorType(
     if (arch.isHighPrecision(t.name)) return;
 
     // Apply the target datatype.
-    const dtype = opts.datatype orelse return;
-    const ggml_type = try gguf.GgmlType.fromString(@tagName(dtype));
-    const bs = ggml_type.getBlockSize();
+    const ttype = opts.datatype orelse return;
+    if (opts.filetype == .gguf) {
+        const ggml_type = gguf.GgmlType.fromString(@tagName(ttype)) catch unreachable;
+        const bs = ggml_type.getBlockSize();
 
-    if (bs > 1 and num_elements % bs != 0) {
-        std.log.warn("Cannot convert tensor {s} to type {s} because {} is not a multiple of blocksize {}", .{ t.name, @tagName(ggml_type), num_elements, bs });
-        return;
+        if (bs > 1 and num_elements % bs != 0) {
+            std.log.warn("Cannot convert tensor {s} to type {s} because {} is not a multiple of blocksize {}", .{ t.name, @tagName(ggml_type), num_elements, bs });
+            return;
+        }
     }
 
     if (use_sensitivity) {
-        try applySensitivityQuantization(t, num_elements, dtype, ggml_type, opts.quantization_aggressiveness, resolvedFamilies(opts), sensitivities.?);
+        try applySensitivityQuantization(t, num_elements, ttype,opts.quantization_aggressiveness, resolvedFamilies(opts), sensitivities.?);
     } else {
-        std.log.debug("Will convert tensor {s} to type {s}", .{ t.name, @tagName(ggml_type) });
-        t.type = @tagName(ggml_type);
-        t.size = ggml_type.calcSizeInBytes(num_elements);
+        std.log.debug("Will convert tensor {s} to type {s}", .{ t.name, @tagName(ttype) });
+        t.type = @tagName(ttype);
+        t.size = ttype.calcSizeInBytes(num_elements);
     }
 }
 
@@ -516,7 +518,6 @@ fn applySensitivityQuantization(
     t: *types.Tensor,
     num_elements: u64,
     dtype: types.DataType,
-    fallback_type: gguf.GgmlType,
     aggressiveness: f32,
     families: QuantizationFamilies,
     sensitivities: *const std.json.Parsed(std.json.Value),
@@ -541,8 +542,8 @@ fn applySensitivityQuantization(
         t.size = final_ggml_type.calcSizeInBytes(num_elements);
     } else {
         std.log.warn("No sensitivity data for layer {s}, using target type", .{t.name});
-        t.type = @tagName(fallback_type);
-        t.size = fallback_type.calcSizeInBytes(num_elements);
+        t.type = @tagName(dtype);
+        t.size = dtype.calcSizeInBytes(num_elements);
     }
 }
 
@@ -677,7 +678,7 @@ fn writeSafetensors(
 
     const base_name = if (opts.output_name) |on| on else blk: {
         const stem = std.fs.path.stem(opts.path);
-        const dtype_str = @tagName(opts.datatype orelse types.DataType.FP16);
+        const dtype_str = @tagName(opts.datatype orelse types.DataType.F16);
         break :blk try std.fmt.allocPrint(arena_alloc, "{s}-{s}", .{ stem, dtype_str });
     };
 

@@ -31,7 +31,7 @@ This table lists the architectures that ggufy can convert, and whether they have
 
 ### Todos:
 
-- [ ] allow opening st or gguf non-existing path and use for writing (seperate instances for read and write) (gguf done)
+- [x] allow opening st or gguf non-existing path and use for writing (separate instances for read and write)
 - [x] generate "quantization sensitivity" file, weight tensors 1-100 on how much quantization affects them
 - [x] allow to set output directory and output file when converting
 - [x] starting with q8_0, support actual quantization

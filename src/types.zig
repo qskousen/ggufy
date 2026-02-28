@@ -58,12 +58,12 @@ pub const Tensor = struct {
 /// Represents data types from all known formats
 pub const DataType = enum {
     // Safetensor types
-    FP8_E4M3,
-    FP8_E5M2,
+    F8_E4M3,
+    F8_E5M2,
     BF16,
-    FP16,
-    FP32,
-    FP64,
+    F16,
+    F32,
+    F64,
     I8,
     I16,
     I32,
@@ -116,16 +116,15 @@ pub const DataType = enum {
     count,
 
     pub fn fromString(value: []const u8) !DataType {
-        var lower: [12]u8 = [_]u8{0} ** 12;
-        return std.meta.stringToEnum(DataType, std.ascii.lowerString(&lower, value)) orelse error.InvalidDataType;
+        return std.meta.stringToEnum(DataType, value) orelse error.InvalidDataType;
     }
 
     /// Comptime table of equivalent (safetensors, gguf) type pairs.
     /// Types with no cross-format equivalent (quantized gguf, FP8, unsigned ints) are omitted.
     const equivalence_table = [_][2]DataType{
-        .{ .FP16, .f16  },
-        .{ .FP32, .f32  },
-        .{ .FP64, .f64  },
+        .{ .F16, .f16  },
+        .{ .F32, .f32  },
+        .{ .F64, .f64  },
         .{ .BF16, .bf16 },
         .{ .I8,   .i8   },
         .{ .I16,  .i16  },
@@ -154,7 +153,7 @@ pub const DataType = enum {
 
     pub fn formatType(self: DataType) FileType {
         return switch (self) {
-            .FP8_E4M3, .FP8_E5M2, .BF16, .FP16, .FP32, .FP64, .I8, .I16, .I32, .I64, .U8, .U16, .U32, .U64 => FileType.safetensors,
+            .F8_E4M3, .F8_E5M2, .BF16, .F16, .F32, .F64, .I8, .I16, .I32, .I64, .U8, .U16, .U32, .U64 => FileType.safetensors,
             .f32, .f16, .q4_0, .q4_1, .q4_2, .q4_3, .q5_0, .q5_1, .q8_0, .q8_1, .q2_k, .q3_k, .q4_k, .q5_k, .q6_k, .q8_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq1_s, .iq4_nl, .iq3_s, .iq2_s, .iq4_xs, .i8, .i16, .i32, .i64, .f64, .iq1_m, .bf16, .q4_0_4_4, .q4_0_4_8, .q4_0_8_8, .tq1_0, .tq2_0, .iq4_nl_4_4, .iq4_nl_4_8, .iq4_nl_8_8, .mxfp4, .count => FileType.gguf,
         };
     }
