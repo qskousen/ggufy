@@ -104,6 +104,7 @@ fn loadSingle(self: *Safetensors, path: []const u8) !void {
     const len = try reader.interface.readAlloc(self.allocator, 8);
     defer self.allocator.free(len);
     const header_len = std.mem.readInt(u64, len[0..8], .little);
+    self.current_data_begin = header_len + 8;
 
     const header_bytes = try reader.interface.readAlloc(self.allocator, header_len);
 
@@ -171,6 +172,7 @@ fn loadSharded(self: *Safetensors, index_path: []const u8) !void {
         const len = try reader.interface.readAlloc(self.allocator, 8);
         defer self.allocator.free(len);
         const header_len = std.mem.readInt(u64, len[0..8], .little);
+        self.current_data_begin = header_len + 8;
         const header_bytes = try reader.interface.readAlloc(self.allocator, header_len);
 
         const shard_json = try std.json.parseFromSlice(std.json.Value, self.allocator, header_bytes, .{});
@@ -543,8 +545,78 @@ pub fn printHeader(self: Safetensors, writer: *std.io.Writer) !void {
     var dtype_counts = std.AutoHashMap(DType, usize).init(self.allocator);
     defer dtype_counts.deinit();
 
+    var bad_offset_count: u64 = 0;
+
     try writer.print("{{\n", .{});
+    // do some sanity checks
     for (self.tensors.items, 0..) |t, i| {
+        const dt = try DType.fromString(t.type);
+
+        // Offset safety check
+        var bad_offset = false;
+
+        // Calculate expected size from dtype + shape
+        var n_elements: u64 = 1;
+        for (t.dims) |d| n_elements *= d;
+        const expected_size: u64 = dt.getSizeInBytes() * n_elements;
+
+        // The stored size (end - start) must match expected
+        if (t.size != expected_size) {
+            std.log.warn(
+                "Tensor {s}: stored size {} does not match expected size {} (dtype={s}, elements={})",
+                .{ t.name, t.size, expected_size, t.type, n_elements },
+            );
+            bad_offset = true;
+            bad_offset_count += 1;
+        }
+
+        // For non-last tensors: next tensor's offset must immediately follow this one
+        if (i < self.tensors.items.len - 1) {
+            const next_offset = self.tensors.items[i + 1].offset;
+            const allocated_size = std.math.sub(u64, next_offset, t.offset) catch {
+                std.log.warn(
+                    "Tensor {s}: overflow computing allocated size (offset={}, next_offset={})",
+                    .{ t.name, t.offset, next_offset },
+                );
+                bad_offset = true;
+                bad_offset_count += 1;
+                continue;
+            };
+            if (allocated_size != expected_size) {
+                std.log.warn(
+                    "Tensor {s}: allocated region {} does not match expected size {}",
+                    .{ t.name, allocated_size, expected_size },
+                );
+                bad_offset = true;
+                bad_offset_count += 1;
+            }
+        } else {
+            // Last tensor: verify it doesn't exceed the file's data section
+            if (self.current_data_begin > 0) {
+                const start_pos = std.math.add(u64, self.current_data_begin, t.offset) catch {
+                    std.log.warn(
+                        "Tensor {s}: overflow computing file start position (data_begin={}, offset={})",
+                        .{ t.name, self.current_data_begin, t.offset },
+                    );
+                    bad_offset = true;
+                    bad_offset_count += 1;
+                    continue;
+                };
+                const end_pos = std.math.add(u64, start_pos, expected_size) catch {
+                    std.log.warn(
+                        "Tensor {s}: overflow computing end position (start={}, expected_size={})",
+                        .{ t.name, start_pos, expected_size },
+                    );
+                    bad_offset = true;
+                    bad_offset_count += 1;
+                    continue;
+                };
+                _ = end_pos; // could compare against file size if available
+            } else {
+                std.log.warn("Tensor {s}: cannot validate last tensor offset, data_begin not set", .{t.name});
+            }
+        }
+
         try writer.print("  \"{s}\": {{\n", .{t.name});
         try writer.print("    \"dtype\": \"{s}\",\n", .{t.type});
         try writer.print("    \"shape\": [", .{});
@@ -553,12 +625,12 @@ pub fn printHeader(self: Safetensors, writer: *std.io.Writer) !void {
             try writer.print("{}", .{d});
         }
         try writer.print("],\n", .{});
-        try writer.print("    \"offset_from_data_start_and_file_start\": [{}, {}]\n", .{ t.offset, t.offset + self.current_data_begin });
-        try writer.print("  }}", .{});
+        try writer.print("    \"offset_from_data_start_and_file_start\": [{}, {}]", .{ t.offset, t.offset + self.current_data_begin });
+        if (bad_offset) try writer.print(" <-- BAD OFFSET", .{});
+        try writer.print("\n  }}", .{});
         if (i < self.tensors.items.len - 1) try writer.print(",", .{});
         try writer.print("\n", .{});
 
-        const dt = try DType.fromString(t.type);
         const g = try dtype_counts.getOrPut(dt);
         if (!g.found_existing) g.value_ptr.* = 0;
         g.value_ptr.* += 1;
@@ -571,6 +643,10 @@ pub fn printHeader(self: Safetensors, writer: *std.io.Writer) !void {
         while (stats_it.next()) |entry| {
             try writer.print("  {s}: {}\n", .{ @tagName(entry.key_ptr.*), entry.value_ptr.* });
         }
+    }
+
+    if (bad_offset_count > 0) {
+        try writer.print("\nTensors with bad offsets/sizes: {}\n", .{bad_offset_count});
     }
 }
 
@@ -749,7 +825,6 @@ pub fn saveWithSTData(self: Safetensors, source: *Safetensors, threads: usize) !
                     try reader.seekTo(source_tensor.offset + source.current_data_begin);
                     try self.writeTensorData(t, source_dtype, &reader.interface, &writer.interface, threads);
 
-                    // write padding for alignment if needed
                     count += 1;
                 }
         }

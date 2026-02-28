@@ -429,11 +429,19 @@ fn assignQuantTypes(
         var num_elements: u64 = 1;
         for (t.dims) |d| num_elements *= d;
 
-        try assignTensorType(t, num_elements, arch, threshold, opts, use_sensitivity, if (use_sensitivity) &sensitivities else null);
+        try assignTensorType(
+            t,
+            num_elements,
+            arch,
+            threshold,
+            opts,
+            use_sensitivity,
+            if (use_sensitivity) &sensitivities else null
+        );
 
         // f64 is unsupported in ComfyUI GGUF — downcast to f32.
         // TODO: make this optional via a flag.
-        if (std.mem.eql(u8, t.type, "f64") or std.mem.eql(u8, t.type, "F64")) {
+        if (opts.filetype == .gguf and (std.mem.eql(u8, t.type, "f64") or std.mem.eql(u8, t.type, "F64"))) {
             std.log.info("Downcasting unsupported f64 to f32 for tensor {s}", .{t.name});
             t.type = "f32";
             const fat_type = try gguf.GgmlType.fromString(t.type);
@@ -445,12 +453,18 @@ fn assignQuantTypes(
             if (i > 0) try dims_buf.appendSlice(arena_alloc, ", ");
             try std.fmt.format(dims_buf.writer(arena_alloc), "{}", .{d});
         }
-        std.log.debug("Calculated size {} for type {s} with num elements {} with dims [{s}]", .{ t.size, t.type, num_elements, dims_buf.items });
+        std.log.debug("{s}: Calculated size {} for type {s} with num elements {} with dims [{s}]", .{ t.name, t.size, t.type, num_elements, dims_buf.items });
 
-        // TODO: make alignment configurable.
-        const padding_len = (32 - (t.size % 32)) % 32;
-        t.offset = offset;
-        offset += t.size + padding_len;
+        // padding only applies to gguf
+        if (opts.filetype == .gguf) {
+            // TODO: make alignment configurable.
+            const padding_len = (32 - (t.size % 32)) % 32;
+            t.offset = offset;
+            offset += t.size + padding_len;
+        } else {
+            t.offset = offset;
+            offset += t.size;
+        }
     }
 }
 
@@ -507,7 +521,7 @@ fn assignTensorType(
     if (use_sensitivity) {
         try applySensitivityQuantization(t, num_elements, ttype,opts.quantization_aggressiveness, resolvedFamilies(opts), sensitivities.?);
     } else {
-        std.log.debug("Will convert tensor {s} to type {s}", .{ t.name, @tagName(ttype) });
+        std.log.debug("Will convert tensor {s} from type {s} to {s}", .{ t.name, t.type, @tagName(ttype) });
         t.type = @tagName(ttype);
         t.size = ttype.calcSizeInBytes(num_elements);
     }
