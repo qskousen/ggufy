@@ -69,7 +69,7 @@ jobs:
             dist/ggufy-windows-x86_64.zip
             dist/ggufy-macos-x86_64.zip
             dist/ggufy-macos-aarch64.zip
-          draft: false
+          draft: true
           prerelease: false
           generate_release_notes: true
         env:
