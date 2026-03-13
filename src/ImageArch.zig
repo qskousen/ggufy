@@ -142,6 +142,10 @@ pub const flux = Arch{
     },
     .keys_banned = &.{"transformer_blocks.0.attn.norm_added_k.weight"},
     .threshhold = null,
+    .upcast_from_bf16 = &.{
+        ".norm.query_norm.scale",
+        ".norm.key_norm.scale",
+    },
 };
 
 pub const sd3 = Arch{
