@@ -11,7 +11,7 @@ pub const Quantizer = struct {
         src_type: types.DataType,
         dst_type: types.DataType,
         element_count: u64,
-        threads: usize,
+        pool: *std.Thread.Pool,
     ) ![]u8 {
         // Optimization: Direct copy if types match
         if (src_type.equivalentType(@tagName(dst_type))) {
@@ -25,14 +25,14 @@ pub const Quantizer = struct {
         const f32_buffer = try allocator.alloc(f32, @intCast(element_count));
         defer allocator.free(f32_buffer);
 
-        try dequantizeToF32(src_data, f32_buffer, src_type, allocator, threads);
+        try dequantizeToF32(src_data, f32_buffer, src_type, pool);
 
         // 2. Quantize from F32 to Target
         const out_size = dst_type.calcSizeInBytes(element_count);
         const out_buffer = try allocator.alloc(u8, out_size);
         errdefer allocator.free(out_buffer); // Free on error, otherwise return ownership
 
-        try quantizeFromF32(f32_buffer, out_buffer, dst_type, allocator, threads);
+        try quantizeFromF32(f32_buffer, out_buffer, dst_type, pool);
 
         return out_buffer;
     }
@@ -41,30 +41,29 @@ pub const Quantizer = struct {
         input_bytes: []const u8,
         output_f32: []f32,
         src_type: types.DataType,
-        allocator: std.mem.Allocator,
-        threads: usize
+        pool: *std.Thread.Pool,
     ) !void {
         switch (src_type) {
             .F8_E4M3 => {
                 if (input_bytes.len != output_f32.len)
                     return error.InputSizeMismatch;
-                try dequantizeSimple(input_bytes, output_f32, allocator, threads, .F8_E4M3);
+                try dequantizeSimple(input_bytes, output_f32, pool, .F8_E4M3);
             },
             .F8_E5M2 => {
                 if (input_bytes.len != output_f32.len)
                     return error.InputSizeMismatch;
-                try dequantizeSimple(input_bytes, output_f32, allocator, threads, .F8_E5M2);
+                try dequantizeSimple(input_bytes, output_f32, pool, .F8_E5M2);
             },
             .BF16, .bf16 => {
                 const count = input_bytes.len / 2;
                 if (count != output_f32.len)
                     return error.InputSizeMismatch;
-                try dequantizeSimple(input_bytes, output_f32, allocator, threads, .BF16);
+                try dequantizeSimple(input_bytes, output_f32, pool, .BF16);
             },
             .F16, .f16 => {
                 const f16_count = input_bytes.len / 2;
                 if (f16_count != output_f32.len) return error.InputSizeMismatch;
-                try dequantizeSimple(input_bytes, output_f32, allocator, threads, .F16);
+                try dequantizeSimple(input_bytes, output_f32, pool, .F16);
             },
             .F32, .f32 => {
                 const input_vals = std.mem.bytesAsSlice(f32, input_bytes);
@@ -73,28 +72,33 @@ pub const Quantizer = struct {
             .F64, .f64 => {
                 const f64_count = input_bytes.len / 8;
                 if (f64_count != output_f32.len) return error.InputSizeMismatch;
-                try dequantizeSimple(input_bytes, output_f32, allocator, threads, .F64);
+                try dequantizeSimple(input_bytes, output_f32, pool, .F64);
             },
             else => return error.UnsupportedSourceType,
         }
     }
 
-    fn quantizeFromF32(input_f32: []const f32, output_bytes: []u8, dst_type: types.DataType, allocator: std.mem.Allocator, threads: usize) !void {
+    fn quantizeFromF32(
+        input_f32: []const f32,
+        output_bytes: []u8,
+        dst_type: types.DataType,
+        pool: *std.Thread.Pool,
+    ) !void {
         switch (dst_type) {
             .f32, .F32 => {
                 const out_slice = std.mem.bytesAsSlice(f32, output_bytes);
                 @memcpy(out_slice, input_f32);
             },
             .BF16, .bf16 => {
-                try convertTypeSimple(input_f32, output_bytes, allocator, threads, .BF16);
+                try convertTypeSimple(input_f32, output_bytes, pool, .BF16);
             },
             .f16, .F16 => {
-                try convertTypeSimple(input_f32, output_bytes, allocator, threads, dst_type);
+                try convertTypeSimple(input_f32, output_bytes, pool, dst_type);
             },
             .F8_E4M3, .F8_E5M2 => {
                 if (output_bytes.len != input_f32.len)
                     return error.OutputBufferSizeMismatch;
-                try convertTypeSimple(input_f32, output_bytes, allocator, threads, dst_type);
+                try convertTypeSimple(input_f32, output_bytes, pool, dst_type);
             },
             .q8_0, .q5_0, .q4_0,
             .q5_1, .q4_1,
@@ -106,8 +110,7 @@ pub const Quantizer = struct {
                 try convertTypeGguf(
                     input_f32,
                     output_bytes,
-                    allocator,
-                    threads,
+                    pool,
                     gguf_type,
                     block_elements,
                     block_size,
@@ -120,15 +123,14 @@ pub const Quantizer = struct {
     fn convertTypeGguf(
         input_f32: []const f32,
         output_bytes: []u8,
-        allocator: std.mem.Allocator,
-        threads: usize,
+        pool: *std.Thread.Pool,
         q_type: gguf.GgmlType,
         block_elements: u64,
         block_size: u64,
     ) !void {
         const element_count: u64 = @intCast(input_f32.len);
         const block_count = @divExact(element_count, block_elements);
-        const threads_u64: u64 = @intCast(threads);
+        const threads_u64: u64 = @intCast(pool.threads.len);
 
         // Ensure output buffer is large enough
         if (output_bytes.len < block_count * block_size) return error.OutputBufferTooSmall;
@@ -136,13 +138,6 @@ pub const Quantizer = struct {
         // divide blocks up for threads
         const blocks_per_thread = @divTrunc(block_count, threads_u64);
         const leftover = block_count - (blocks_per_thread * threads_u64);
-
-        var pool: std.Thread.Pool = undefined;
-        try pool.init(.{
-            .allocator = allocator,
-            .n_jobs = threads,
-        });
-        defer pool.deinit();
 
         var wg: std.Thread.WaitGroup = .{};
 
@@ -173,18 +168,13 @@ pub const Quantizer = struct {
     fn convertTypeSimple(
         input_f32: []const f32,
         output_bytes: []u8,
-        allocator: std.mem.Allocator,
-        threads: usize,
+        pool: *std.Thread.Pool,
         dst_type: types.DataType,
     ) !void {
         const element_count = input_f32.len;
-        const threads_count = @min(threads, element_count);
+        const threads_count = @min(pool.threads.len, element_count);
         const elems_per_thread = element_count / threads_count;
         const leftover = element_count - (elems_per_thread * threads_count);
-
-        var pool: std.Thread.Pool = undefined;
-        try pool.init(.{ .allocator = allocator, .n_jobs = threads_count });
-        defer pool.deinit();
 
         var wg: std.Thread.WaitGroup = .{};
 
@@ -228,18 +218,13 @@ pub const Quantizer = struct {
     fn dequantizeSimple(
         input_bytes: []const u8,
         output_f32: []f32,
-        allocator: std.mem.Allocator,
-        threads: usize,
+        pool: *std.Thread.Pool,
         src_type: types.DataType,
     ) !void {
         const element_count = output_f32.len;
-        const threads_count = @min(threads, element_count);
+        const threads_count = @min(pool.threads.len, element_count);
         const elems_per_thread = element_count / threads_count;
         const leftover = element_count - (elems_per_thread * threads_count);
-
-        var pool: std.Thread.Pool = undefined;
-        try pool.init(.{ .allocator = allocator, .n_jobs = threads_count });
-        defer pool.deinit();
 
         var wg: std.Thread.WaitGroup = .{};
 

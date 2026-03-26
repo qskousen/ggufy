@@ -355,6 +355,10 @@ pub fn saveWithSTData(self: Gguf, source: *st, threads: usize) !void {
         bytes_written += try Gguf.writeMetadataKVJsonTracked(&writer.interface, meta.key_ptr.*, meta.value_ptr.*);
     }
 
+    var pool: std.Thread.Pool = undefined;
+    try pool.init(.{ .allocator = self.allocator, .n_jobs = threads });
+    defer pool.deinit();
+
     std.log.info("Writing tensor info for {} tensors", .{self.tensors.items.len});
     var offset: u64 = 0;
     for (self.tensors.items) |t| {
@@ -403,7 +407,7 @@ pub fn saveWithSTData(self: Gguf, source: *st, threads: usize) !void {
                     // get a reader from the source
                     var reader = try source.getReaderForTensor(source_tensor.name, &read_buffer);
                     try reader.seekTo(source_tensor.offset + source.current_data_begin);
-                    try self.writeTensorData(t, source_dtype, &reader.interface, &writer.interface, threads);
+                    try self.writeTensorData(t, source_dtype, &reader.interface, &writer.interface, &pool);
 
                     // write padding for alignment if needed
                     const size = try Gguf.calculateTensorSize(t);
@@ -437,7 +441,14 @@ fn maybeWritePadding(self: Gguf, size: u64, writer: *std.io.Writer) !void {
     }
 }
 
-pub fn writeTensorData(self: Gguf, t: types.Tensor, source_dtype: types.DataType, reader: *std.io.Reader, writer: *std.io.Writer, threads: usize) !void {
+pub fn writeTensorData(
+    self: Gguf,
+    t: types.Tensor,
+    source_dtype: types.DataType,
+    reader: *std.io.Reader,
+    writer: *std.io.Writer,
+    pool: *std.Thread.Pool
+) !void {
     try self.file.seekTo(self.data_offset + t.offset);
 
     const target_dtype = try types.DataType.fromString(t.type);
@@ -476,7 +487,7 @@ pub fn writeTensorData(self: Gguf, t: types.Tensor, source_dtype: types.DataType
             source_dtype,
             target_dtype,
             n_elements,
-            threads,
+            pool,
         );
         defer self.allocator.free(converted_data);
 

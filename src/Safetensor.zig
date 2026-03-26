@@ -696,7 +696,14 @@ pub fn parseHeader(self: Safetensors) !std.json.Parsed(std.json.Value) {
     return std.json.parseFromSlice(std.json.Value, self.arena_alloc, data, .{});
 }
 
-pub fn writeTensorData(self: Safetensors, t: types.Tensor, source_dtype: types.DataType, reader: *std.io.Reader, writer: *std.io.Writer, threads: usize) !void {
+pub fn writeTensorData(
+    self: Safetensors,
+    t: types.Tensor,
+    source_dtype: types.DataType,
+    reader: *std.io.Reader,
+    writer: *std.io.Writer,
+    pool: *std.Thread.Pool
+) !void {
     try self.current_file_handle.?.seekTo(self.current_data_begin + t.offset);
 
     const target_dtype = try types.DataType.fromString(t.type);
@@ -735,7 +742,7 @@ pub fn writeTensorData(self: Safetensors, t: types.Tensor, source_dtype: types.D
             source_dtype,
             target_dtype,
             n_elements,
-            threads,
+            pool,
         );
         defer self.allocator.free(converted_data);
 
@@ -792,6 +799,10 @@ pub fn saveWithSTData(self: Safetensors, source: *Safetensors, threads: usize) !
     // write header
     _ = try writer.interface.write(header_bytes);
 
+    var pool: std.Thread.Pool = undefined;
+    try pool.init(.{ .allocator = self.allocator, .n_jobs = threads });
+    defer pool.deinit();
+
     // write the tensors
 
     // we need to write them in the order of our tensors, but there is no guarantee that the source tensors will be in the same order
@@ -823,7 +834,7 @@ pub fn saveWithSTData(self: Safetensors, source: *Safetensors, threads: usize) !
                     // get a reader from the source
                     var reader = try source.getReaderForTensor(source_tensor.name, &read_buffer);
                     try reader.seekTo(source_tensor.offset + source.current_data_begin);
-                    try self.writeTensorData(t, source_dtype, &reader.interface, &writer.interface, threads);
+                    try self.writeTensorData(t, source_dtype, &reader.interface, &writer.interface, &pool);
 
                     count += 1;
                 }
