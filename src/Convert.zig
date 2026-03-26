@@ -500,11 +500,11 @@ fn assignTensorType(
         return;
     }
 
-    // Too small to quantize — leave it alone.
-    if (num_elements < threshold) return;
+    // Too small to quantize - use nearest compatible type
+    if (num_elements < threshold) return nearestCompatibleType(t, opts, num_elements);
 
-    // High-precision tensors (e.g. norms, gates) — leave alone.
-    if (arch.isHighPrecision(t.name)) return;
+    // High-precision tensors (e.g. norms, gates) - use nearest compatible type
+    if (arch.isHighPrecision(t.name)) return nearestCompatibleType(t, opts, num_elements);
 
     // Apply the target datatype.
     const ttype = opts.datatype orelse return;
@@ -525,6 +525,23 @@ fn assignTensorType(
         t.type = @tagName(ttype);
         t.size = ttype.calcSizeInBytes(num_elements);
     }
+}
+
+/// nearestCompatibleType converts a tensor type to the nearest type compatible with the output (or leaves it the same, if it's already compatible)
+fn nearestCompatibleType(
+    t: *types.Tensor,
+    opts: ConvertOptions,
+    num_elements: u64,
+) void {
+    const sourceType = types.DataType.fromString(t.type) catch unreachable;
+    if (opts.filetype == .gguf) {
+        if (sourceType == .F8_E4M3 or sourceType == .F8_E5M2) {
+            const ggml_type = gguf.GgmlType.f16;
+            t.type = @tagName(ggml_type);
+            t.size = ggml_type.calcSizeInBytes(num_elements);
+        }
+    }
+    return;
 }
 
 /// Applies sensitivity-adjusted quantization to a single tensor.
