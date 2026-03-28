@@ -74,9 +74,14 @@ pub fn build(b: *std.Build) void {
             exe.root_module.addObjectFile(b.path("artifacts/ggml-windows-x86_64/ggml-base.a"));
             exe.root_module.addObjectFile(b.path("artifacts/ggml-windows-x86_64/ggml-cpu.a"));
 
+            const mingw_lib = b.option([]const u8, "mingw-lib", "Path to MinGW lib") orelse "";
+            exe.addLibraryPath(.{ .cwd_relative = mingw_lib });
+
+            // C++ runtime from MinGW
             exe.linkSystemLibrary("stdc++");
             exe.linkSystemLibrary("gcc");
 
+            // Win32 system libs
             exe.linkSystemLibrary("Winmm");
             exe.linkSystemLibrary("Version");
             exe.linkSystemLibrary("kernel32");
