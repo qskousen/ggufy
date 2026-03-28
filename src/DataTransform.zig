@@ -164,7 +164,7 @@ pub const Quantizer = struct {
         const dst_block = output_bytes[dst_offset .. dst_offset + block_size_usize];
 
         _ = ggml.ggml_quantize_chunk(
-            @as(c_uint, @intFromEnum(q_type)),
+            @as(ggml.enum_ggml_type, @intCast(@intFromEnum(q_type))),
             src_block.ptr,
             dst_block.ptr,
             0,
