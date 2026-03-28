@@ -136,6 +136,6 @@ jobs:
         with:
           name: ggml-windows-x86_64
           path: |
-            vendor/ggml/build/src/ggml.lib
-            vendor/ggml/build/src/ggml-base.lib
-            vendor/ggml/build/src/ggml-cpu.lib
+            vendor/ggml/build/src/ggml.a
+            vendor/ggml/build/src/ggml-base.a
+            vendor/ggml/build/src/ggml-cpu.a
