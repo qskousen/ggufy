@@ -29,13 +29,6 @@ jobs:
         with:
           version: 0.15.2
 
-      - name: Locate MinGW
-        run: |
-          where gcc
-          where g++
-          dir C:\msys64\mingw64\lib
-          dir "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\lib"
-
       - name: Build for Linux x86-64
         if: matrix.os == 'ubuntu-24.04'
         run: |
