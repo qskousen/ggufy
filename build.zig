@@ -75,7 +75,7 @@ pub fn build(b: *std.Build) void {
                 @panic("Must pass -Dmingw-lib when targeting windows-gnu");
             }
 
-            exe.addLibraryPath(.{ .path = mingw_lib });
+            exe.addLibraryPath(.{ .cwd_relative = mingw_lib });
 
             exe.root_module.addObjectFile(b.path("artifacts/ggml-windows-x86_64/ggml.a"));
             exe.root_module.addObjectFile(b.path("artifacts/ggml-windows-x86_64/ggml-base.a"));
