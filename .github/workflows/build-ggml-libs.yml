@@ -107,9 +107,6 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Setup MSVC
-        uses: ilammy/msvc-dev-cmd@v1
-
       - name: Install dependencies
         run: choco install -y ninja cmake
         shell: pwsh
@@ -128,10 +125,8 @@ jobs:
             -DGGML_BUILD_TESTS=OFF ^
             -DGGML_BUILD_TOOLS=OFF ^
             -DCMAKE_BUILD_TYPE=Release ^
-            -DCMAKE_POLICY_DEFAULT_CMP0091=NEW ^
-            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL ^
-            -DCMAKE_C_FLAGS_RELEASE="/MD" ^
-            -DCMAKE_CXX_FLAGS_RELEASE="/MD" ^
+            -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc ^
+            -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ ^
             ..
           ninja
         shell: cmd
