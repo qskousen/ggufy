@@ -82,6 +82,7 @@ jobs:
             -DGGML_BUILD_TESTS=OFF \
             -DGGML_BUILD_TOOLS=OFF \
             -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_NATIVE=OFF \
             ..
           ninja
 
