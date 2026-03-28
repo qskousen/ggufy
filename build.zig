@@ -41,9 +41,9 @@ pub fn build(b: *std.Build) void {
 
     switch (os) {
         .linux => {
-            exe.root_module.addObjectFile(b.path("vendor/ggml/artifacts/ggml-linux-x86_64/libggml.a"));
-            exe.root_module.addObjectFile(b.path("vendor/ggml/artifacts/ggml-linux-x86_64/libggml-base.a"));
-            exe.root_module.addObjectFile(b.path("vendor/ggml/artifacts/ggml-linux-x86_64/libggml-cpu.a"));
+            exe.root_module.addObjectFile(b.path("artifacts/ggml-linux-x86_64/libggml.a"));
+            exe.root_module.addObjectFile(b.path("artifacts/ggml-linux-x86_64/libggml-base.a"));
+            exe.root_module.addObjectFile(b.path("artifacts/ggml-linux-x86_64/libggml-cpu.a"));
             exe.linkSystemLibrary("pthread");
             exe.linkSystemLibrary("m");
             exe.linkSystemLibrary("c++");
@@ -52,14 +52,14 @@ pub fn build(b: *std.Build) void {
         .macos => {
             switch (arch) {
                 .aarch64 => {
-                    exe.root_module.addObjectFile(b.path("vendor/ggml/artifacts/ggml-macos-arm64/libggml.a"));
-                    exe.root_module.addObjectFile(b.path("vendor/ggml/artifacts/ggml-macos-arm64/libggml-base.a"));
-                    exe.root_module.addObjectFile(b.path("vendor/ggml/artifacts/ggml-macos-arm64/libggml-cpu.a"));
+                    exe.root_module.addObjectFile(b.path("artifacts/ggml-macos-arm64/libggml.a"));
+                    exe.root_module.addObjectFile(b.path("artifacts/ggml-macos-arm64/libggml-base.a"));
+                    exe.root_module.addObjectFile(b.path("artifacts/ggml-macos-arm64/libggml-cpu.a"));
                 },
                 .x86_64 => {
-                    exe.root_module.addObjectFile(b.path("vendor/ggml/artifacts/ggml-macos-x86_64//libggml.a"));
-                    exe.root_module.addObjectFile(b.path("vendor/ggml/artifacts/ggml-macos-x86_64/libggml-base.a"));
-                    exe.root_module.addObjectFile(b.path("vendor/ggml/artifacts/ggml-macos-x86_64/libggml-cpu.a"));
+                    exe.root_module.addObjectFile(b.path("artifacts/ggml-macos-x86_64//libggml.a"));
+                    exe.root_module.addObjectFile(b.path("artifacts/ggml-macos-x86_64/libggml-base.a"));
+                    exe.root_module.addObjectFile(b.path("artifacts/ggml-macos-x86_64/libggml-cpu.a"));
                 },
                 else => {
                     unreachable;
@@ -69,9 +69,9 @@ pub fn build(b: *std.Build) void {
             exe.linkSystemLibrary("c++abi");
         },
         .windows => {
-            exe.root_module.addObjectFile(b.path("vendor/ggml/artifacts/ggml-windows-x86_64/libggml.lib"));
-            exe.root_module.addObjectFile(b.path("vendor/ggml/artifacts/ggml-windows-x86_64/libggml-base.lib"));
-            exe.root_module.addObjectFile(b.path("vendor/ggml/artifacts/ggml-windows-x86_64/libggml-cpu.lib"));
+            exe.root_module.addObjectFile(b.path("artifacts/ggml-windows-x86_64/libggml.lib"));
+            exe.root_module.addObjectFile(b.path("artifacts/ggml-windows-x86_64/libggml-base.lib"));
+            exe.root_module.addObjectFile(b.path("artifacts/ggml-windows-x86_64/libggml-cpu.lib"));
         },
         else => {
             unreachable;
