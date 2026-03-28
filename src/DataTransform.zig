@@ -162,7 +162,16 @@ pub const Quantizer = struct {
         const block_size_usize: usize = @intCast(block_size);
         const src_block = input_f32[src_offset .. src_offset + block_elements_usize];
         const dst_block = output_bytes[dst_offset .. dst_offset + block_size_usize];
-        _ = ggml.ggml_quantize_chunk(@intFromEnum(q_type), src_block.ptr, dst_block.ptr, 0, @intCast(size), @intCast(block_elements), null);
+
+        _ = ggml.ggml_quantize_chunk(
+            @as(c_uint, @intFromEnum(q_type)),
+            src_block.ptr,
+            dst_block.ptr,
+            0,
+            @intCast(size),
+            @intCast(block_elements),
+            null,
+        );
     }
 
     fn convertTypeSimple(
