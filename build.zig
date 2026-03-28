@@ -104,6 +104,9 @@ pub fn build(b: *std.Build) void {
     const clap = b.dependency("clap", .{});
     exe.root_module.addImport("clap", clap.module("clap"));
 
+    const mem_mapper = b.dependency("MemMapper", .{});
+    exe.root_module.addImport("MemMapper", mem_mapper.module("MemMapper"));
+
     ggmlc.link(exe);
 
     // This declares intent for the executable to be installed into the

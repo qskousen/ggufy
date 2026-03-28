@@ -3,6 +3,7 @@ const nw = @import("NullWriter.zig");
 const types = @import("types.zig");
 const st = @import("Safetensor.zig");
 const DataTransform = @import("DataTransform.zig");
+const MemMapper = @import("MemMapper");
 
 path: []const u8,
 allocator: std.mem.Allocator,
@@ -339,6 +340,13 @@ const GgufMetadata = struct {
 };
 
 pub fn saveWithSTData(self: Gguf, source: *st, threads: usize) !void {
+    // open the source path file
+    const source_file = try std.fs.cwd().openFile(source.path, .{});
+
+    var mapper = try MemMapper.MemMapper.init(source_file, false);
+    defer mapper.deinit();
+    const mapped = try mapper.map(u8, .{ .read = true, .write = false });
+
     // we need to track bytes written for calculating alignment for the starting tensor
     var bytes_written: u64 = 0;
 
@@ -361,6 +369,10 @@ pub fn saveWithSTData(self: Gguf, source: *st, threads: usize) !void {
 
     std.log.info("Writing tensor info for {} tensors", .{self.tensors.items.len});
     var offset: u64 = 0;
+    // we will also calculate the largest tensor size in f32 here
+    var largest_tensor_elements: u64 = 0;
+    // as well as the expected data size (including alignment bytes)
+    var tensor_data_size: u64 = 0;
     for (self.tensors.items) |t| {
         //std.log.debug("Trying to convert {s} to GgmlType", .{t.type});
         const d_type = try GgmlType.fromString(t.type);
@@ -370,17 +382,49 @@ pub fn saveWithSTData(self: Gguf, source: *st, threads: usize) !void {
         const remainder = next_offset % self.alignment;
         if (remainder != 0) next_offset += (self.alignment - remainder);
         offset = next_offset;
+
+        // largest tensor elements
+        var elements: u64 = 1;
+        for (t.dims) |d| {
+            elements *= d;
+        }
+        largest_tensor_elements = @max(largest_tensor_elements, elements);
+
+        // tensor data size
+        var size: u64 = d_type.calcSizeInBytes(elements);
+        const size_remainder = size % self.alignment;
+        if (size_remainder != 0) size += (self.alignment - size_remainder);
+        tensor_data_size += size;
     }
 
     // write any additional alignment bytes needed
-    try self.maybeWritePadding(bytes_written, &writer.interface);
+    bytes_written += try self.maybeWritePadding(bytes_written, &writer.interface);
+
+    // create buffer for intermediate f32
+    std.log.debug(
+        "Creating intermediate f32 buffer of size {} for largest tensor of size {}",
+        .{largest_tensor_elements * 4, largest_tensor_elements}
+    );
+    const f32_buffer = try self.allocator.alloc(f32, largest_tensor_elements);
+    defer self.allocator.free(f32_buffer);
+
+    // memory map the destination file
+    // first we have to set it to the expected size
+    const total_size = bytes_written + tensor_data_size;
+    std.log.debug("Setting file size to {}", .{total_size});
+    try self.file.setEndPos(total_size);
+    std.log.debug("File size is now {}", .{try self.file.getEndPos()});
+    var dest_mapper = try MemMapper.MemMapper.init(self.file, true);
+    defer dest_mapper.deinit();
+    const dest_mapped = try dest_mapper.map(u8, .{ .read = false, .write = true });
 
     std.log.info("Writing tensor data for {} tensors", .{self.tensors.items.len});
     // write the tensor data itself
     // we need to write them in the order of our tensors, but there is no guarantee that the source tensors will be in the same order
     // the names might also be different, so we have to do some matching
-    var read_buffer: [1024 * 1024]u8 = undefined;
     var count: u64 = 1;
+    // we have to keep track of offset, as the tensor offset currently is the source offset, not the dest
+    var dest_offset = bytes_written;
     for (self.tensors.items) |t| {
         // try to find the matching tensor in the source
         var matched = false;
@@ -401,17 +445,34 @@ pub fn saveWithSTData(self: Gguf, source: *st, threads: usize) !void {
                         t.type,
                         elements,
                     });
-                    // convert source tensor type to gguf type
+                    // convert source tensor type to tensor type
                     const source_dtype = try types.DataType.fromString(source_tensor.type);
 
-                    // get a reader from the source
-                    var reader = try source.getReaderForTensor(source_tensor.name, &read_buffer);
-                    try reader.seekTo(source_tensor.offset + source.current_data_begin);
-                    try self.writeTensorData(t, source_dtype, &reader.interface, &writer.interface, &pool);
+                    // get the source target from the mmapped file
+                    const source_offset = source.current_data_begin + source_tensor.offset;
+                    const source_data = mapped[source_offset .. source_offset + source_dtype.calcSizeInBytes(elements)];
+
+                    // get the dest tensor type
+                    const dest_dtype = try types.DataType.fromString(t.type);
+
+                    // get the dest target from the dest mmapped file
+                    std.log.debug("Mapping dest file offset {} size {}", .{dest_offset, dest_dtype.calcSizeInBytes(elements)});
+                    const dest_data = dest_mapped[dest_offset .. dest_offset + dest_dtype.calcSizeInBytes(elements)];
+
+                    try self.writeTensorData(
+                        t,
+                        source_dtype,
+                        source_data,
+                        f32_buffer,
+                        dest_data,
+                        elements,
+                        &pool
+                    );
 
                     // write padding for alignment if needed
                     const size = try Gguf.calculateTensorSize(t);
-                    try self.maybeWritePadding(size, &writer.interface);
+                    const padding_written = try self.maybeWritePadding(size, &writer.interface);
+                    dest_offset += dest_dtype.calcSizeInBytes(elements) + padding_written;
                     count += 1;
                 }
         }
@@ -429,7 +490,7 @@ pub fn readGgufVersion(self: Gguf) !u32 {
     return self.version;
 }
 
-fn maybeWritePadding(self: Gguf, size: u64, writer: *std.io.Writer) !void {
+fn maybeWritePadding(self: Gguf, size: u64, writer: *std.io.Writer) !u64 {
     var padding_len = (self.alignment - (size % self.alignment)) % self.alignment;
     while (padding_len > 0) {
         // to work with any alignment value, we will iteratively write 0's
@@ -439,59 +500,37 @@ fn maybeWritePadding(self: Gguf, size: u64, writer: *std.io.Writer) !void {
         try writer.writeAll(zeros[0..lt]);
         padding_len -= lt;
     }
+    return padding_len;
 }
 
 pub fn writeTensorData(
-    self: Gguf,
+    _: Gguf,
     t: types.Tensor,
     source_dtype: types.DataType,
-    reader: *std.io.Reader,
-    writer: *std.io.Writer,
+    source_data: []const u8,
+    f32_buffer: []f32,
+    dest_data: []u8,
+    element_count: u64,
     pool: *std.Thread.Pool
 ) !void {
-    try self.file.seekTo(self.data_offset + t.offset);
-
     const target_dtype = try types.DataType.fromString(t.type);
-
-    // Calculate the source tensor size based on source type
-    var n_elements: u64 = 1;
-    for (t.dims) |d| n_elements *= d;
-
-    // figure out source type
-    const source_size: usize = switch (source_dtype.formatType()) {
-        .safetensors => blk: {
-            const stype = try st.DType.fromString(@tagName(source_dtype));
-            break :blk stype.getSizeInBytes() * n_elements;
-        },
-        .gguf => blk: {
-            const stype = try GgmlType.fromString(@tagName(source_dtype));
-            break :blk stype.calcSizeInBytes(n_elements);
-        },
-    };
-
-
-    // Read source data
-    const source_data = try reader.readAlloc(self.allocator, source_size);
-    defer self.allocator.free(source_data);
 
     // Convert if types differ, otherwise write directly
     if (source_dtype.equivalentType(@tagName(target_dtype))) {
         std.log.debug("Using direct data copy for {s} to {s}.", .{@tagName(source_dtype), @tagName(target_dtype)});
-        try writer.writeAll(source_data);
+        @memcpy(dest_data, source_data);
     } else {
         // Use DataTransform to convert the data
         std.log.debug("Converting data from {s} to {s}.", .{@tagName(source_dtype), @tagName(target_dtype)});
-        const converted_data = try DataTransform.Quantizer.convertTensorData(
-            self.allocator,
+        try DataTransform.Quantizer.convertTensorData(
             source_data,
             source_dtype,
             target_dtype,
-            n_elements,
+            f32_buffer,
+            dest_data,
+            element_count,
             pool,
         );
-        defer self.allocator.free(converted_data);
-
-        try writer.writeAll(converted_data);
     }
 }
 

@@ -6,35 +6,30 @@ const ggml = @import("ggml.h");
 pub const Quantizer = struct {
     // Main entry point: Source -> F32 -> Dest
     pub fn convertTensorData(
-        allocator: std.mem.Allocator,
         src_data: []const u8,
         src_type: types.DataType,
         dst_type: types.DataType,
+        f32_buffer: []f32,
+        dest_data: []u8,
         element_count: u64,
         pool: *std.Thread.Pool,
-    ) ![]u8 {
+    ) !void {
         // Optimization: Direct copy if types match
         if (src_type.equivalentType(@tagName(dst_type))) {
-            const out = try allocator.alloc(u8, src_data.len);
-            @memcpy(out, src_data);
-            return out;
+            @memcpy(dest_data, src_data);
         }
 
-        // 1. Dequantize to F32 (Intermediate Buffer)
-        // We allocate this temporarily
-        const f32_buffer = try allocator.alloc(f32, @intCast(element_count));
-        defer allocator.free(f32_buffer);
+        // shortcut if the source is already f32
+        if (src_type == types.DataType.F32 or src_type == types.DataType.f32) {
+            const f32_slice: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, src_data));
+            try quantizeFromF32(f32_slice, dest_data, dst_type, pool);
+        } else {
+            // Dequantize to F32 (Intermediate Buffer)
+            try dequantizeToF32(src_data, f32_buffer[0..element_count], src_type, pool);
 
-        try dequantizeToF32(src_data, f32_buffer, src_type, pool);
-
-        // 2. Quantize from F32 to Target
-        const out_size = dst_type.calcSizeInBytes(element_count);
-        const out_buffer = try allocator.alloc(u8, out_size);
-        errdefer allocator.free(out_buffer); // Free on error, otherwise return ownership
-
-        try quantizeFromF32(f32_buffer, out_buffer, dst_type, pool);
-
-        return out_buffer;
+            // Quantize from F32 to Target
+            try quantizeFromF32(f32_buffer[0..element_count], dest_data, dst_type, pool);
+        }
     }
 
     fn dequantizeToF32(

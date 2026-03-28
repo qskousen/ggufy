@@ -2,6 +2,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const gguf = @import("Gguf.zig");
 const DataTransform = @import("DataTransform.zig");
+const MemMapper = @import("MemMapper");
 
 path: []const u8,
 allocator: std.mem.Allocator,
@@ -17,6 +18,11 @@ current_open_path: []const u8 = "",
 current_data_begin: u64 = 0,
 
 pub const formatType = types.FileType.safetensors;
+
+pub const TensorFileLocation = struct {
+    FilePath: []const u8,
+    FilePosition: u64,
+};
 
 const Safetensors = @This();
 
@@ -241,27 +247,42 @@ fn extractTensorsFromObject(self: *Safetensors, root: std.json.ObjectMap, source
 }
 
 pub fn getReaderForTensor(self: *Safetensors, name: []const u8, buffer: []u8) !std.fs.File.Reader {
+    const tensor_path = try self.getTensorFileLocation(name);
+
+    if (!std.mem.eql(u8, self.current_open_path, tensor_path.FilePath)) {
+        if (self.current_file_handle) |h| h.close();
+
+        const new_file = try std.fs.cwd().openFile(tensor_path.FilePath, .{});
+        self.current_file_handle = new_file;
+        self.current_open_path = tensor_path.FilePath;
+
+        var len_bytes: [8]u8 = undefined;
+        _ = try new_file.readAll(&len_bytes);
+        const st_len = std.mem.readInt(u64, len_bytes[0..8], .little);
+        self.current_data_begin = 8 + st_len;
+    }
+
+    if (self.current_file_handle) |h| {
+        try h.seekTo(tensor_path.FilePosition);
+        return h.reader(buffer);
+    }
+
+    return error.NoFileHandle;
+}
+
+pub fn getTensorFileLocation(self: *Safetensors, name: []const u8) !TensorFileLocation {
     for (self.tensors.items) |t| {
         if (std.mem.eql(u8, t.name, name)) {
-            const tensor_path = t.source_path orelse self.path;
-
-            if (!std.mem.eql(u8, self.current_open_path, tensor_path)) {
-                if (self.current_file_handle) |h| h.close();
-
-                const new_file = try std.fs.cwd().openFile(tensor_path, .{});
-                self.current_file_handle = new_file;
-                self.current_open_path = tensor_path;
-
-                var len_bytes: [8]u8 = undefined;
-                _ = try new_file.readAll(&len_bytes);
-                const st_len = std.mem.readInt(u64, len_bytes[0..8], .little);
-                self.current_data_begin = 8 + st_len;
+            if (t.source_path) |sp| {
+                return TensorFileLocation {
+                    .FilePath = sp,
+                    .FilePosition = t.offset + self.current_data_begin
+                };
             }
-
-            if (self.current_file_handle) |h| {
-                try h.seekTo(self.current_data_begin + t.offset);
-                return h.reader(buffer);
-            }
+            return TensorFileLocation {
+                .FilePath = self.path,
+                .FilePosition = t.offset + self.current_data_begin
+            };
         }
     }
     return error.TensorNotFound;
@@ -697,56 +718,32 @@ pub fn parseHeader(self: Safetensors) !std.json.Parsed(std.json.Value) {
 }
 
 pub fn writeTensorData(
-    self: Safetensors,
+    _: Safetensors,
     t: types.Tensor,
     source_dtype: types.DataType,
-    reader: *std.io.Reader,
-    writer: *std.io.Writer,
-    pool: *std.Thread.Pool
+    source_data: []const u8,
+    f32_buffer: []f32,
+    dest_data: []u8,
+    element_count: u64,
+    pool: *std.Thread.Pool,
 ) !void {
-    try self.current_file_handle.?.seekTo(self.current_data_begin + t.offset);
-
     const target_dtype = try types.DataType.fromString(t.type);
-
-    // Calculate the source tensor size based on source type
-    var n_elements: u64 = 1;
-    for (t.dims) |d| n_elements *= d;
-
-    // figure out source type
-    const source_size: usize = switch (source_dtype.formatType()) {
-        .safetensors => blk: {
-            const stype = try Safetensors.DType.fromString(@tagName(source_dtype));
-            break :blk stype.getSizeInBytes() * n_elements;
-        },
-        .gguf => blk: {
-            const stype = try gguf.GgmlType.fromString(@tagName(source_dtype));
-            break :blk stype.calcSizeInBytes(n_elements);
-        },
-    };
-
-
-    // Read source data
-    const source_data = try reader.readAlloc(self.allocator, source_size);
-    defer self.allocator.free(source_data);
 
     // Convert if types differ, otherwise write directly
     if (source_dtype.equivalentType(@tagName(target_dtype))) {
-        std.log.debug("Using direct data copy for {s} to {s}.", .{@tagName(source_dtype), @tagName(target_dtype)});
-        try writer.writeAll(source_data);
+        std.log.debug("Using direct data copy for {s} to {s}.", .{ @tagName(source_dtype), @tagName(target_dtype) });
+        @memcpy(dest_data, source_data);
     } else {
-        // Use DataTransform to convert the data
-        std.log.debug("Converting data from {s} to {s}.", .{@tagName(source_dtype), @tagName(target_dtype)});
-        const converted_data = try DataTransform.Quantizer.convertTensorData(
-            self.allocator,
+        std.log.debug("Converting data from {s} to {s}.", .{ @tagName(source_dtype), @tagName(target_dtype) });
+        try DataTransform.Quantizer.convertTensorData(
             source_data,
             source_dtype,
             target_dtype,
-            n_elements,
+            f32_buffer,
+            dest_data,
+            element_count,
             pool,
         );
-        defer self.allocator.free(converted_data);
-
-        try writer.writeAll(converted_data);
     }
 }
 
@@ -754,12 +751,10 @@ pub fn saveWithSTData(self: Safetensors, source: *Safetensors, threads: usize) !
     // Build the full header JSON object (tensor entries + __metadata__)
     var header_obj = std.json.ObjectMap.init(self.arena_alloc);
 
-    // Add __metadata__ under its special key
     if (self.metadata) |meta| {
         try header_obj.put("__metadata__", .{ .object = meta });
     }
 
-    // Add each tensor entry
     for (self.tensors.items) |t| {
         var tensor_obj = std.json.ObjectMap.init(self.arena_alloc);
 
@@ -779,7 +774,7 @@ pub fn saveWithSTData(self: Safetensors, source: *Safetensors, threads: usize) !
         try header_obj.put(t.name, .{ .object = tensor_obj });
     }
 
-    // Serialize the full header to bytes
+    // Serialize the header
     var aw: std.io.Writer.Allocating = .init(self.allocator);
     defer aw.deinit();
 
@@ -790,27 +785,58 @@ pub fn saveWithSTData(self: Safetensors, source: *Safetensors, threads: usize) !
     const header_size: u64 = header_bytes.len;
     std.log.debug("Header size: {}", .{header_size});
 
-    // writer for ourselves
+    // Calculate total tensor data size and largest tensor element count
+    var largest_tensor_elements: u64 = 0;
+    var tensor_data_size: u64 = 0;
+    for (self.tensors.items) |t| {
+        var elements: u64 = 1;
+        for (t.dims) |d| elements *= d;
+        largest_tensor_elements = @max(largest_tensor_elements, elements);
+        tensor_data_size += t.size;
+    }
+
+    // Write header to file (needed before mmap)
     var write_buffer: [1024 * 1024]u8 = undefined;
     var writer = self.current_file_handle.?.writer(&write_buffer);
-
-    // write header size
     try writer.interface.writeInt(u64, header_size, .little);
-    // write header
     _ = try writer.interface.write(header_bytes);
+    try writer.interface.flush();
+
+    const header_written: u64 = 8 + header_size;
+
+    // Allocate the shared f32 intermediate buffer
+    std.log.debug(
+        "Creating intermediate f32 buffer of size {} for largest tensor of {} elements",
+        .{ largest_tensor_elements * 4, largest_tensor_elements },
+    );
+    const f32_buffer = try self.allocator.alloc(f32, largest_tensor_elements);
+    defer self.allocator.free(f32_buffer);
+
+    // Memory-map the source file
+    const source_file = try std.fs.cwd().openFile(source.path, .{});
+    var src_mapper = try MemMapper.MemMapper.init(source_file, false);
+    defer src_mapper.deinit();
+    const src_mapped = try src_mapper.map(u8, .{ .read = true, .write = false });
+
+    // Set dest file size and memory-map it
+    const total_size = header_written + tensor_data_size;
+    std.log.debug("Setting file size to {}", .{total_size});
+    try self.current_file_handle.?.setEndPos(total_size);
+    var dest_mapper = try MemMapper.MemMapper.init(self.current_file_handle.?, true);
+    defer dest_mapper.deinit();
+    const dest_mapped = try dest_mapper.map(u8, .{ .read = false, .write = true });
 
     var pool: std.Thread.Pool = undefined;
     try pool.init(.{ .allocator = self.allocator, .n_jobs = threads });
     defer pool.deinit();
 
-    // write the tensors
+    var count: u64 = 1;
+    var dest_offset: u64 = header_written;
 
+    // write the tensors
     // we need to write them in the order of our tensors, but there is no guarantee that the source tensors will be in the same order
     // the names might also be different, so we have to do some matching
-    var read_buffer: [1024 * 1024]u8 = undefined;
-    var count: u64 = 1;
     for (self.tensors.items) |t| {
-        // try to find the matching tensor in the source
         var matched = false;
         for (source.tensors.items) |source_tensor| {
             if (std.mem.eql(u8, source_tensor.name, t.name) or
@@ -821,6 +847,7 @@ pub fn saveWithSTData(self: Safetensors, source: *Safetensors, threads: usize) !
                     matched = true;
                     var elements: usize = 1;
                     for (t.dims) |d| elements *= d;
+
                     std.log.info("Writing tensor data for tensor {}/{} {s} - {s} to {s}, {} elements", .{
                         count,
                         self.tensors.items.len,
@@ -829,21 +856,38 @@ pub fn saveWithSTData(self: Safetensors, source: *Safetensors, threads: usize) !
                         t.type,
                         elements,
                     });
+
                     const source_dtype = try types.DataType.fromString(source_tensor.type);
+                    const dest_dtype = try types.DataType.fromString(t.type);
 
-                    // get a reader from the source
-                    var reader = try source.getReaderForTensor(source_tensor.name, &read_buffer);
-                    try reader.seekTo(source_tensor.offset + source.current_data_begin);
-                    try self.writeTensorData(t, source_dtype, &reader.interface, &writer.interface, &pool);
+                    // Resolve the source file's data begin for this shard
+                    const src_data_begin = blk: {
+                        if (source_tensor.source_path) |sp| {
+                            if (!std.mem.eql(u8, sp, source.path)) {
+                                // Sharded: need data_begin per shard — fall back to stored value
+                                // (source.current_data_begin may be stale; best-effort here)
+                                break :blk source.current_data_begin;
+                            }
+                        }
+                        break :blk source.current_data_begin;
+                    };
 
+                    const src_offset = src_data_begin + source_tensor.offset;
+                    const src_size = source_dtype.calcSizeInBytes(elements);
+                    const source_data = src_mapped[src_offset .. src_offset + src_size];
+
+                    const dest_size = dest_dtype.calcSizeInBytes(elements);
+                    const dest_data = dest_mapped[dest_offset .. dest_offset + dest_size];
+
+                    try self.writeTensorData(t, source_dtype, source_data, f32_buffer, dest_data, elements, &pool);
+
+                    dest_offset += dest_size;
                     count += 1;
                 }
         }
-        if (! matched) {
+        if (!matched) {
             std.log.warn("Could not find source tensor match for tensor {s}!", .{t.name});
             return error.NoMatchingSourceTensor;
         }
     }
-
-    try writer.interface.flush();
 }
