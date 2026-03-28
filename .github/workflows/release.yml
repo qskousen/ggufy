@@ -63,8 +63,17 @@ jobs:
       - name: Build GGML (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
+          sudo apt update
+          sudo apt install -y clang libc++-dev libc++abi-dev cmake ninja-build
+          
           cd vendor/ggml
-          rm -rf build && mkdir build && cd build
+          rm -rf build
+          mkdir build
+          cd build
+          
+          export CC=clang
+          export CXX=clang++
+          
           cmake -G Ninja \
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++ \
