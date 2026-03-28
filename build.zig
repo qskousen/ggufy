@@ -37,28 +37,41 @@ pub fn build(b: *std.Build) void {
 
     // GGML libraries must already be compiled!
     const os = target.result.os.tag;
+    const arch = target.result.cpu.arch;
 
     switch (os) {
         .linux => {
-            exe.root_module.addObjectFile(b.path("vendor/ggml/build/src/libggml.a"));
-            exe.root_module.addObjectFile(b.path("vendor/ggml/build/src/libggml-base.a"));
-            exe.root_module.addObjectFile(b.path("vendor/ggml/build/src/libggml-cpu.a"));
+            exe.root_module.addObjectFile(b.path("vendor/ggml/artifacts/ggml-linux-x86_64/libggml.a"));
+            exe.root_module.addObjectFile(b.path("vendor/ggml/artifacts/ggml-linux-x86_64/libggml-base.a"));
+            exe.root_module.addObjectFile(b.path("vendor/ggml/artifacts/ggml-linux-x86_64/libggml-cpu.a"));
             exe.linkSystemLibrary("pthread");
             exe.linkSystemLibrary("m");
             exe.linkSystemLibrary("c++");
             exe.linkSystemLibrary("c++abi");
         },
         .macos => {
-            exe.root_module.addObjectFile(b.path("vendor/ggml/build/src/libggml.a"));
-            exe.root_module.addObjectFile(b.path("vendor/ggml/build/src/libggml-base.a"));
-            exe.root_module.addObjectFile(b.path("vendor/ggml/build/src/libggml-cpu.a"));
+            switch (arch) {
+                .aarch64 => {
+                    exe.root_module.addObjectFile(b.path("vendor/ggml/artifacts/ggml-macos-arm64/libggml.a"));
+                    exe.root_module.addObjectFile(b.path("vendor/ggml/artifacts/ggml-macos-arm64/libggml-base.a"));
+                    exe.root_module.addObjectFile(b.path("vendor/ggml/artifacts/ggml-macos-arm64/libggml-cpu.a"));
+                },
+                .x86_64 => {
+                    exe.root_module.addObjectFile(b.path("vendor/ggml/artifacts/ggml-macos-x86_64//libggml.a"));
+                    exe.root_module.addObjectFile(b.path("vendor/ggml/artifacts/ggml-macos-x86_64/libggml-base.a"));
+                    exe.root_module.addObjectFile(b.path("vendor/ggml/artifacts/ggml-macos-x86_64/libggml-cpu.a"));
+                },
+                else => {
+                    unreachable;
+                }
+            }
             exe.linkSystemLibrary("c++");
             exe.linkSystemLibrary("c++abi");
         },
         .windows => {
-            exe.root_module.addObjectFile(b.path("vendor/ggml/build/src/libggml.lib"));
-            exe.root_module.addObjectFile(b.path("vendor/ggml/build/src/libggml-base.lib"));
-            exe.root_module.addObjectFile(b.path("vendor/ggml/build/src/libggml-cpu.lib"));
+            exe.root_module.addObjectFile(b.path("vendor/ggml/artifacts/ggml-windows-x86_64/libggml.lib"));
+            exe.root_module.addObjectFile(b.path("vendor/ggml/artifacts/ggml-windows-x86_64/libggml-base.lib"));
+            exe.root_module.addObjectFile(b.path("vendor/ggml/artifacts/ggml-windows-x86_64/libggml-cpu.lib"));
         },
         else => {
             unreachable;
@@ -67,10 +80,6 @@ pub fn build(b: *std.Build) void {
 
     const clap = b.dependency("clap", .{});
     exe.root_module.addImport("clap", clap.module("clap"));
-
-    // disabling ggml direct building because zig's build of ggml is ~8x slower than clang, etc.
-    // sadly this means we have to build and distribute the ggml libraries ourselves
-    //ggmlc.link(exe);
 
     b.installArtifact(exe);
 
