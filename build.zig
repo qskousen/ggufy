@@ -86,11 +86,6 @@ pub fn build(b: *std.Build) void {
             exe.linkSystemLibrary("uuid");
             exe.linkSystemLibrary("comdlg32");
             exe.linkSystemLibrary("advapi32");
-
-            // MSVC CRTs — required when linking MSVC-built .lib files
-            exe.linkSystemLibrary("vcruntime");
-            exe.linkSystemLibrary("ucrt");
-            exe.linkSystemLibrary("msvcrt");
         },
         else => {
             unreachable;
