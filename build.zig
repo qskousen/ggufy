@@ -69,9 +69,9 @@ pub fn build(b: *std.Build) void {
             exe.linkSystemLibrary("c++abi");
         },
         .windows => {
-            exe.root_module.addObjectFile(b.path("artifacts/ggml-windows-x86_64/libggml.lib"));
-            exe.root_module.addObjectFile(b.path("artifacts/ggml-windows-x86_64/libggml-base.lib"));
-            exe.root_module.addObjectFile(b.path("artifacts/ggml-windows-x86_64/libggml-cpu.lib"));
+            exe.root_module.addObjectFile(b.path("artifacts/ggml-windows-x86_64/ggml.lib"));
+            exe.root_module.addObjectFile(b.path("artifacts/ggml-windows-x86_64/ggml-base.lib"));
+            exe.root_module.addObjectFile(b.path("artifacts/ggml-windows-x86_64/ggml-cpu.lib"));
         },
         else => {
             unreachable;
