@@ -44,6 +44,7 @@ pub fn build(b: *std.Build) void {
             exe.root_module.addObjectFile(b.path("artifacts/ggml-linux-x86_64/libggml.a"));
             exe.root_module.addObjectFile(b.path("artifacts/ggml-linux-x86_64/libggml-base.a"));
             exe.root_module.addObjectFile(b.path("artifacts/ggml-linux-x86_64/libggml-cpu.a"));
+
             exe.linkSystemLibrary("pthread");
             exe.linkSystemLibrary("m");
             exe.linkSystemLibrary("c++");
@@ -72,6 +73,7 @@ pub fn build(b: *std.Build) void {
             exe.root_module.addObjectFile(b.path("artifacts/ggml-windows-x86_64/ggml.lib"));
             exe.root_module.addObjectFile(b.path("artifacts/ggml-windows-x86_64/ggml-base.lib"));
             exe.root_module.addObjectFile(b.path("artifacts/ggml-windows-x86_64/ggml-cpu.lib"));
+
             exe.linkSystemLibrary("Winmm");
             exe.linkSystemLibrary("Version");
             exe.linkSystemLibrary("kernel32");
@@ -84,8 +86,11 @@ pub fn build(b: *std.Build) void {
             exe.linkSystemLibrary("uuid");
             exe.linkSystemLibrary("comdlg32");
             exe.linkSystemLibrary("advapi32");
-            exe.linkLibC();
-            exe.linkLibCpp();
+
+            // MSVC CRTs — required when linking MSVC-built .lib files
+            exe.linkSystemLibrary("vcruntime");
+            exe.linkSystemLibrary("ucrt");
+            exe.linkSystemLibrary("msvcrt");
         },
         else => {
             unreachable;
