@@ -74,11 +74,8 @@ pub fn build(b: *std.Build) void {
             exe.root_module.addObjectFile(b.path("artifacts/ggml-windows-x86_64/ggml-base.a"));
             exe.root_module.addObjectFile(b.path("artifacts/ggml-windows-x86_64/ggml-cpu.a"));
 
-            exe.addLibraryPath(b.path("C:/msys64/mingw64/lib"));
-
             exe.linkSystemLibrary("stdc++");
             exe.linkSystemLibrary("gcc");
-            exe.linkSystemLibrary("gcc_s_seh");
 
             exe.linkSystemLibrary("Winmm");
             exe.linkSystemLibrary("Version");
