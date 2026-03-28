@@ -29,6 +29,10 @@ jobs:
         with:
           version: 0.15.2
 
+      - name: Setup MSVC
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Build for Linux x86-64
         if: matrix.os == 'ubuntu-24.04'
         run: |
