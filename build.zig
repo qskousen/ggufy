@@ -70,9 +70,9 @@ pub fn build(b: *std.Build) void {
             exe.linkSystemLibrary("c++abi");
         },
         .windows => {
-            exe.root_module.addObjectFile(b.path("artifacts/ggml-windows-x86_64/ggml.lib"));
-            exe.root_module.addObjectFile(b.path("artifacts/ggml-windows-x86_64/ggml-base.lib"));
-            exe.root_module.addObjectFile(b.path("artifacts/ggml-windows-x86_64/ggml-cpu.lib"));
+            exe.root_module.addObjectFile(b.path("artifacts/ggml-windows-x86_64/ggml.a"));
+            exe.root_module.addObjectFile(b.path("artifacts/ggml-windows-x86_64/ggml-base.a"));
+            exe.root_module.addObjectFile(b.path("artifacts/ggml-windows-x86_64/ggml-cpu.a"));
 
             exe.linkSystemLibrary("Winmm");
             exe.linkSystemLibrary("Version");
