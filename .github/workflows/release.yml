@@ -39,13 +39,8 @@ jobs:
           zip ../ggufy-linux-x86_64.zip ggufy
           cd ../..
 
-      - name: Locate MinGW libs
-        if: matrix.os == 'windows-latest'
-        run: |
-          pwd
-          where gcc
-          dir C:\msys64\mingw64\lib\libstdc++.a
-          dir "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\lib\libstdc++.a"
+      - name: Install MinGW-w64
+        run: choco install mingw --version=12.2.0 --yes
 
       - name: Build for Windows x86-64
         if: matrix.os == 'windows-latest'
