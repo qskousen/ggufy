@@ -128,7 +128,7 @@ jobs:
             -DGGML_BUILD_TESTS=OFF ^
             -DGGML_BUILD_TOOLS=OFF ^
             -DCMAKE_BUILD_TYPE=Release ^
-            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded ^
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL ^
             ..
           ninja
         shell: cmd
