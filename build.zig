@@ -77,7 +77,7 @@ pub fn build(b: *std.Build) void {
 
             exe.addLibraryPath(.{ .cwd_relative = mingw_lib });
 
-            exe.addObjectFile(b.pathJoin(&.{ mingw_lib, "libgcc_s_seh.a" }));
+            exe.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ mingw_lib, "libgcc_s_seh.a" }) });
 
             exe.root_module.addObjectFile(b.path("artifacts/ggml-windows-x86_64/ggml.a"));
             exe.root_module.addObjectFile(b.path("artifacts/ggml-windows-x86_64/ggml-base.a"));
