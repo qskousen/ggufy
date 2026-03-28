@@ -34,7 +34,7 @@ jobs:
         if: matrix.os == 'ubuntu-24.04'
         run: |
           sudo apt update
-          sudo apt install -y clang libc++-dev libc++abi-dev cmake ninja-build
+          sudo apt install -y clang libc++-dev libc++abi-dev cmake ninja-build libunwind-dev
 
       - name: Install deps (macOS)
         if: matrix.os == 'macos-latest'
