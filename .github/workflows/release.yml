@@ -10,38 +10,62 @@ permissions:
   contents: write
 
 jobs:
-  ###########################################################################
-  # LINUX BUILD (Ubuntu 24.04 container to match glibc >= 2.38)
-  ###########################################################################
-  linux:
-    runs-on: ubuntu-latest
-    container:
-      image: ubuntu:24.04
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest, windows-latest]
+
+    runs-on: ${{ matrix.os }}
 
     steps:
-      - name: Install dependencies
-        run: |
-          apt update
-          apt install -y git curl zip clang libc++-dev libc++abi-dev cmake ninja-build xz-utils
-
-      - name: Install Zig
-        run: |
-          curl -L https://github.com/ziglang/zig/releases/download/0.15.2/zig-linux-x86_64-0.15.2.tar.xz \
-            | tar xJ
-          mv zig-linux-x86_64-0.15.2 /opt/zig
-          echo "/opt/zig" >> $GITHUB_PATH
-
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Build GGML (Linux)
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      # -------------------- OS-specific deps --------------------
+      - name: Install deps (Linux)
+        if: matrix.os == 'ubuntu-24.04'
         run: |
-          cd vendor/ggml
-          rm -rf build && mkdir build && cd build
+          sudo apt update
+          sudo apt install -y clang libc++-dev libc++abi-dev cmake ninja-build
+
+      - name: Install deps (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          brew update
+          brew install cmake ninja
+
+      - name: Install deps (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          choco install -y ninja cmake
+        shell: pwsh
+
+      - name: Setup MSVC (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # -------------------- GGML cache --------------------
+      - name: Restore GGML build cache
+        uses: actions/cache@v4
+        with:
+          path: vendor/ggml/build
+          key: ggml-${{ matrix.os }}-${{ hashFiles('vendor/ggml/CMakeLists.txt', 'vendor/ggml/src/**') }}
+
+      # -------------------- Build GGML per OS --------------------
+      - name: Build GGML (Linux)
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
           export CC=clang
           export CXX=clang++
+          
           cmake -G Ninja \
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++ \
@@ -57,52 +81,6 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             ..
           ninja
-
-      - name: Build Zig binary (Linux)
-        run: |
-          zig build --release=fast -Dtarget=x86_64-linux
-          mkdir -p dist
-          cp zig-out/bin/ggufy dist/ggufy-linux-x86_64
-          cd dist
-          zip ../ggufy-linux-x86_64.zip ggufy-linux-x86_64
-          cd ..
-
-      - name: Upload Linux artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux-artifacts
-          path: ggufy-linux-x86_64.zip
-
-  ###########################################################################
-  # MACOS + WINDOWS MATRIX
-  ###########################################################################
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, windows-latest]
-
-    runs-on: ${{ matrix.os }}
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.2
-
-      #######################################################################
-      # macOS
-      #######################################################################
-      - name: Install deps (macOS)
-        if: matrix.os == 'macos-latest'
-        run: |
-          brew update
-          brew install cmake ninja
 
       - name: Build GGML (macOS)
         if: matrix.os == 'macos-latest'
@@ -122,44 +100,6 @@ jobs:
             ..
           ninja
 
-      - name: Build Zig binaries (macOS)
-        if: matrix.os == 'macos-latest'
-        run: |
-          mkdir -p dist
-
-          zig build --release=fast -Dtarget=x86_64-macos
-          cp zig-out/bin/ggufy dist/ggufy-macos-x86_64
-
-          zig build --release=fast -Dtarget=aarch64-macos
-          cp zig-out/bin/ggufy dist/ggufy-macos-aarch64
-
-          cd dist
-          zip ../ggufy-macos-x86_64.zip ggufy-macos-x86_64
-          zip ../ggufy-macos-aarch64.zip ggufy-macos-aarch64
-          cd ..
-
-      - name: Upload macOS artifacts
-        if: matrix.os == 'macos-latest'
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-artifacts
-          path: |
-            ggufy-macos-x86_64.zip
-            ggufy-macos-aarch64.zip
-
-      #######################################################################
-      # WINDOWS
-      #######################################################################
-      - name: Setup MSVC
-        if: matrix.os == 'windows-latest'
-        uses: ilammy/msvc-dev-cmd@v1
-
-      - name: Install deps (Windows)
-        if: matrix.os == 'windows-latest'
-        run: |
-          choco install -y ninja cmake
-        shell: pwsh
-
       - name: Build GGML (Windows)
         if: matrix.os == 'windows-latest'
         run: |
@@ -177,29 +117,74 @@ jobs:
           ninja
         shell: cmd
 
-      - name: Build Zig binary (Windows)
+      # -------------------- Build Zig binaries --------------------
+      - name: Build + package (Linux x86_64)
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          zig build --release=fast -Dtarget=x86_64-linux
+          mkdir -p dist/linux
+          cp zig-out/bin/ggufy dist/linux/ggufy
+          cd dist/linux
+          zip ../ggufy-linux-x86_64.zip ggufy
+          cd ../..
+
+      - name: Build + package (Windows x86_64)
         if: matrix.os == 'windows-latest'
         run: |
           zig build --release=fast -Dtarget=x86_64-windows
-          mkdir dist
-          copy zig-out\bin\ggufy.exe dist\ggufy-windows-x86_64.exe
-          cd dist
-          powershell -Command "Compress-Archive ggufy-windows-x86_64.exe ..\ggufy-windows-x86_64.zip"
-          cd ..
+          mkdir -p dist/windows
+          copy zig-out\bin\ggufy.exe dist\windows\ggufy.exe
+          cd dist\windows
+          powershell -Command "Compress-Archive ggufy.exe ..\ggufy-windows-x86_64.zip"
+          cd ..\..
         shell: cmd
 
-      - name: Upload Windows artifact
+      - name: Build + package (macOS x86_64)
+        if: matrix.os == 'macos-latest'
+        run: |
+          zig build --release=fast -Dtarget=x86_64-macos
+          mkdir -p dist/macos-x86_64
+          cp zig-out/bin/ggufy dist/macos-x86_64/ggufy
+          cd dist/macos-x86_64
+          zip ../ggufy-macos-x86_64.zip ggufy
+          cd ../..
+
+      - name: Build + package (macOS aarch64)
+        if: matrix.os == 'macos-latest'
+        run: |
+          zig build --release=fast -Dtarget=aarch64-macos
+          mkdir -p dist/macos-aarch64
+          cp zig-out/bin/ggufy dist/macos-aarch64/ggufy
+          cd dist/macos-aarch64
+          zip ../ggufy-macos-aarch64.zip ggufy
+          cd ../..
+
+      # -------------------- Upload artifacts --------------------
+      - name: Upload artifacts (Linux)
+        if: matrix.os == 'ubuntu-24.04'
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-artifacts
+          path: dist/ggufy-linux-x86_64.zip
+
+      - name: Upload artifacts (Windows)
         if: matrix.os == 'windows-latest'
         uses: actions/upload-artifact@v4
         with:
           name: windows-artifacts
-          path: ggufy-windows-x86_64.zip
+          path: dist/ggufy-windows-x86_64.zip
 
-  ###########################################################################
-  # RELEASE JOB
-  ###########################################################################
+      - name: Upload artifacts (macOS)
+        if: matrix.os == 'macos-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-artifacts
+          path: |
+            dist/ggufy-macos-x86_64.zip
+            dist/ggufy-macos-aarch64.zip
+
   release:
-    needs: [linux, build]
+    needs: build
     runs-on: ubuntu-latest
 
     steps:
