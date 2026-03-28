@@ -76,6 +76,7 @@ pub fn build(b: *std.Build) void {
 
             exe.linkSystemLibrary("stdc++");
             exe.linkSystemLibrary("gcc");
+            exe.linkSystemLibrary("gcc_s_seh");
 
             exe.linkSystemLibrary("Winmm");
             exe.linkSystemLibrary("Version");
