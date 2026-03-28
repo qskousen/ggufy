@@ -29,100 +29,8 @@ jobs:
         with:
           version: 0.15.2
 
-      # -------------------- OS-specific deps --------------------
-      - name: Install deps (Linux)
-        if: matrix.os == 'ubuntu-24.04'
-        run: |
-          sudo apt update
-          sudo apt install -y clang libc++-dev libc++abi-dev cmake ninja-build libunwind-dev
-
-      - name: Install deps (macOS)
-        if: matrix.os == 'macos-latest'
-        run: |
-          brew update
-          brew install cmake ninja
-
-      - name: Install deps (Windows)
-        if: matrix.os == 'windows-latest'
-        run: |
-          choco install -y ninja cmake
-        shell: pwsh
-
-      - name: Setup MSVC (Windows)
-        if: matrix.os == 'windows-latest'
-        uses: ilammy/msvc-dev-cmd@v1
-
-      # -------------------- GGML cache --------------------
-      - name: Restore GGML build cache
-        uses: actions/cache@v4
-        with:
-          path: vendor/ggml/build
-          key: ggml-${{ matrix.os }}-${{ hashFiles('vendor/ggml/CMakeLists.txt', 'vendor/ggml/src/**') }}
-
-      # -------------------- Build GGML per OS --------------------
-      - name: Build GGML (Linux)
-        if: matrix.os == 'ubuntu-24.04'
-        run: |
-          cd vendor/ggml
-          mkdir build
-          cd build
-          export CC=clang
-          export CXX=clang++
-          
-          cmake -G Ninja \
-            -DCMAKE_C_COMPILER=clang \
-            -DCMAKE_CXX_COMPILER=clang++ \
-            -DCMAKE_CXX_FLAGS="-stdlib=libc++" \
-            -DCMAKE_EXE_LINKER_FLAGS="-stdlib=libc++" \
-            -DCMAKE_SHARED_LINKER_FLAGS="-stdlib=libc++" \
-            -DGGML_STATIC=ON \
-            -DBUILD_SHARED_LIBS=OFF \
-            -DGGML_CPU_BACKEND=ON \
-            -DGGML_BUILD_EXAMPLES=OFF \
-            -DGGML_BUILD_TESTS=OFF \
-            -DGGML_BUILD_TOOLS=OFF \
-            -DCMAKE_BUILD_TYPE=Release \
-            ..
-          ninja
-
-      - name: Build GGML (macOS)
-        if: matrix.os == 'macos-latest'
-        run: |
-          cd vendor/ggml
-          rm -rf build && mkdir build && cd build
-          cmake -G Ninja \
-            -DCMAKE_C_COMPILER=clang \
-            -DCMAKE_CXX_COMPILER=clang++ \
-            -DGGML_STATIC=ON \
-            -DBUILD_SHARED_LIBS=OFF \
-            -DGGML_CPU_BACKEND=ON \
-            -DGGML_BUILD_EXAMPLES=OFF \
-            -DGGML_BUILD_TESTS=OFF \
-            -DGGML_BUILD_TOOLS=OFF \
-            -DCMAKE_BUILD_TYPE=Release \
-            ..
-          ninja
-
-      - name: Build GGML (Windows)
-        if: matrix.os == 'windows-latest'
-        run: |
-          cd vendor/ggml
-          rm -rf build && mkdir build && cd build
-          cmake -G "Ninja" ^
-            -DGGML_STATIC=ON ^
-            -DBUILD_SHARED_LIBS=OFF ^
-            -DGGML_CPU_BACKEND=ON ^
-            -DGGML_BUILD_EXAMPLES=OFF ^
-            -DGGML_BUILD_TESTS=OFF ^
-            -DGGML_BUILD_TOOLS=OFF ^
-            -DCMAKE_BUILD_TYPE=Release ^
-            ..
-          ninja
-        shell: cmd
-
-      # -------------------- Build Zig binaries --------------------
-      - name: Build + package (Linux x86_64)
-        if: matrix.os == 'ubuntu-24.04'
+      - name: Build for Linux x86-64
+        if: matrix.os == 'ubuntu-latest'
         run: |
           zig build --release=fast -Dtarget=x86_64-linux
           mkdir -p dist/linux
@@ -131,18 +39,17 @@ jobs:
           zip ../ggufy-linux-x86_64.zip ggufy
           cd ../..
 
-      - name: Build + package (Windows x86_64)
+      - name: Build for Windows x86-64
         if: matrix.os == 'windows-latest'
         run: |
           zig build --release=fast -Dtarget=x86_64-windows
           mkdir -p dist/windows
-          copy zig-out\bin\ggufy.exe dist\windows\ggufy.exe
-          cd dist\windows
-          powershell -Command "Compress-Archive ggufy.exe ..\ggufy-windows-x86_64.zip"
-          cd ..\..
-        shell: cmd
+          cp zig-out/bin/ggufy.exe dist/windows/ggufy.exe
+          cd dist/windows
+          zip ../ggufy-windows-x86_64.zip ggufy.exe
+          cd ../..
 
-      - name: Build + package (macOS x86_64)
+      - name: Build for macOS x86-64
         if: matrix.os == 'macos-latest'
         run: |
           zig build --release=fast -Dtarget=x86_64-macos
@@ -152,7 +59,7 @@ jobs:
           zip ../ggufy-macos-x86_64.zip ggufy
           cd ../..
 
-      - name: Build + package (macOS aarch64)
+      - name: Build for macOS aarch64
         if: matrix.os == 'macos-latest'
         run: |
           zig build --release=fast -Dtarget=aarch64-macos
