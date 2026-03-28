@@ -748,6 +748,7 @@ pub fn writeTensorData(
 }
 
 pub fn saveWithSTData(self: Safetensors, source: *Safetensors, threads: usize) !void {
+    std.log.err("Safetensors output is very broken with the mmap rewrite so far.", .{});
     // Build the full header JSON object (tensor entries + __metadata__)
     var header_obj = std.json.ObjectMap.init(self.arena_alloc);
 

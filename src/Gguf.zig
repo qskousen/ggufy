@@ -346,6 +346,7 @@ pub fn saveWithSTData(self: Gguf, source: *st, threads: usize) !void {
     var mapper = try MemMapper.MemMapper.init(source_file, false);
     defer mapper.deinit();
     const mapped = try mapper.map(u8, .{ .read = true, .write = false });
+    defer mapper.unmap(mapped);
 
     // we need to track bytes written for calculating alignment for the starting tensor
     var bytes_written: u64 = 0;
@@ -417,6 +418,7 @@ pub fn saveWithSTData(self: Gguf, source: *st, threads: usize) !void {
     var dest_mapper = try MemMapper.MemMapper.init(self.file, true);
     defer dest_mapper.deinit();
     const dest_mapped = try dest_mapper.map(u8, .{ .read = false, .write = true });
+    defer dest_mapper.unmap(dest_mapped);
 
     std.log.info("Writing tensor data for {} tensors", .{self.tensors.items.len});
     // write the tensor data itself
