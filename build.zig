@@ -72,9 +72,17 @@ pub fn build(b: *std.Build) void {
             exe.root_module.addObjectFile(b.path("artifacts/ggml-windows-x86_64/ggml.lib"));
             exe.root_module.addObjectFile(b.path("artifacts/ggml-windows-x86_64/ggml-base.lib"));
             exe.root_module.addObjectFile(b.path("artifacts/ggml-windows-x86_64/ggml-cpu.lib"));
+            exe.linkSystemLibrary("Winmm");
+            exe.linkSystemLibrary("Version");
             exe.linkSystemLibrary("kernel32");
             exe.linkSystemLibrary("user32");
-            exe.linkSystemLibrary("bcrypt");
+            exe.linkSystemLibrary("gdi32");
+            exe.linkSystemLibrary("winspool");
+            exe.linkSystemLibrary("shell32");
+            exe.linkSystemLibrary("ole32");
+            exe.linkSystemLibrary("oleaut32");
+            exe.linkSystemLibrary("uuid");
+            exe.linkSystemLibrary("comdlg32");
             exe.linkSystemLibrary("advapi32");
         },
         else => {
