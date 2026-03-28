@@ -47,6 +47,7 @@ pub fn build(b: *std.Build) void {
             exe.linkSystemLibrary("m");
             exe.linkSystemLibrary("c++");
             exe.linkSystemLibrary("c++abi");
+            exe.linkSystemLibrary("execinfo");
         },
         .macos => {
             exe.root_module.addObjectFile(b.path("vendor/ggml/build/src/libggml.a"));

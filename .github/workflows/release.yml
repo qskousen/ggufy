@@ -10,8 +10,13 @@ permissions:
   contents: write
 
 jobs:
-  build-and-release:
-    runs-on: ubuntu-latest
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    runs-on: ${{ matrix.os }}
 
     steps:
       - name: Checkout code
@@ -24,15 +29,39 @@ jobs:
         with:
           version: 0.15.2
 
-      #######################################################################
-      # LINUX BUILD
-      #######################################################################
-      - name: Install Linux build deps
+      # -------------------- OS-specific deps --------------------
+      - name: Install deps (Linux)
+        if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt update
-          sudo apt install -y clang libc++-dev libc++abi-dev ninja-build cmake
+          sudo apt install -y clang libc++-dev libc++abi-dev cmake ninja-build
 
+      - name: Install deps (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          brew update
+          brew install cmake ninja
+
+      - name: Install deps (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          choco install -y ninja cmake
+        shell: pwsh
+
+      - name: Setup MSVC (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # -------------------- GGML cache --------------------
+      - name: Restore GGML build cache
+        uses: actions/cache@v4
+        with:
+          path: vendor/ggml/build
+          key: ggml-${{ matrix.os }}-${{ hashFiles('vendor/ggml/CMakeLists.txt', 'vendor/ggml/src/**') }}
+
+      # -------------------- Build GGML per OS --------------------
       - name: Build GGML (Linux)
+        if: matrix.os == 'ubuntu-latest'
         run: |
           cd vendor/ggml
           rm -rf build && mkdir build && cd build
@@ -45,51 +74,15 @@ jobs:
             -DGGML_STATIC=ON \
             -DBUILD_SHARED_LIBS=OFF \
             -DGGML_CPU_BACKEND=ON \
+            -DGGML_BUILD_EXAMPLES=OFF \
+            -DGGML_BUILD_TESTS=OFF \
+            -DGGML_BUILD_TOOLS=OFF \
             -DCMAKE_BUILD_TYPE=Release \
             ..
           ninja
 
-      - name: Build Zig binary (Linux x86-64)
-        run: |
-          zig build --release=fast -Dtarget=x86_64-linux
-          mkdir -p dist/linux
-          cp zig-out/bin/ggufy dist/linux/ggufy
-          cd dist/linux
-          zip ../ggufy-linux-x86_64.zip ggufy
-          cd ../..
-
-      #######################################################################
-      # WINDOWS BUILD
-      #######################################################################
-      - name: Setup MSVC
-        uses: ilammy/msvc-dev-cmd@v1
-
-      - name: Build GGML (Windows)
-        run: |
-          cd vendor/ggml
-          rm -rf build && mkdir build && cd build
-          cmake -G "Ninja" \
-            -DGGML_STATIC=ON \
-            -DBUILD_SHARED_LIBS=OFF \
-            -DGGML_CPU_BACKEND=ON \
-            -DCMAKE_BUILD_TYPE=Release \
-            ..
-          ninja
-
-      - name: Build Zig binary (Windows x86-64)
-        run: |
-          zig build --release=fast -Dtarget=x86_64-windows
-          mkdir -p dist/windows
-          cp zig-out/bin/ggufy.exe dist/windows/ggufy.exe
-          cd dist/windows
-          zip ../ggufy-windows-x86_64.zip ggufy.exe
-          cd ../..
-
-      #######################################################################
-      # MACOS BUILDS
-      #######################################################################
       - name: Build GGML (macOS)
-        if: runner.os == 'macOS'
+        if: matrix.os == 'macos-latest'
         run: |
           cd vendor/ggml
           rm -rf build && mkdir build && cd build
@@ -99,12 +92,54 @@ jobs:
             -DGGML_STATIC=ON \
             -DBUILD_SHARED_LIBS=OFF \
             -DGGML_CPU_BACKEND=ON \
+            -DGGML_BUILD_EXAMPLES=OFF \
+            -DGGML_BUILD_TESTS=OFF \
+            -DGGML_BUILD_TOOLS=OFF \
             -DCMAKE_BUILD_TYPE=Release \
             ..
           ninja
 
-      - name: Build Zig binary (macOS x86-64)
-        if: runner.os == 'macOS'
+      - name: Build GGML (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          cd vendor/ggml
+          rm -rf build && mkdir build && cd build
+          cmake -G "Ninja" ^
+            -DGGML_STATIC=ON ^
+            -DBUILD_SHARED_LIBS=OFF ^
+            -DGGML_CPU_BACKEND=ON ^
+            -DGGML_BUILD_EXAMPLES=OFF ^
+            -DGGML_BUILD_TESTS=OFF ^
+            -DGGML_BUILD_TOOLS=OFF ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            ..
+          ninja
+        shell: cmd
+
+      # -------------------- Build Zig binaries --------------------
+      - name: Build + package (Linux x86_64)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          zig build --release=fast -Dtarget=x86_64-linux
+          mkdir -p dist/linux
+          cp zig-out/bin/ggufy dist/linux/ggufy
+          cd dist/linux
+          zip ../ggufy-linux-x86_64.zip ggufy
+          cd ../..
+
+      - name: Build + package (Windows x86_64)
+        if: matrix.os == 'windows-latest'
+        run: |
+          zig build --release=fast -Dtarget=x86_64-windows
+          mkdir -p dist/windows
+          copy zig-out\bin\ggufy.exe dist\windows\ggufy.exe
+          cd dist\windows
+          powershell -Command "Compress-Archive ggufy.exe ..\ggufy-windows-x86_64.zip"
+          cd ..\..
+        shell: cmd
+
+      - name: Build + package (macOS x86_64)
+        if: matrix.os == 'macos-latest'
         run: |
           zig build --release=fast -Dtarget=x86_64-macos
           mkdir -p dist/macos-x86_64
@@ -113,8 +148,8 @@ jobs:
           zip ../ggufy-macos-x86_64.zip ggufy
           cd ../..
 
-      - name: Build Zig binary (macOS aarch64)
-        if: runner.os == 'macOS'
+      - name: Build + package (macOS aarch64)
+        if: matrix.os == 'macos-latest'
         run: |
           zig build --release=fast -Dtarget=aarch64-macos
           mkdir -p dist/macos-aarch64
@@ -123,17 +158,48 @@ jobs:
           zip ../ggufy-macos-aarch64.zip ggufy
           cd ../..
 
-      #######################################################################
-      # RELEASE
-      #######################################################################
+      # -------------------- Upload artifacts --------------------
+      - name: Upload artifacts (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-artifacts
+          path: dist/ggufy-linux-x86_64.zip
+
+      - name: Upload artifacts (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-artifacts
+          path: dist/ggufy-windows-x86_64.zip
+
+      - name: Upload artifacts (macOS)
+        if: matrix.os == 'macos-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-artifacts
+          path: |
+            dist/ggufy-macos-x86_64.zip
+            dist/ggufy-macos-aarch64.zip
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/ggufy-linux-x86_64.zip
-            dist/ggufy-windows-x86_64.zip
-            dist/ggufy-macos-x86_64.zip
-            dist/ggufy-macos-aarch64.zip
+            dist/linux-artifacts/ggufy-linux-x86_64.zip
+            dist/windows-artifacts/ggufy-windows-x86_64.zip
+            dist/macos-artifacts/ggufy-macos-x86_64.zip
+            dist/macos-artifacts/ggufy-macos-aarch64.zip
           draft: true
           generate_release_notes: true
         env:
