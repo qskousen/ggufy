@@ -39,14 +39,22 @@ jobs:
           zip ../ggufy-linux-x86_64.zip ggufy
           cd ../..
 
-      - name: Install MinGW-w64
+      - name: Install MSYS2
         if: matrix.os == 'windows-latest'
-        run: choco install mingw --version=12.2.0 --yes
+        run: choco install msys2 --yes
+
+      - name: Update MSYS2
+        if: matrix.os == 'windows-latest'
+        run: C:\tools\msys64\usr\bin\bash -lc "pacman -Syu --noconfirm"
+
+      - name: Install MinGW-w64 toolchain
+        if: matrix.os == 'windows-latest'
+        run: C:\tools\msys64\usr\bin\bash -lc "pacman -S --noconfirm mingw-w64-x86_64-toolchain"
 
       - name: Build for Windows x86-64
         if: matrix.os == 'windows-latest'
         run: |
-          zig build --release=fast -Dtarget=x86_64-windows-gnu -Dmingw-lib="C:/ProgramData/chocolatey/lib/mingw/tools/install/mingw64/lib"
+          zig build --release=fast -Dtarget=x86_64-windows-gnu -Dmingw-lib="C:\tools\msys64\mingw64\lib\"
           mkdir -p dist/windows
           cp zig-out/bin/ggufy.exe dist/windows/ggufy.exe
           cd dist/windows
