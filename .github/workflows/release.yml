@@ -22,7 +22,7 @@ jobs:
       - name: Install dependencies
         run: |
           apt update
-          apt install -y git curl zip clang libc++-dev libc++abi-dev cmake ninja-build
+          apt install -y git curl zip clang libc++-dev libc++abi-dev cmake ninja-build xz-utils
 
       - name: Install Zig
         run: |
