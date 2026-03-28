@@ -72,6 +72,10 @@ pub fn build(b: *std.Build) void {
             exe.root_module.addObjectFile(b.path("artifacts/ggml-windows-x86_64/ggml.lib"));
             exe.root_module.addObjectFile(b.path("artifacts/ggml-windows-x86_64/ggml-base.lib"));
             exe.root_module.addObjectFile(b.path("artifacts/ggml-windows-x86_64/ggml-cpu.lib"));
+            exe.linkSystemLibrary("kernel32");
+            exe.linkSystemLibrary("user32");
+            exe.linkSystemLibrary("bcrypt");
+            exe.linkSystemLibrary("advapi32");
         },
         else => {
             unreachable;
