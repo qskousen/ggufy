@@ -46,8 +46,7 @@ jobs:
       - name: Build for Windows x86-64
         if: matrix.os == 'windows-latest'
         run: |
-          zig build --release=fast -Dtarget=x86_64-windows-gnu \
-           -Dmingw-lib="C:/ProgramData/chocolatey/lib/mingw/tools/install/mingw64/lib"
+          zig build --release=fast -Dtarget=x86_64-windows-gnu -Dmingw-lib="C:/ProgramData/chocolatey/lib/mingw/tools/install/mingw64/lib"
           mkdir -p dist/windows
           cp zig-out/bin/ggufy.exe dist/windows/ggufy.exe
           cd dist/windows
