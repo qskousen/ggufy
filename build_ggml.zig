@@ -1,4 +1,3 @@
-// build_ggml.zig
 const std = @import("std");
 
 const ggml_root = thisDir() ++ "/vendor/ggml";
@@ -111,11 +110,6 @@ const cpu_arm_cpp_sources = [_][]const u8{
 // ── Public API ───────────────────────────────────────────────────────────────
 
 /// Build a static GGML library and link it into `exe`.
-/// Call this from your main build.zig:
-///
-///   const ggml = @import("build_ggml.zig");
-///   ggml.link(b, exe, target);
-///
 pub fn link(
     b: *std.Build,
     exe: *std.Build.Step.Compile,
@@ -184,7 +178,7 @@ fn addSources(
     }
 
     // All C++ files need libc++ (satisfies exception/RTTI runtime symbols,
-    // including the SEH glue on Windows that was causing your link errors).
+    // including the SEH glue on Windows that was causing link errors).
     lib.linkLibCpp();
 
     // ── Group 1: ggml-base (no SIMD) ────────────────────────────────────────
