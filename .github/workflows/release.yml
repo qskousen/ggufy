@@ -45,9 +45,7 @@ jobs:
           zig build --release=fast -Dtarget=x86_64-windows
           mkdir -p dist/windows
           cp zig-out/bin/ggufy.exe dist/windows/ggufy.exe
-          cd dist/windows
-          zip ../ggufy-windows-x86_64.zip ggufy.exe
-          cd ../..
+          Compress-Archive -Path dist/windows/ggufy.exe -DestinationPath dist/ggufy-windows-x86_64.zip
 
       - name: Build for macOS x86-64
         if: matrix.os == 'macos-latest'
