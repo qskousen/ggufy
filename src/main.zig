@@ -28,7 +28,7 @@ pub fn main() !void {
         \\-t, --template <FILENAME>      When converting, specify a template to use.
         \\-o, --output-dir <DIR>         Output directory (default: same as source file).
         \\-n, --output-name <FILENAME>   Output filename without extension (default: source name + datatype).
-        \\-j, --threads <INT>            Threads to use when quantizing. Defaults to number of cores - 2.
+        \\-j, --threads <INT>            Threads to use when quantizing. Defaults to number of cores.
         \\-a, --aggressiveness <INT>     How aggressively to quantize layers when using sensitivity. 100 is most aggressive, 1 is least.
         \\-x, --skip-sensitivity         Pass this to not use a built-in layer sensitivity file and just blindly quantize to target type.
         \\-s, --sensitivities <FILENAME> Path to a sensitivities JSON file to use (overrides built-in sensitivities).
@@ -97,7 +97,7 @@ pub fn main() !void {
     const template_path = res.args.template;
     const output_dir = res.args.@"output-dir";
     const output_name = res.args.@"output-name";
-    const threads = res.args.threads orelse @max(1, try std.Thread.getCpuCount() - 2);
+    const threads = res.args.threads orelse @max(1, try std.Thread.getCpuCount());
     const skip_sensitivity = res.args.@"skip-sensitivity" != 0;
     const quantization_aggressiveness: f32 = @floatFromInt(res.args.aggressiveness orelse 50);
     const sensitivities_path = res.args.sensitivities;
