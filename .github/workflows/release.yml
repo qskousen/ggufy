@@ -32,7 +32,7 @@ jobs:
       - name: Build for Linux x86-64
         if: matrix.os == 'ubuntu-24.04'
         run: |
-          zig build --release=fast
+          zig build --release=small
           mkdir -p dist/linux
           cp zig-out/bin/ggufy dist/linux/ggufy
           cd dist/linux
@@ -42,7 +42,7 @@ jobs:
       - name: Build for Windows x86-64
         if: matrix.os == 'windows-latest'
         run: |
-          zig build --release=fast -Dtarget=x86_64-windows
+          zig build --release=small -Dtarget=x86_64-windows
           mkdir -p dist/windows
           cp zig-out/bin/ggufy.exe dist/windows/ggufy.exe
           Compress-Archive -Path dist/windows/ggufy.exe -DestinationPath dist/ggufy-windows-x86_64.zip
@@ -50,7 +50,7 @@ jobs:
       - name: Build for macOS x86-64
         if: matrix.os == 'macos-latest'
         run: |
-          zig build --release=fast -Dtarget=x86_64-macos
+          zig build --release=small -Dtarget=x86_64-macos
           mkdir -p dist/macos-x86_64
           cp zig-out/bin/ggufy dist/macos-x86_64/ggufy
           cd dist/macos-x86_64
@@ -60,7 +60,7 @@ jobs:
       - name: Build for macOS aarch64
         if: matrix.os == 'macos-latest'
         run: |
-          zig build --release=fast -Dtarget=aarch64-macos
+          zig build --release=small -Dtarget=aarch64-macos
           mkdir -p dist/macos-aarch64
           cp zig-out/bin/ggufy dist/macos-aarch64/ggufy
           cd dist/macos-aarch64

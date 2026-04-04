@@ -1,11 +1,11 @@
 const std = @import("std");
-const st = @import("Safetensor.zig");
-const types = @import("types.zig");
-const nw = @import("NullWriter.zig");
-const gguf = @import("Gguf.zig");
+const ggufy = @import("ggufy");
+const st = ggufy.safetensor;
+const types = ggufy.types;
+const gguf = ggufy.gguf;
 const clap = @import("clap");
-const imagearch = @import("ImageArch.zig");
-const conv = @import("Convert.zig");
+const imagearch = ggufy.imageArch;
+const conv = ggufy.convert;
 
 const Command = enum {
     header,
