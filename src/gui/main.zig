@@ -253,18 +253,160 @@ fn showIntro() void {
     tl2.deinit();
 }
 
-fn showInputFile() void {
-    var box_inner = dvui.box(@src(), .{}, .{.gravity_x = 0.5, .gravity_y = 0.5});
-    defer box_inner.deinit();
+fn frameArena() std.mem.Allocator {
+    return dvui.currentWindow().arena();
+}
 
-    var tl = dvui.textLayout(@src(), .{}, .{.gravity_x = 0.5, .font = .theme(.title) });
-    const tensor_string = std.fmt.allocPrint(gpa,"Tensor count: {}\n", .{state.loaded_file.?.tensors.items.len}) catch "Out of memory";
-    defer gpa.free(tensor_string);
-    const metadata_string = std.fmt.allocPrint(gpa, "Metadata count: {}", .{state.loaded_file.?.metadata.?.count()}) catch "Out of memory";
-    defer gpa.free(metadata_string);
-    tl.addText(tensor_string, .{});
-    tl.addText(metadata_string, .{});
+fn showInputFile() void {
+    const file = &state.loaded_file.?;
+    const fa = frameArena();
+
+    dvui.label(
+        @src(),
+        "Opened file: {s}",
+        .{state.file_selected.?},
+        .{.gravity_x = 0.5, .border = .all(1)}
+    );
+
+    // Metadata accordion
+    if (file.metadata) |meta| {
+        const header = std.fmt.allocPrint(fa, "Metadata ({d})", .{meta.count()}) catch "Metadata";
+        if (dvui.expander(@src(), header, .{}, .{ .expand = .horizontal })) {
+            showMetadataEntries(meta);
+        }
+    }
+
+    // Tensors accordion
+    {
+        const header = std.fmt.allocPrint(fa, "Tensors ({d})", .{file.tensors.items.len}) catch "Tensors";
+        if (dvui.expander(@src(), header, .{}, .{ .expand = .horizontal })) {
+            showTensorsExpanded(file.tensors.items);
+        }
+    }
+}
+
+fn showTensorsExpanded(tensors: []const ggufy.types.Tensor) void {
+    // Container wrapping the whole list so we can measure total height.
+    var list_box = dvui.box(@src(), .{}, .{ .expand = .horizontal });
+    defer list_box.deinit();
+    const list_id = list_box.data().id;
+
+    // Derive per-item height from previous frame's total height.
+    // Self-consistent: spacers maintain total = N * item_h, so this is stable.
+    var item_h: f32 = dvui.dataGet(null, list_id, "_ih", f32) orelse 0;
+    {
+        const prev_total = list_box.data().rect.h;
+        if (prev_total > 0 and tensors.len > 0) {
+            item_h = prev_total / @as(f32, @floatFromInt(tensors.len));
+            dvui.dataSet(null, list_id, "_ih", item_h);
+        }
+    }
+
+    if (item_h <= 0) {
+        // First frame only: render everything to establish measurements.
+        for (tensors, 0..) |tensor, i| {
+            showTensorEntry(tensor, i);
+        }
+        return;
+    }
+
+    // Convert item height to physical pixels for clip comparison.
+    const rs = list_box.data().borderRectScale();
+    const item_h_phys = item_h * rs.s;
+    const list_top_phys = rs.r.y;
+    const clip = dvui.clipGet();
+
+    const first_visible: usize = blk: {
+        const above = clip.y - list_top_phys;
+        if (above <= 0) break :blk 0;
+        break :blk @min(@as(usize, @intFromFloat(above / item_h_phys)), tensors.len);
+    };
+    const last_visible: usize = blk: {
+        const to_bottom = clip.y + clip.h - list_top_phys;
+        if (to_bottom <= 0) break :blk 0;
+        const idx = @as(usize, @intFromFloat(@ceil(to_bottom / item_h_phys))) + 2;
+        break :blk @min(idx, tensors.len);
+    };
+
+    // Top spacer for items scrolled above the viewport.
+    if (first_visible > 0) {
+        var sp = dvui.box(@src(), .{}, .{
+            .expand = .horizontal,
+            .min_size_content = .{ .h = @as(f32, @floatFromInt(first_visible)) * item_h },
+        });
+        sp.deinit();
+    }
+
+    for (first_visible..last_visible) |i| {
+        showTensorEntry(tensors[i], i);
+    }
+
+    // Bottom spacer for items below the viewport.
+    if (last_visible < tensors.len) {
+        var sp = dvui.box(@src(), .{}, .{
+            .expand = .horizontal,
+            .min_size_content = .{ .h = @as(f32, @floatFromInt(tensors.len - last_visible)) * item_h },
+        });
+        sp.deinit();
+    }
+}
+
+fn showMetadataEntries(meta: std.json.ObjectMap) void {
+    const fa = frameArena();
+    var it = meta.iterator();
+    var i: usize = 0;
+    while (it.next()) |entry| : (i += 1) {
+        const type_name = @tagName(entry.value_ptr.*);
+        const entry_label = std.fmt.allocPrint(fa, "{s}  [{s}]", .{ entry.key_ptr.*, type_name }) catch entry.key_ptr.*;
+        if (dvui.expander(@src(), entry_label, .{}, .{ .expand = .horizontal, .id_extra = i })) {
+            var indent = dvui.box(@src(), .{}, .{ .expand = .horizontal, .padding = .{ .x = 20 }, .id_extra = i });
+            defer indent.deinit();
+            showJsonValue(entry.value_ptr.*);
+        }
+    }
+}
+
+fn showJsonValue(value: std.json.Value) void {
+    const json_str = std.json.Stringify.valueAlloc(frameArena(), value, .{ .whitespace = .indent_2 }) catch {
+        dvui.labelNoFmt(@src(), "(error serializing value)", .{}, .{});
+        return;
+    };
+    var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal });
+    tl.addText(json_str, .{});
     tl.deinit();
+}
+
+fn showTensorEntry(tensor: ggufy.types.Tensor, i: usize) void {
+    const fa = frameArena();
+
+    var dims_buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&dims_buf);
+    const w = fbs.writer();
+    w.writeByte('[') catch {};
+    for (tensor.dims, 0..) |d, j| {
+        if (j > 0) w.writeAll(" x ") catch {};
+        w.print("{d}", .{d}) catch {};
+    }
+    w.writeByte(']') catch {};
+
+    var n: u64 = 1;
+    for (tensor.dims) |d| n *= d;
+
+    const size_str = if (tensor.size == 0) ""
+        else if (tensor.size >= 1024 * 1024 * 1024)
+            std.fmt.allocPrint(fa, "  {d:.2} GB", .{@as(f64, @floatFromInt(tensor.size)) / (1024.0 * 1024.0 * 1024.0)}) catch ""
+        else if (tensor.size >= 1024 * 1024)
+            std.fmt.allocPrint(fa, "  {d:.2} MB", .{@as(f64, @floatFromInt(tensor.size)) / (1024.0 * 1024.0)}) catch ""
+        else if (tensor.size >= 1024)
+            std.fmt.allocPrint(fa, "  {d:.2} KB", .{@as(f64, @floatFromInt(tensor.size)) / 1024.0}) catch ""
+        else
+            std.fmt.allocPrint(fa, "  {d} B", .{tensor.size}) catch "";
+
+    const line = std.fmt.allocPrint(fa, "{s}  [{s}]  {s}  {d} elem{s}  offset:{d}", .{
+        tensor.name, tensor.type, fbs.getWritten(), n, size_str, tensor.offset,
+    }) catch tensor.name;
+
+    dvui.labelNoFmt(@src(), line, .{}, .{ .expand = .horizontal, .id_extra = i });
 }
 
 fn showError() void {
