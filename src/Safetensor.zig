@@ -16,8 +16,6 @@ current_file_handle: ?std.fs.File = null,
 current_open_path: []const u8 = "",
 current_data_begin: u64 = 0,
 
-pub const formatType = types.FileType.safetensors;
-
 const Safetensors = @This();
 
 /// Opens a safetensors file or directory for reading or writing. `target` indicates the file will be opened for read/write.
