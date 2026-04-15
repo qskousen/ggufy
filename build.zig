@@ -48,4 +48,17 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mod })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = exe.root_module })).step);
+
+    const arch_detect_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/arch_detection_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ggml.h", .module = ggml_h_module },
+            },
+        }),
+    });
+    ggml.link(b, arch_detect_test, target, optimize);
+    test_step.dependOn(&b.addRunArtifact(arch_detect_test).step);
 }

@@ -13,6 +13,7 @@ const Command = enum {
     metadata,
     convert,
     template,
+    names,
 };
 
 pub fn main() !void {
@@ -78,7 +79,8 @@ pub fn main() !void {
         try stdout.print("  tree           Output tensor data in a tree format (SafeTensors only)\n", .{});
         try stdout.print("  metadata       Shows metadata information for the specified file\n", .{});
         try stdout.print("  convert        Convert the specified file into a different format or datatype\n", .{});
-        try stdout.print("  template       Creates a json template from the specified file\n\n", .{});
+        try stdout.print("  template       Creates a json template from the specified file\n", .{});
+        try stdout.print("  names          Dump tensor names as a JSON array (for test fixtures)\n\n", .{});
         try stdout.print("Options:\n", .{});
         try stdout.flush();
         return clap.helpToFile(.stderr(), clap.Help, &params, .{});
@@ -154,6 +156,15 @@ pub fn main() !void {
                 .template => {
                     return error.Unimplimented;
                 },
+                .names => {
+                    const name_list = try allocator.alloc([]const u8, f.tensors.items.len);
+                    defer allocator.free(name_list);
+                    for (f.tensors.items, 0..) |t, i| name_list[i] = t.name;
+                    const json = try std.json.Stringify.valueAlloc(allocator, name_list, .{ .whitespace = .indent_2 });
+                    defer allocator.free(json);
+                    try stdout.writeAll(json);
+                    try stdout.writeByte('\n');
+                },
             }
         },
         .gguf => {
@@ -173,6 +184,15 @@ pub fn main() !void {
                 },
                 .convert => {
                     return error.Unimplimented;
+                },
+                .names => {
+                    const name_list = try allocator.alloc([]const u8, f.tensors.items.len);
+                    defer allocator.free(name_list);
+                    for (f.tensors.items, 0..) |t, i| name_list[i] = t.name;
+                    const json = try std.json.Stringify.valueAlloc(allocator, name_list, .{ .whitespace = .indent_2 });
+                    defer allocator.free(json);
+                    try stdout.writeAll(json);
+                    try stdout.writeByte('\n');
                 },
                 .template => {
                     const out_file = try std.fs.cwd().createFile("template.json", .{ .truncate = true });

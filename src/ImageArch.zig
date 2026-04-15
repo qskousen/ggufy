@@ -306,6 +306,24 @@ pub const qwen = Arch{
     },
 };
 
+pub const ernie = Arch{
+    .name = "ernie",
+    .keys_detect = &.{
+        &.{
+            "adaLN_modulation.1.weight",
+            "x_embedder.proj.weight",
+            "text_proj.weight",
+            "layers.0.mlp.linear_fc2.weight",
+        },
+    },
+    .shape_fix = true,
+    .threshhold = null,
+    .upcast_from_bf16 = &.{
+        ".adaLN_sa_ln.weight",
+        ".adaLN_mlp_ln.weight",
+    },
+};
+
 /// List of all known architectures, in detection priority order
 pub const arch_list = [_]*const Arch{
     &flux,
@@ -320,6 +338,7 @@ pub const arch_list = [_]*const Arch{
     &sd1,
     &lumina2,
     &qwen,
+    &ernie,
 };
 
 /// Detect architecture from a list of tensor names
