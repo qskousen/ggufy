@@ -220,19 +220,15 @@ fn gui_frame() bool {
 fn showLoading() void {
     var box_inner = dvui.box(@src(), .{}, .{.gravity_x = 0.5, .gravity_y = 0.5});
     defer box_inner.deinit();
-    var tl = dvui.textLayout(@src(), .{}, .{.gravity_x = 0.5, .font = .theme(.title) });
-    tl.addText("Loading...", .{});
-    tl.deinit();
+Add arch
+    dvui.label(@src(), "Loading...", .{}, .{.gravity_x = 0.5, .font = .theme(.title) });
 }
 
 fn showIntro() void {
     var box_inner = dvui.box(@src(), .{}, .{.gravity_x = 0.5, .gravity_y = 0.5});
     defer box_inner.deinit();
 
-    var tl = dvui.textLayout(@src(), .{}, .{.gravity_x = 0.5, .font = .theme(.title) });
-    tl.addText("Convert a safetensors or gguf file", .{});
-    tl.deinit();
-
+    dvui.label(@src(), "Convert a safetensors or gguf file", .{}, .{.gravity_x = 0.5, .font = .theme(.title) });
 
     if (dvui.button(@src(), "Select a File", .{}, .{.gravity_x = 0.5})) {
         if (! state.file_dialog_open) {
@@ -248,9 +244,7 @@ fn showIntro() void {
             );
         }
     }
-    var tl2 = dvui.textLayout(@src(), .{}, .{.gravity_x = 0.5, .font = .theme(.title) });
-    tl2.addText("Or drag and drop a file", .{});
-    tl2.deinit();
+    dvui.label(@src(), "Or drag and drop a file", .{}, .{.gravity_x = 0.5, .font = .theme(.title) });
 }
 
 fn frameArena() std.mem.Allocator {
@@ -259,109 +253,71 @@ fn frameArena() std.mem.Allocator {
 
 fn showInputFile() void {
     const file = &state.loaded_file.?;
-    const fa = frameArena();
+    //const fa = frameArena();
 
     dvui.label(
         @src(),
-        "Opened file: {s}",
+        "Opened file: {s}\n",
         .{state.file_selected.?},
-        .{.gravity_x = 0.5, .border = .all(1)}
+        .{.gravity_x = 0.5, .border = .all(1), .margin = .all(5)}
     );
 
-    // Metadata accordion
+    const arch = if (file.arch) |a| a.name else "Unknown";
+    var size_buf: [32]u8 = undefined;
+    const size = formatWithCommas(file.sizeInBytes, &size_buf);
+    var bytes_buf: [16]u8 = undefined;
+    const size_bytes = formatBytes(file.sizeInBytes, &bytes_buf);
+
+    dvui.label(
+        @src(),
+        "File type: {s} File architecture: {s} File size: {s} ({s}) Tensor types: {s}\n",
+        .{@tagName(file.type), arch, size, size_bytes, file.types_line},
+        .{.gravity_x = 0.5}
+    );
+
+}
+
+fn showModelInternals() void {
+    const file = &state.loaded_file.?;
+    const fa = frameArena();
+
+
+
+    var tree = dvui.TreeWidget.tree(@src(), .{ .enable_reordering = false }, .{ .expand = .horizontal });
+    defer tree.deinit();
+
+    // Metadata branch
     if (file.metadata) |meta| {
         const header = std.fmt.allocPrint(fa, "Metadata ({d})", .{meta.count()}) catch "Metadata";
-        if (dvui.expander(@src(), header, .{}, .{ .expand = .horizontal })) {
-            showMetadataEntries(meta);
+        const meta_branch = tree.branch(@src(), .{ .expanded = false }, .{ .expand = .horizontal });
+        defer meta_branch.deinit();
+        dvui.labelNoFmt(@src(), header, .{}, .{ .expand = .horizontal });
+        if (meta_branch.expander(@src(), .{ .indent = 10 }, .{ .expand = .horizontal })) {
+            var it = meta.iterator();
+            var i: usize = 0;
+            while (it.next()) |entry| : (i += 1) {
+                const type_name = @tagName(entry.value_ptr.*);
+                const entry_label = std.fmt.allocPrint(fa, "{s}  [{s}]", .{ entry.key_ptr.*, type_name }) catch entry.key_ptr.*;
+                const entry_branch = tree.branch(@src(), .{ .expanded = false }, .{ .expand = .horizontal, .id_extra = i });
+                defer entry_branch.deinit();
+                dvui.labelNoFmt(@src(), entry_label, .{}, .{ .expand = .horizontal });
+                if (entry_branch.expander(@src(), .{ .indent = 10 }, .{ .expand = .horizontal, .id_extra = i })) {
+                    showJsonValue(entry.value_ptr.*);
+                }
+            }
         }
     }
 
-    // Tensors accordion
+    // Tensors branch
     {
         const header = std.fmt.allocPrint(fa, "Tensors ({d})", .{file.tensors.items.len}) catch "Tensors";
-        if (dvui.expander(@src(), header, .{}, .{ .expand = .horizontal })) {
-            showTensorsExpanded(file.tensors.items);
-        }
-    }
-}
-
-fn showTensorsExpanded(tensors: []const ggufy.types.Tensor) void {
-    // Container wrapping the whole list so we can measure total height.
-    var list_box = dvui.box(@src(), .{}, .{ .expand = .horizontal });
-    defer list_box.deinit();
-    const list_id = list_box.data().id;
-
-    // Derive per-item height from previous frame's total height.
-    // Self-consistent: spacers maintain total = N * item_h, so this is stable.
-    var item_h: f32 = dvui.dataGet(null, list_id, "_ih", f32) orelse 0;
-    {
-        const prev_total = list_box.data().rect.h;
-        if (prev_total > 0 and tensors.len > 0) {
-            item_h = prev_total / @as(f32, @floatFromInt(tensors.len));
-            dvui.dataSet(null, list_id, "_ih", item_h);
-        }
-    }
-
-    if (item_h <= 0) {
-        // First frame only: render everything to establish measurements.
-        for (tensors, 0..) |tensor, i| {
-            showTensorEntry(tensor, i);
-        }
-        return;
-    }
-
-    // Convert item height to physical pixels for clip comparison.
-    const rs = list_box.data().borderRectScale();
-    const item_h_phys = item_h * rs.s;
-    const list_top_phys = rs.r.y;
-    const clip = dvui.clipGet();
-
-    const first_visible: usize = blk: {
-        const above = clip.y - list_top_phys;
-        if (above <= 0) break :blk 0;
-        break :blk @min(@as(usize, @intFromFloat(above / item_h_phys)), tensors.len);
-    };
-    const last_visible: usize = blk: {
-        const to_bottom = clip.y + clip.h - list_top_phys;
-        if (to_bottom <= 0) break :blk 0;
-        const idx = @as(usize, @intFromFloat(@ceil(to_bottom / item_h_phys))) + 2;
-        break :blk @min(idx, tensors.len);
-    };
-
-    // Top spacer for items scrolled above the viewport.
-    if (first_visible > 0) {
-        var sp = dvui.box(@src(), .{}, .{
-            .expand = .horizontal,
-            .min_size_content = .{ .h = @as(f32, @floatFromInt(first_visible)) * item_h },
-        });
-        sp.deinit();
-    }
-
-    for (first_visible..last_visible) |i| {
-        showTensorEntry(tensors[i], i);
-    }
-
-    // Bottom spacer for items below the viewport.
-    if (last_visible < tensors.len) {
-        var sp = dvui.box(@src(), .{}, .{
-            .expand = .horizontal,
-            .min_size_content = .{ .h = @as(f32, @floatFromInt(tensors.len - last_visible)) * item_h },
-        });
-        sp.deinit();
-    }
-}
-
-fn showMetadataEntries(meta: std.json.ObjectMap) void {
-    const fa = frameArena();
-    var it = meta.iterator();
-    var i: usize = 0;
-    while (it.next()) |entry| : (i += 1) {
-        const type_name = @tagName(entry.value_ptr.*);
-        const entry_label = std.fmt.allocPrint(fa, "{s}  [{s}]", .{ entry.key_ptr.*, type_name }) catch entry.key_ptr.*;
-        if (dvui.expander(@src(), entry_label, .{}, .{ .expand = .horizontal, .id_extra = i })) {
-            var indent = dvui.box(@src(), .{}, .{ .expand = .horizontal, .padding = .{ .x = 20 }, .id_extra = i });
-            defer indent.deinit();
-            showJsonValue(entry.value_ptr.*);
+        const tensors_branch = tree.branch(@src(), .{ .expanded = false }, .{ .expand = .horizontal });
+        defer tensors_branch.deinit();
+        dvui.labelNoFmt(@src(), header, .{}, .{ .expand = .horizontal });
+        if (tensors_branch.expander(@src(), .{ .indent = 10 }, .{ .expand = .horizontal })) {
+            for (file.tensors.items) |tensor| {
+                showTensorBranch(tensor);
+            }
         }
     }
 }
@@ -376,7 +332,7 @@ fn showJsonValue(value: std.json.Value) void {
     tl.deinit();
 }
 
-fn showTensorEntry(tensor: ggufy.types.Tensor, i: usize) void {
+fn showTensorBranch(tensor: ggufy.types.Tensor) void {
     const fa = frameArena();
 
     var dims_buf: [256]u8 = undefined;
@@ -392,31 +348,21 @@ fn showTensorEntry(tensor: ggufy.types.Tensor, i: usize) void {
     var n: u64 = 1;
     for (tensor.dims) |d| n *= d;
 
-    const size_str = if (tensor.size == 0) ""
-        else if (tensor.size >= 1024 * 1024 * 1024)
-            std.fmt.allocPrint(fa, "  {d:.2} GB", .{@as(f64, @floatFromInt(tensor.size)) / (1024.0 * 1024.0 * 1024.0)}) catch ""
-        else if (tensor.size >= 1024 * 1024)
-            std.fmt.allocPrint(fa, "  {d:.2} MB", .{@as(f64, @floatFromInt(tensor.size)) / (1024.0 * 1024.0)}) catch ""
-        else if (tensor.size >= 1024)
-            std.fmt.allocPrint(fa, "  {d:.2} KB", .{@as(f64, @floatFromInt(tensor.size)) / 1024.0}) catch ""
-        else
-            std.fmt.allocPrint(fa, "  {d} B", .{tensor.size}) catch "";
+    var size_buf: [32]u8 = undefined;
+    const size_str = formatBytes(tensor.size, &size_buf);
 
     const line = std.fmt.allocPrint(fa, "{s}  [{s}]  {s}  {d} elem{s}  offset:{d}", .{
         tensor.name, tensor.type, fbs.getWritten(), n, size_str, tensor.offset,
     }) catch tensor.name;
 
-    dvui.labelNoFmt(@src(), line, .{}, .{ .expand = .horizontal, .id_extra = i });
+    dvui.labelNoFmt(@src(), line, .{}, .{ .expand = .horizontal });
 }
 
 fn showError() void {
     var box_inner = dvui.box(@src(), .{}, .{.gravity_x = 0.5, .gravity_y = 0.5});
     defer box_inner.deinit();
 
-    var tl = dvui.textLayout(@src(), .{}, .{.gravity_x = 0.5, .font = .theme(.title) });
-    const err = std.fmt.allocPrint(gpa, "Error: {}", .{state.load_error.?}) catch "Out of memory";
-    tl.addText(err, .{});
-    tl.deinit();
+    dvui.label(@src(), "Error: {}", .{state.load_error.?}, .{ .gravity_x = 0.5, .font = .theme(.title) });
 }
 
 fn handleDropEvent(sdlEvent: SDLBackend.c.SDL_Event) void {
@@ -469,3 +415,60 @@ const filters = [_]SDLBackend.c.SDL_DialogFileFilter{
     .{ .name = "Safetensors files",  .pattern = "safetensors" },
     .{ .name = "All files",   .pattern = "*" },
 };
+
+/// format a u64 as a number with comma separators
+fn formatWithCommas(value: u64, buf: []u8) []u8 {
+    var tmp: [20]u8 = undefined;
+    var tmp_len: usize = 0;
+
+    if (value == 0) {
+        buf[0] = '0';
+        return buf[0..1];
+    }
+
+    var v = value;
+    while (v > 0) {
+        tmp[tmp_len] = '0' + @as(u8, @intCast(v % 10));
+        tmp_len += 1;
+        v /= 10;
+    }
+
+    // tmp is now the digits in reverse order; write to buf with commas
+      var out_idx: usize = 0;
+    for (0..tmp_len) |i| {
+        const digit_pos = tmp_len - 1 - i; // position from the left
+          if (i > 0 and (tmp_len - i) % 3 == 0) {
+            buf[out_idx] = ',';
+            out_idx += 1;
+        }
+        buf[out_idx] = tmp[digit_pos];
+        out_idx += 1;
+    }
+
+    return buf[0..out_idx];
+}
+
+/// formats a u64 as a human-friendly byte size, such as "6.9GB"
+fn formatBytes(value: u64, buf: []u8) []u8 {
+    const units = [_][]const u8{ "B", "KB", "MB", "GB", "TB", "PB" };
+    const unit_count = units.len;
+
+    var idx: usize = 0;
+    var scaled = @as(f64, @floatFromInt(value));
+
+    while (scaled >= 1024.0 and idx < unit_count - 1) {
+        scaled /= 1024.0;
+        idx += 1;
+    }
+
+    if (idx == 0) {
+        // Bytes — no decimal
+          return std.fmt.bufPrint(buf, "{d}{s}", .{ value, units[idx] }) catch buf[0..0];
+    } else if (scaled >= 100.0) {
+        return std.fmt.bufPrint(buf, "{d:.0}{s}", .{ scaled, units[idx] }) catch buf[0..0];
+    } else if (scaled >= 10.0) {
+        return std.fmt.bufPrint(buf, "{d:.1}{s}", .{ scaled, units[idx] }) catch buf[0..0];
+    } else {
+        return std.fmt.bufPrint(buf, "{d:.2}{s}", .{ scaled, units[idx] }) catch buf[0..0];
+    }
+}
