@@ -37,8 +37,8 @@
             .hash = "clap-0.11.0-oBajB-HnAQDPCKYzwF7rO3qDFwRcD39Q0DALlTSz5H7e",
         },
         .dvui = .{
-            .url = "git+https://github.com/david-vanderson/dvui#0ce3d688718fd9cabe18770034761b388d1fa2bf",
-            .hash = "dvui-0.4.0-dev-AQFJmTLk3wBocv7Exz59NJ17TZym2manCpclor-OtPSO",
+            .url = "git+https://github.com/david-vanderson/dvui#c340b88053280e1cf19890e56c797664f9bf7ca2",
+            .hash = "dvui-0.4.0-dev-AQFJmTXU3wBJ2wCYyH4UeUWkMBSJbY7y6Ouc11_Gkls1",
         },
     },
     .paths = .{

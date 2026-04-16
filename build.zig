@@ -72,7 +72,7 @@ pub fn build(b: *std.Build) void {
 
     ggml.link(b, gui, target, optimize);
 
-    const dvui_dep = b.dependency("dvui", .{ .target = target, .optimize = optimize, .backend = .sdl3 });
+    const dvui_dep = b.dependency("dvui", .{ .target = target, .optimize = optimize, .backend = .sdl3, .@"tree-sitter" = false });
     gui.root_module.addImport("dvui", dvui_dep.module("dvui_sdl3"));
     gui.root_module.addImport("backend", dvui_dep.module("sdl3"));
 

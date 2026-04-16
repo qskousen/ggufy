@@ -220,7 +220,6 @@ fn gui_frame() bool {
 fn showLoading() void {
     var box_inner = dvui.box(@src(), .{}, .{.gravity_x = 0.5, .gravity_y = 0.5});
     defer box_inner.deinit();
-Add arch
     dvui.label(@src(), "Loading...", .{}, .{.gravity_x = 0.5, .font = .theme(.title) });
 }
 
