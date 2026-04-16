@@ -95,6 +95,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mod })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cli.root_module })).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cli.root_module })).step);
 
     const arch_detect_test = b.addTest(.{
         .root_module = b.createModule(.{
