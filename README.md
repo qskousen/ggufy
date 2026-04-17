@@ -3,6 +3,7 @@ A lightweight and efficient tool to convert tensor formats.
 
 ggufy:
 - is a single-file executable written in zig, for linux, windows, and macos (arm64 and x86_64)
+- comes in CLI and GUI flavors
 - is fast and memory efficient
 - supports converting from safetensors to various gguf quantizations
 - supports converting safetensors datatypes (F32, BF16, F16, F8 (E5M2 and E4M3))
@@ -10,6 +11,11 @@ ggufy:
 - currently targets image diffusion models (SD1.5, SDXL, etc.)
 
 Download pre-built executables [on the releases page](https://github.com/qskousen/ggufy/releases)
+
+### GUI screenshots
+
+![ggufy GUI](assets/ggufy-gui.png)
+![ggufy GUI converting](assets/ggufy-gui-converting.png)
 
 ### Supported architectures
 
@@ -31,21 +37,19 @@ This table lists the architectures that ggufy can convert, and whether they have
 | Qwen               | ✅         | ❌                |
 | ERNIE              | ✅         | ❌                |
 
-### Todos:
-
-- [x] allow opening st or gguf non-existing path and use for writing (separate instances for read and write)
-- [x] generate "quantization sensitivity" file, weight tensors 1-100 on how much quantization affects them
-- [x] allow to set output directory and output file when converting
-- [x] starting with q8_0, support actual quantization
-- [ ] allow converting model, encoders, vae by option
-- [ ] allow setting alignment to something other than 32
-
 I initially intended to have this all in pure zig, but now it includes ggml c/c++ code for quantization. I did actually get a working q8_0 implementation in zig (you can find it if you look back through the commits) but got stuck on figuring out q5_0 and decided to just pull in ggml and use that.
 
 ## Installation
 
-ggufy is a single-file executable, available for download from the [releases page](https://github.com/qskousen/ggufy/releases).
+### CLI
+
+ggufy CLI is a single-file executable, available for download from the [releases page](https://github.com/qskousen/ggufy/releases).
 Download the version appropriate for your system, extract it, and place it somewhere in your PATH; alternatively, run it directly from wherever you extracted it.
+
+### GUI
+
+ggufy is also available as a GUI app on the same [releases page](https://github.com/qskousen/ggufy/releases).
+Download the version appropriate for your system, extract it, and run it.
 
 ## Usage
 

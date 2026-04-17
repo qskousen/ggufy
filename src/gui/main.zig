@@ -892,16 +892,81 @@ fn showModelInternals() void {
 
     // Tensors branch
     {
-        const header = std.fmt.allocPrint(fa, "Tensors ({d})", .{file.tensors.items.len}) catch "Tensors";
+        const n = file.tensors.items.len;
+        const header = std.fmt.allocPrint(fa, "Tensors ({d})", .{n}) catch "Tensors";
         const tensors_branch = tree.branch(@src(), .{ .expanded = false }, .{ .expand = .horizontal });
         defer tensors_branch.deinit();
         dvui.labelNoFmt(@src(), header, .{}, .{ .expand = .horizontal });
         if (tensors_branch.expander(@src(), .{ .indent = 10 }, .{ .expand = .horizontal })) {
-            for (file.tensors.items, 0..) |tensor, i| {
-                showTensorBranch(tensor, i);
-            }
+            showTensorsVirtual(file, tensors_branch.data().id, n);
         }
     }
+}
+
+fn showTensorsVirtual(file: *const ggufy.fileLoader.TensorFile, parent_id: dvui.Id, n: usize) void {
+    if (n == 0) return;
+
+    // Row height in logical content pixels — derived from the current body font,
+    // so it adapts to theme changes without needing a measurement frame.
+    const row_h: f32 = dvui.themeGet().font_body.lineHeight() + 2.0;
+
+    // Place a zero-height marker to record the physical Y where the list starts.
+    var marker_wd: dvui.WidgetData = undefined;
+    {
+        var marker = dvui.box(@src(), .{}, .{ .min_size_content = .{ .h = 0 }, .expand = .horizontal, .data_out = &marker_wd });
+        marker.deinit();
+    }
+
+    const scale = dvui.windowNaturalScale();
+    const row_h_phys = row_h * scale;
+    const list_y = marker_wd.borderRectScale().r.y; // physical Y of list top
+    const clip = dvui.clipGet(); // physical visible rect
+
+    // How far (in physical px) the viewport top is below the list top.
+    // Negative means the viewport starts above the list (list not yet scrolled to).
+    const rel_top = clip.y - list_y;
+    const rel_bot = (clip.y + clip.h) - list_y;
+
+    // Visible row range with one row of overdraw on each side.
+    const first: usize = if (rel_top > row_h_phys)
+        @intFromFloat(@floor((rel_top - row_h_phys) / row_h_phys))
+    else
+        0;
+    const last_raw: usize = if (rel_bot > 0)
+        @intFromFloat(@ceil((rel_bot + row_h_phys) / row_h_phys))
+    else
+        0;
+    const last: usize = @min(n, last_raw);
+
+    // Top spacer — represents the rows above the viewport.
+    if (first > 0) {
+        var spacer = dvui.box(@src(), .{}, .{
+            .min_size_content = .{ .h = @as(f32, @floatFromInt(first)) * row_h },
+            .expand = .horizontal,
+            // stable id so dvui doesn't confuse this with real tensor rows
+            .id_extra = std.math.maxInt(usize),
+        });
+        spacer.deinit();
+    }
+
+    // Visible tensors.
+    for (file.tensors.items[first..last], first..) |tensor, i| {
+        showTensorBranch(tensor, i);
+    }
+
+    // Bottom spacer — represents the rows below the viewport.
+    const tail = n - last;
+    if (tail > 0) {
+        var spacer = dvui.box(@src(), .{}, .{
+            .min_size_content = .{ .h = @as(f32, @floatFromInt(tail)) * row_h },
+            .expand = .horizontal,
+            .id_extra = std.math.maxInt(usize) - 1,
+        });
+        spacer.deinit();
+    }
+
+    // Keep the stored parent id alive so the data key is stable.
+    _ = parent_id;
 }
 
 fn showJsonValue(value: std.json.Value) void {
