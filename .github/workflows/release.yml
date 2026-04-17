@@ -60,7 +60,7 @@ jobs:
       - name: Build for macOS aarch64
         if: matrix.os == 'macos-latest'
         run: |
-          zig build --release=small -Dtarget=aarch64-macos
+          zig build --release=small -Dtarget=aarch64-macos --sysroot "$(xcrun --sdk macosx --show-sdk-path)"
           mkdir -p dist/macos-aarch64
           cp zig-out/bin/ggufy dist/macos-aarch64/ggufy
           cd dist/macos-aarch64
