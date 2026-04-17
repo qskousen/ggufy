@@ -14,8 +14,10 @@ Download pre-built executables [on the releases page](https://github.com/qskouse
 
 ### GUI screenshots
 
-![ggufy GUI](assets/ggufy-gui.png)
-![ggufy GUI converting](assets/ggufy-gui-converting.png)
+<p align="center">
+  <a href="assets/ggufy-gui.png"><img src="assets/ggufy-gui.png" width="48%" alt="guffy gui"></a>
+  <a href="assets/ggufy-gui-converting.png"><img src="assets/ggufy-gui-converting.png" width="48%" alt="ggufy gui conversion screen"></a>
+</p>
 
 ### Supported architectures
 
