@@ -32,41 +32,40 @@ jobs:
       - name: Build for Linux x86-64
         if: matrix.os == 'ubuntu-24.04'
         run: |
-          zig build --release=fast
+          zig build --release=small
           mkdir -p dist/linux
-          cp zig-out/bin/ggufy dist/linux/ggufy
+          cp zig-out/bin/ggufy zig-out/bin/ggufy-gui dist/linux/
           cd dist/linux
-          zip ../ggufy-linux-x86_64.zip ggufy
+          zip ../ggufy-linux-x86_64.zip ggufy ggufy-gui
           cd ../..
 
       - name: Build for Windows x86-64
         if: matrix.os == 'windows-latest'
         run: |
-          zig build --release=fast -Dtarget=x86_64-windows
+          zig build --release=small -Dtarget=x86_64-windows
           mkdir -p dist/windows
           cp zig-out/bin/ggufy.exe dist/windows/ggufy.exe
-          Compress-Archive -Path dist/windows/ggufy.exe -DestinationPath dist/ggufy-windows-x86_64.zip
+          cp zig-out/bin/ggufy-gui.exe dist/windows/ggufy-gui.exe
+          Compress-Archive -Path dist/windows/ggufy.exe,dist/windows/ggufy-gui.exe -DestinationPath dist/ggufy-windows-x86_64.zip
 
       - name: Build for macOS x86-64
         if: matrix.os == 'macos-latest'
         run: |
-          SDK_PATH=$(xcrun --sdk macosx --show-sdk-path)
-          zig build --release=fast -Dtarget=x86_64-macos -Dsysroot=$SDK_PATH
+          zig build --release=small -Dtarget=x86_64-macos --sysroot "$(xcrun --sdk macosx --show-sdk-path)"
           mkdir -p dist/macos-x86_64
-          cp zig-out/bin/ggufy dist/macos-x86_64/ggufy
+          cp zig-out/bin/ggufy zig-out/bin/ggufy-gui dist/macos-x86_64/
           cd dist/macos-x86_64
-          zip ../ggufy-macos-x86_64.zip ggufy
+          zip ../ggufy-macos-x86_64.zip ggufy ggufy-gui
           cd ../..
 
       - name: Build for macOS aarch64
         if: matrix.os == 'macos-latest'
         run: |
-          SDK_PATH=$(xcrun --sdk macosx --show-sdk-path)
-          zig build --release=fast -Dtarget=aarch64-macos -Dsysroot=$SDK_PATH
+          zig build --release=small -Dtarget=aarch64-macos --sysroot "$(xcrun --sdk macosx --show-sdk-path)"
           mkdir -p dist/macos-aarch64
-          cp zig-out/bin/ggufy dist/macos-aarch64/ggufy
+          cp zig-out/bin/ggufy zig-out/bin/ggufy-gui dist/macos-aarch64/
           cd dist/macos-aarch64
-          zip ../ggufy-macos-aarch64.zip ggufy
+          zip ../ggufy-macos-aarch64.zip ggufy ggufy-gui
           cd ../..
 
       # -------------------- Upload artifacts --------------------

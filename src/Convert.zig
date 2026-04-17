@@ -7,6 +7,7 @@ const st = @import("Safetensor.zig");
 const types = @import("types.zig");
 const gguf = @import("Gguf.zig");
 const imagearch = @import("ImageArch.zig");
+const cb = @import("callbacks.zig");
 
 // ============================================================================
 // Public API
@@ -28,6 +29,8 @@ pub const ConvertOptions = struct {
     /// Non-quantized types (f16, bf16, f32, f64) and q8_0 are always allowed.
     /// Defaults to null, meaning "infer from datatype".
     allowed_quant_families: ?QuantizationFamilies = null,
+    /// Optional GUI progress/cancel hooks.  No-ops when null.
+    callbacks: cb.ConvertCallbacks = .{},
 };
 
 /// Which sub-families of quantized types may be used during sensitivity-aware
@@ -85,6 +88,28 @@ pub const QuantizationFamilies = struct {
         };
     }
 };
+
+/// Compute the output file path that `convert` would write to, without
+/// performing any actual conversion.  Useful for overwrite checks in the GUI.
+pub fn computeOutputPath(opts: ConvertOptions, arena_alloc: std.mem.Allocator) ![]const u8 {
+    const dir_path = if (opts.output_dir) |od| od else std.fs.path.dirname(opts.path) orelse ".";
+    const ext: []const u8 = switch (opts.filetype) {
+        .gguf => "gguf",
+        .safetensors => "safetensors",
+    };
+    const base_name = if (opts.output_name) |on| on else blk: {
+        const stem = std.fs.path.stem(opts.path);
+        const dtype_str = switch (opts.filetype) {
+            .gguf => @tagName(opts.datatype orelse types.DataType.f16),
+            .safetensors => @tagName(opts.datatype orelse types.DataType.F16),
+        };
+        break :blk try std.fmt.allocPrint(arena_alloc, "{s}-{s}", .{ stem, dtype_str });
+    };
+    return std.fs.path.join(
+        arena_alloc,
+        &[_][]const u8{ dir_path, try std.fmt.allocPrint(arena_alloc, "{s}.{s}", .{ base_name, ext }) },
+    );
+}
 
 /// Entry point: convert a SafeTensors file according to `opts`.
 /// `f` is the already-opened SafeTensors handle.
@@ -686,7 +711,12 @@ fn writeGguf(
             try out_gguf.metadata.put(try arena_alloc.dupe(u8, entry.key_ptr.*), entry.value_ptr.*);
     }
 
-    try out_gguf.saveWithSTData(f, opts.threads);
+    out_gguf.saveWithSTData(f, opts.threads, opts.callbacks) catch |err| {
+        if (err == error.Cancelled) {
+            std.fs.deleteFileAbsolute(out_filename) catch {};
+        }
+        return err;
+    };
     std.log.info("Converted to {s}", .{out_filename});
 }
 
@@ -748,7 +778,12 @@ fn writeSafetensors(
             try out_st.metadata.?.put(try arena_alloc.dupe(u8, entry.key_ptr.*), entry.value_ptr.*);
     }
 
-    try out_st.saveWithSTData(f, opts.threads);
+    out_st.saveWithSTData(f, opts.threads, opts.callbacks) catch |err| {
+        if (err == error.Cancelled) {
+            std.fs.deleteFileAbsolute(out_filename) catch {};
+        }
+        return err;
+    };
     std.log.info("Converted to {s}", .{out_filename});
 
 

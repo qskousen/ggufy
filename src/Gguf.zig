@@ -3,6 +3,7 @@ const nw = @import("NullWriter.zig");
 const types = @import("types.zig");
 const st = @import("Safetensor.zig");
 const DataTransform = @import("DataTransform.zig");
+const cb = @import("callbacks.zig");
 
 path: []const u8,
 allocator: std.mem.Allocator,
@@ -338,7 +339,7 @@ const GgufMetadata = struct {
     }
 };
 
-pub fn saveWithSTData(self: Gguf, source: *st, threads: usize) !void {
+pub fn saveWithSTData(self: Gguf, source: *st, threads: usize, callbacks: cb.ConvertCallbacks) !void {
     // we need to track bytes written for calculating alignment for the starting tensor
     var bytes_written: u64 = 0;
 
@@ -380,8 +381,12 @@ pub fn saveWithSTData(self: Gguf, source: *st, threads: usize) !void {
     // we need to write them in the order of our tensors, but there is no guarantee that the source tensors will be in the same order
     // the names might also be different, so we have to do some matching
     var read_buffer: [1024 * 1024]u8 = undefined;
-    var count: u64 = 1;
+    const total_tensors: u32 = @intCast(self.tensors.items.len);
+    var count: u32 = 1;
     for (self.tensors.items) |t| {
+        // Check for cancellation before writing each tensor
+        if (callbacks.isCancelled()) return error.Cancelled;
+
         // try to find the matching tensor in the source
         var matched = false;
         for (source.tensors.items) |source_tensor| {
@@ -395,7 +400,7 @@ pub fn saveWithSTData(self: Gguf, source: *st, threads: usize) !void {
                     for (t.dims) |d| elements *= d;
                     std.log.info("Writing tensor data for tensor {}/{} {s} - {s} to {s}, {} elements", .{
                         count,
-                        self.tensors.items.len,
+                        total_tensors,
                         t.name,
                         source_tensor.type,
                         t.type,
@@ -412,10 +417,12 @@ pub fn saveWithSTData(self: Gguf, source: *st, threads: usize) !void {
                     // write padding for alignment if needed
                     const size = try Gguf.calculateTensorSize(t);
                     try self.maybeWritePadding(size, &writer.interface);
+
+                    callbacks.reportProgress(count, total_tensors, t.name, source_tensor.type, t.type, @intCast(elements));
                     count += 1;
                 }
         }
-        if (! matched) {
+        if (!matched) {
             std.log.warn("Could not find source tensor match for tensor {s}!", .{t.name});
             return error.NoMatchingSourceTensor;
         }
