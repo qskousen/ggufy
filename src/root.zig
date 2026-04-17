@@ -8,3 +8,4 @@ pub const imageArch = @import("ImageArch.zig");
 pub const safetensor = @import("Safetensor.zig");
 pub const types = @import("types.zig");
 pub const fileLoader = @import("FileLoader.zig");
+pub const callbacks = @import("callbacks.zig");
