@@ -76,6 +76,15 @@ pub fn build(b: *std.Build) void {
     gui.root_module.addImport("dvui", dvui_dep.module("dvui_sdl3"));
     gui.root_module.addImport("backend", dvui_dep.module("sdl3"));
 
+    // When cross-compiling for macOS with an explicit sysroot (e.g. CI),
+    // Zig does not automatically add the SDK's framework search path, so we must wire it up ourselves.
+    if (target.result.os.tag == .macos) {
+        if (b.sysroot) |sysroot| {
+            const fw_path = b.pathJoin(&.{ sysroot, "System/Library/Frameworks" });
+            gui.addFrameworkPath(.{ .cwd_relative = fw_path });
+        }
+    }
+
     const gui_install = b.addInstallArtifact(gui, .{});
     const gui_step = b.step("gui", "Build the GUI");
     gui_step.dependOn(&gui_install.step);
