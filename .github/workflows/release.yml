@@ -44,7 +44,8 @@ jobs:
         run: |
           zig build --release=small -Dtarget=x86_64-windows
           mkdir -p dist/windows
-          cp zig-out/bin/ggufy.exe zig-out/bin/ggufy-gui.exe dist/windows/
+          cp zig-out/bin/ggufy.exe dist/windows/ggufy.exe
+          cp zig-out/bin/ggufy-gui.exe dist/windows/ggufy-gui.exe
           Compress-Archive -Path dist/windows/ggufy.exe,dist/windows/ggufy-gui.exe -DestinationPath dist/ggufy-windows-x86_64.zip
 
       - name: Build for macOS x86-64
