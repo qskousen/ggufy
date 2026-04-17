@@ -50,7 +50,8 @@ jobs:
       - name: Build for macOS x86-64
         if: matrix.os == 'macos-latest'
         run: |
-          zig build --release=small -Dtarget=x86_64-macos
+          SDK_PATH=$(xcrun --sdk macosx --show-sdk-path)
+          zig build --release=small -Dtarget=x86_64-macos -Dsysroot=$SDK_PATH
           mkdir -p dist/macos-x86_64
           cp zig-out/bin/ggufy dist/macos-x86_64/ggufy
           cd dist/macos-x86_64
@@ -60,7 +61,8 @@ jobs:
       - name: Build for macOS aarch64
         if: matrix.os == 'macos-latest'
         run: |
-          zig build --release=small -Dtarget=aarch64-macos
+          SDK_PATH=$(xcrun --sdk macosx --show-sdk-path)
+          zig build --release=small -Dtarget=aarch64-macos -Dsysroot=$SDK_PATH
           mkdir -p dist/macos-aarch64
           cp zig-out/bin/ggufy dist/macos-aarch64/ggufy
           cd dist/macos-aarch64
