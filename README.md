@@ -310,3 +310,4 @@ zig build
 - [llama.cpp.zig](https://github.com/Deins/llama.cpp.zig) for helping get ggml compiling in zig
 - [gguf-docs](https://github.com/iuliaturc/gguf-docs) for helping me understand quantization
 - Random German who helped to get ggufy working on MacOS for arm64 and x86_64
+- [dvui](https://github.com/david-vanderson/dvui) ggufy GUI uses DVUI for cross-platform GUI

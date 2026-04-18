@@ -31,6 +31,8 @@ pub const State = struct {
     filename_base_stem_len: usize = 0,
     /// Last dtype applied when auto-generating the filename. Null = never auto-applied.
     prev_target_dtype: ?ggufy.types.DataType = null,
+    /// Length of template_path last time the filename was auto-generated (change detector).
+    prev_template_path_len: usize = 0,
     /// CPU thread count for quantization. Populated at startup with getCpuCount().
     target_threads: usize = 4,
     cpu_count: usize = 4,
@@ -45,6 +47,20 @@ pub const State = struct {
     folder_dialog_open: bool = false,
     sensitivity_dialog_open: bool = false,
     template_dialog_open: bool = false,
+    export_template_dialog_open: bool = false,
+    gen_sensitivities_dialog_open: bool = false,
+
+    // Export template / generate sensitivities
+    export_template_path_buf: [std.fs.max_path_bytes]u8 = std.mem.zeroes([std.fs.max_path_bytes]u8),
+    export_template_path: ?[]u8 = null,
+    gen_sensitivities_path_buf: [std.fs.max_path_bytes]u8 = std.mem.zeroes([std.fs.max_path_bytes]u8),
+    gen_sensitivities_path: ?[]u8 = null,
+    export_template_requested: bool = false,
+    gen_sensitivities_requested: bool = false,
+    // Status message shown after a tool operation (template export / sensitivities gen)
+    tool_status_buf: [256]u8 = std.mem.zeroes([256]u8),
+    tool_status_len: usize = 0,
+    tool_status_is_error: bool = false,
 
     // Conversion progress
     convert_state: std.atomic.Value(ConvertState) = .init(.idle),
@@ -58,6 +74,7 @@ pub const State = struct {
     /// Set true in the main loop to spawn the convert thread on the next iteration.
     convert_requested: bool = false,
     convert_error: ?anyerror = null,
+    convert_elapsed_ns: u64 = 0,
     convert_output_path_buf: [std.fs.max_path_bytes]u8 = undefined,
     convert_output_path: ?[]u8 = null,
 
@@ -99,5 +116,9 @@ pub const State = struct {
 
     pub fn currentTensorDstType(self: *const State) []const u8 {
         return self.convert_tensor_dst_type_buf[0..self.convert_tensor_dst_type_len];
+    }
+
+    pub fn toolStatus(self: *const State) []const u8 {
+        return self.tool_status_buf[0..self.tool_status_len];
     }
 };

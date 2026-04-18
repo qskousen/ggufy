@@ -152,6 +152,106 @@ fn cancelCallback(ctx: ?*anyopaque) bool {
     return state.cancel_requested.load(.acquire);
 }
 
+// Export template / generate sensitivities
+
+fn setToolStatus(state: *guiState.State, is_error: bool, comptime fmt: []const u8, args: anytype) void {
+    const msg = std.fmt.bufPrint(&state.tool_status_buf, fmt, args) catch "(message too long)";
+    state.tool_status_len = msg.len;
+    state.tool_status_is_error = is_error;
+}
+
+pub fn exportTemplateCallback(userdata: ?*anyopaque, filelist: [*c]const [*c]const u8, _: c_int) callconv(.c) void {
+    const state: *guiState.State = @ptrCast(@alignCast(userdata));
+    state.export_template_dialog_open = false;
+
+    const files = filelist orelse return;
+    if (files[0] == null) return;
+
+    const path = std.mem.span(files[0]);
+    const len = @min(path.len, state.export_template_path_buf.len - 1);
+    @memcpy(state.export_template_path_buf[0..len], path[0..len]);
+    state.export_template_path_buf[len] = 0;
+    state.export_template_path = state.export_template_path_buf[0..len];
+    state.export_template_requested = true;
+    pushWakeupEvent(state);
+}
+
+pub fn genSensitivitiesCallback(userdata: ?*anyopaque, filelist: [*c]const [*c]const u8, _: c_int) callconv(.c) void {
+    const state: *guiState.State = @ptrCast(@alignCast(userdata));
+    state.gen_sensitivities_dialog_open = false;
+
+    const files = filelist orelse return;
+    if (files[0] == null) return;
+
+    const path = std.mem.span(files[0]);
+    const len = @min(path.len, state.gen_sensitivities_path_buf.len - 1);
+    @memcpy(state.gen_sensitivities_path_buf[0..len], path[0..len]);
+    state.gen_sensitivities_path_buf[len] = 0;
+    state.gen_sensitivities_path = state.gen_sensitivities_path_buf[0..len];
+    state.gen_sensitivities_requested = true;
+    pushWakeupEvent(state);
+}
+
+pub fn doExportTemplate(arena_alloc: std.mem.Allocator, state: *guiState.State) void {
+    const path = state.export_template_path.?;
+    const loaded_file = &state.loaded_file.?;
+    const arch_opt: ?*const ggufy.imageArch.Arch = if (loaded_file.arch != null) &(loaded_file.arch.?) else null;
+    const reverse_dims = loaded_file.type == .safetensors;
+
+    const out_file = std.fs.cwd().createFile(path, .{ .truncate = true }) catch |err| {
+        setToolStatus(state, true, "Export failed: {s}", .{@errorName(err)});
+        return;
+    };
+    defer out_file.close();
+
+    var write_buf: [8192]u8 = undefined;
+    var file_writer = out_file.writer(&write_buf);
+    const writer = &file_writer.interface;
+
+    conv.writeTemplateFromTensors(
+        loaded_file.tensors.items,
+        arch_opt,
+        reverse_dims,
+        writer,
+        arena_alloc,
+    ) catch |err| {
+        setToolStatus(state, true, "Export failed: {s}", .{@errorName(err)});
+        return;
+    };
+    writer.flush() catch {};
+    setToolStatus(state, false, "Template exported to {s}", .{std.fs.path.basename(path)});
+}
+
+pub fn doGenSensitivities(arena_alloc: std.mem.Allocator, state: *guiState.State) void {
+    const path = state.gen_sensitivities_path.?;
+    const loaded_file = &state.loaded_file.?;
+    const arch_opt: ?*const ggufy.imageArch.Arch = if (loaded_file.arch != null) &(loaded_file.arch.?) else null;
+    const threshold: u64 = if (arch_opt) |a| (a.threshhold orelse conv.QUANTIZATION_THRESHOLD) else conv.QUANTIZATION_THRESHOLD;
+
+    const out_file = std.fs.cwd().createFile(path, .{ .truncate = true }) catch |err| {
+        setToolStatus(state, true, "Failed: {s}", .{@errorName(err)});
+        return;
+    };
+    defer out_file.close();
+
+    var write_buf: [8192]u8 = undefined;
+    var file_writer = out_file.writer(&write_buf);
+    const writer = &file_writer.interface;
+
+    conv.generateSensitivitiesFromTensors(
+        loaded_file.tensors.items,
+        arch_opt,
+        threshold,
+        writer,
+        arena_alloc,
+    ) catch |err| {
+        setToolStatus(state, true, "Failed: {s}", .{@errorName(err)});
+        return;
+    };
+    writer.flush() catch {};
+    setToolStatus(state, false, "Sensitivities written to {s}", .{std.fs.path.basename(path)});
+}
+
 // Conversion
 
 /// Convert the loaded file according to the options in state.
@@ -206,6 +306,8 @@ pub fn convertFile(alloc: std.mem.Allocator, arena_alloc: std.mem.Allocator, sta
         break :blk ft;
     };
 
+    var convert_timer = std.time.Timer.start() catch null;
+
     switch (file_type) {
         .safetensors => {
             var f = ggufy.safetensor.init(path, alloc, arena_alloc, false, false) catch |err| {
@@ -236,6 +338,8 @@ pub fn convertFile(alloc: std.mem.Allocator, arena_alloc: std.mem.Allocator, sta
             return;
         },
     }
+
+    if (convert_timer) |*t| state.convert_elapsed_ns = t.read();
 
     // Store output path for display on the done screen.
     const path_len = @min(output_path_str.len, state.convert_output_path_buf.len);

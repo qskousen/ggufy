@@ -14,6 +14,7 @@ const Command = enum {
     convert,
     template,
     names,
+    sensitivities,
 };
 
 pub fn main() !void {
@@ -80,7 +81,8 @@ pub fn main() !void {
         try stdout.print("  metadata       Shows metadata information for the specified file\n", .{});
         try stdout.print("  convert        Convert the specified file into a different format or datatype\n", .{});
         try stdout.print("  template       Creates a json template from the specified file\n", .{});
-        try stdout.print("  names          Dump tensor names as a JSON array (for test fixtures)\n\n", .{});
+        try stdout.print("  names          Dump tensor names as a JSON array (for test fixtures)\n", .{});
+        try stdout.print("  sensitivities  Generate a sensitivities JSON template from the specified file\n\n", .{});
         try stdout.print("Options:\n", .{});
         try stdout.flush();
         return clap.helpToFile(.stderr(), clap.Help, &params, .{});
@@ -154,7 +156,47 @@ pub fn main() !void {
                     }, allocator, arena_alloc);
                 },
                 .template => {
-                    return error.Unimplimented;
+                    const out_path = if (output_name) |n|
+                        try std.fmt.allocPrint(arena_alloc, "{s}.json", .{n})
+                    else
+                        "template.json";
+                    const out_file = try std.fs.cwd().createFile(out_path, .{ .truncate = true });
+                    defer out_file.close();
+                    var writer_buffer: [8192]u8 = undefined;
+                    var out_writer = out_file.writer(&writer_buffer);
+                    var writer = &out_writer.interface;
+                    const arch_ptr = try imagearch.detectArchFromTensors(f.tensors.items, allocator);
+                    try conv.writeTemplateFromTensors(
+                        f.tensors.items,
+                        arch_ptr,
+                        true, // reverse dims: safetensors → GGUF template convention
+                        writer,
+                        arena_alloc,
+                    );
+                    try writer.flush();
+                    std.log.info("Template exported to {s}", .{out_path});
+                },
+                .sensitivities => {
+                    const out_path = if (output_name) |n|
+                        try std.fmt.allocPrint(arena_alloc, "{s}.json", .{n})
+                    else
+                        "sensitivities.json";
+                    const out_file = try std.fs.cwd().createFile(out_path, .{ .truncate = true });
+                    defer out_file.close();
+                    var writer_buffer: [8192]u8 = undefined;
+                    var out_writer = out_file.writer(&writer_buffer);
+                    var writer = &out_writer.interface;
+                    const arch_ptr = try imagearch.detectArchFromTensors(f.tensors.items, allocator);
+                    const threshold: u64 = if (arch_ptr) |a| (a.threshhold orelse conv.QUANTIZATION_THRESHOLD) else conv.QUANTIZATION_THRESHOLD;
+                    try conv.generateSensitivitiesFromTensors(
+                        f.tensors.items,
+                        arch_ptr,
+                        threshold,
+                        writer,
+                        arena_alloc,
+                    );
+                    try writer.flush();
+                    std.log.info("Sensitivities exported to {s}", .{out_path});
                 },
                 .names => {
                     const name_list = try allocator.alloc([]const u8, f.tensors.items.len);
@@ -195,15 +237,40 @@ pub fn main() !void {
                     try stdout.writeByte('\n');
                 },
                 .template => {
-                    const out_file = try std.fs.cwd().createFile("template.json", .{ .truncate = true });
+                    const out_path = if (output_name) |n|
+                        try std.fmt.allocPrint(arena_alloc, "{s}.json", .{n})
+                    else
+                        "template.json";
+                    const out_file = try std.fs.cwd().createFile(out_path, .{ .truncate = true });
                     defer out_file.close();
-                    var writer_buffer: [1024]u8 = undefined;
+                    var writer_buffer: [8192]u8 = undefined;
                     var out_writer = out_file.writer(&writer_buffer);
                     var writer = &out_writer.interface;
-
                     try f.writeTemplate(writer);
                     try writer.flush();
-                    std.log.info("Template exported to template.json", .{});
+                    std.log.info("Template exported to {s}", .{out_path});
+                },
+                .sensitivities => {
+                    const out_path = if (output_name) |n|
+                        try std.fmt.allocPrint(arena_alloc, "{s}.json", .{n})
+                    else
+                        "sensitivities.json";
+                    const out_file = try std.fs.cwd().createFile(out_path, .{ .truncate = true });
+                    defer out_file.close();
+                    var writer_buffer: [8192]u8 = undefined;
+                    var out_writer = out_file.writer(&writer_buffer);
+                    var writer = &out_writer.interface;
+                    const arch_ptr = try imagearch.detectArchFromTensors(f.tensors.items, allocator);
+                    const threshold: u64 = if (arch_ptr) |a| (a.threshhold orelse conv.QUANTIZATION_THRESHOLD) else conv.QUANTIZATION_THRESHOLD;
+                    try conv.generateSensitivitiesFromTensors(
+                        f.tensors.items,
+                        arch_ptr,
+                        threshold,
+                        writer,
+                        arena_alloc,
+                    );
+                    try writer.flush();
+                    std.log.info("Sensitivities exported to {s}", .{out_path});
                 },
             }
         },

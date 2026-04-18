@@ -148,11 +148,14 @@ pub fn init(path: []const u8, mem_allocator: std.mem.Allocator, arena_alloc: std
         bytes_read += 8;
         const tensor_offset = std.mem.readInt(u64, offset_buf[0..8], .little);
 
+        var n_elements: u64 = 1;
+        for (dims) |d| n_elements *= d;
+
         try self.tensors.append(self.arena_alloc, .{
             .name = name,
             .type = @tagName(tensor_type),
             .dims = dims,
-            .size = 0, // GGUF tensor info doesn't store size, needs calculation
+            .size = tensor_type.calcSizeInBytes(n_elements),
             .offset = tensor_offset,
         });
     }

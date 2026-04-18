@@ -50,7 +50,7 @@ pub const Tensor = struct {
             .dims = try allocator.dupe(usize, self.dims),
             .size = self.size,
             .offset = self.offset,
-            .source_path = allocator.dupe(u8, self.source_path.?) catch null,
+            .source_path = if (self.source_path) |sp| allocator.dupe(u8, sp) catch null else null,
         };
     }
 };

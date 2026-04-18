@@ -109,6 +109,11 @@ pub fn main() !void {
             state.convert_state.store(.idle, .release);
             state.convert_progress.store(0, .release);
             state.convert_output_path = null;
+            state.sensitivity_path = null;
+            state.template_path = null;
+            state.skip_sensitivity = false;
+            state.tool_status_len = 0;
+            state.same_file_error = false;
             const thread = std.Thread.spawn(.{ .allocator = gpa }, fileHandling.loadFile, .{ gpa, arena_alloc, &state }) catch |err| {
                 state.load_error = err;
                 state.load_state.store(.err, .release);
@@ -132,6 +137,18 @@ pub fn main() !void {
                 continue :main_loop;
             };
             thread.detach();
+        }
+
+        // Export template trigger (synchronous — fast file write)
+        if (state.export_template_requested) {
+            state.export_template_requested = false;
+            fileHandling.doExportTemplate(arena_alloc, &state);
+        }
+
+        // Generate sensitivities trigger (synchronous — fast file write)
+        if (state.gen_sensitivities_requested) {
+            state.gen_sensitivities_requested = false;
+            fileHandling.doGenSensitivities(arena_alloc, &state);
         }
 
         try win.begin(nstime);
@@ -414,11 +431,16 @@ fn showInputFile() void {
             }
         }
 
-        // Auto-regenerate filename when dtype changes (or on first display).
-        // Uses the stored base stem + the selected (or most-common) dtype name.
-        if (first_init or state.target_dtype != state.prev_target_dtype) {
+        // Auto-regenerate filename when dtype or template changes (or on first display).
+        const cur_tmpl_len = if (state.template_path) |tp| tp.len else 0;
+        const template_changed = cur_tmpl_len != state.prev_template_path_len;
+        if (first_init or state.target_dtype != state.prev_target_dtype or template_changed) {
             state.prev_target_dtype = state.target_dtype;
-            const type_name: []const u8 = if (state.target_dtype) |dt|
+            state.prev_template_path_len = cur_tmpl_len;
+            const type_name: []const u8 = if (state.template_path) |tp| blk: {
+                // Template overrides dtype: derive suffix from the template's tensor types.
+                break :blk conv.templateTypeSuffix(tp, state.target_filetype, fa) catch "";
+            } else if (state.target_dtype) |dt|
                 @tagName(dt)
             else blk: {
                 // No dtype selected - fall back to the most common type in the source file.
@@ -513,6 +535,11 @@ fn showInputFile() void {
             const sens_display = if (state.sensitivity_path) |p| p else "none";
             dvui.labelNoFmt(@src(), sens_display, .{}, .{ .expand = .horizontal, .gravity_y = 0.5, .color_text = row_color });
 
+            if (state.sensitivity_path != null and !blocked_by_template) {
+                if (dvui.button(@src(), "Clear", .{}, .{ .gravity_y = 0.5 })) {
+                    state.sensitivity_path = null;
+                }
+            }
             var bwd: dvui.WidgetData = undefined;
             if (dvui.button(@src(), "Browse...", .{}, .{ .gravity_y = 0.5, .color_text = row_color, .data_out = &bwd })) {
                 if (!blocked_by_template and !state.sensitivity_dialog_open) {
@@ -546,6 +573,12 @@ fn showInputFile() void {
             const tmpl_display = if (state.template_path) |p| p else "none";
             dvui.labelNoFmt(@src(), tmpl_display, .{}, .{ .expand = .horizontal, .gravity_y = 0.5, .color_text = row_color });
 
+            if (state.template_path != null and !blocked_by_sens) {
+                if (dvui.button(@src(), "Clear", .{}, .{ .gravity_y = 0.5 })) {
+                    state.template_path = null;
+                    state.prev_template_path_len = 0;
+                }
+            }
             var bwd: dvui.WidgetData = undefined;
             if (dvui.button(@src(), "Browse...", .{}, .{ .gravity_y = 0.5, .color_text = row_color, .data_out = &bwd })) {
                 if (!blocked_by_sens and !state.template_dialog_open) {
@@ -640,6 +673,42 @@ fn showInputFile() void {
                 launchConversion(fa);
             }
 
+            // Gap between Convert and the export/generate buttons
+            {
+                var gap = dvui.box(@src(), .{}, .{ .min_size_content = .{ .w = 16 } });
+                defer gap.deinit();
+            }
+
+            if (dvui.button(@src(), "Export Template", .{}, .{ .gravity_y = 0.5 })) {
+                if (!state.export_template_dialog_open) {
+                    state.export_template_dialog_open = true;
+                    state.tool_status_len = 0;
+                    SDLBackend.c.SDL_ShowSaveFileDialog(
+                        fileHandling.exportTemplateCallback,
+                        &state,
+                        g_backend.?.window,
+                        &json_filters,
+                        json_filters.len,
+                        null,
+                    );
+                }
+            }
+
+            if (dvui.button(@src(), "Generate Sensitivities", .{}, .{ .gravity_y = 0.5 })) {
+                if (!state.gen_sensitivities_dialog_open) {
+                    state.gen_sensitivities_dialog_open = true;
+                    state.tool_status_len = 0;
+                    SDLBackend.c.SDL_ShowSaveFileDialog(
+                        fileHandling.genSensitivitiesCallback,
+                        &state,
+                        g_backend.?.window,
+                        &json_filters,
+                        json_filters.len,
+                        null,
+                    );
+                }
+            }
+
             // Spacer pushes Unload to the right
             {
                 var spacer = dvui.box(@src(), .{}, .{ .expand = .horizontal });
@@ -648,6 +717,18 @@ fn showInputFile() void {
 
             if (dvui.button(@src(), "Unload File", .{}, .{ .gravity_y = 0.5 })) {
                 unloadFile();
+            }
+        }
+
+        // Status message from tool operations (template export, sensitivities gen)
+        {
+            const status = state.toolStatus();
+            if (status.len > 0) {
+                const color: dvui.Color = if (state.tool_status_is_error)
+                    .{ .r = 220, .g = 60, .b = 60, .a = 255 }
+                else
+                    .{ .r = 80, .g = 180, .b = 80, .a = 255 };
+                dvui.labelNoFmt(@src(), status, .{}, .{ .color_text = color, .margin = .{ .x = 0, .y = 2, .w = 0, .h = 2 } });
             }
         }
     }
@@ -711,6 +792,7 @@ fn unloadFile() void {
     state.convert_output_path = null;
     state.convert_error = null;
     state.same_file_error = false;
+    state.tool_status_len = 0;
     state.load_state.store(.idle, .release);
 }
 
@@ -770,7 +852,19 @@ fn showConvertDone() void {
     dvui.label(@src(), "Conversion complete!", .{}, .{ .gravity_x = 0.5, .font = .theme(.title) });
 
     if (state.convert_output_path) |p| {
-        dvui.label(@src(), "Output: {s}", .{p}, .{ .gravity_x = 0.5, .margin = .{ .x = 0, .y = 4, .w = 0, .h = 12 } });
+        dvui.label(@src(), "Output: {s}", .{p}, .{ .gravity_x = 0.5, .margin = .{ .x = 0, .y = 4, .w = 0, .h = 4 } });
+    }
+
+    {
+        const ns = state.convert_elapsed_ns;
+        const secs = @as(f64, @floatFromInt(ns)) / std.time.ns_per_s;
+        if (secs >= 60.0) {
+            const mins: u64 = ns / std.time.ns_per_min;
+            const rem_s = (ns % std.time.ns_per_min) / std.time.ns_per_s;
+            dvui.label(@src(), "Completed in {d}m {d}s", .{ mins, rem_s }, .{ .gravity_x = 0.5, .margin = .{ .x = 0, .y = 0, .w = 0, .h = 12 } });
+        } else {
+            dvui.label(@src(), "Completed in {d:.2}s", .{secs}, .{ .gravity_x = 0.5, .margin = .{ .x = 0, .y = 0, .w = 0, .h = 12 } });
+        }
     }
 
     {
@@ -870,18 +964,20 @@ fn showModelInternals() void {
 
     // Metadata branch
     if (file.metadata) |meta| {
-        const header = std.fmt.allocPrint(fa, "Metadata ({d})", .{meta.count()}) catch "Metadata";
         const meta_branch = tree.branch(@src(), .{ .expanded = false }, .{ .expand = .horizontal });
         defer meta_branch.deinit();
+        const meta_caret: []const u8 = if (meta_branch.expanded) "v " else "> ";
+        const header = std.fmt.allocPrint(fa, "{s}Metadata ({d})", .{ meta_caret, meta.count() }) catch "Metadata";
         dvui.labelNoFmt(@src(), header, .{}, .{ .expand = .horizontal });
         if (meta_branch.expander(@src(), .{ .indent = 10 }, .{ .expand = .horizontal })) {
             var it = meta.iterator();
             var i: usize = 0;
             while (it.next()) |entry| : (i += 1) {
                 const type_name = @tagName(entry.value_ptr.*);
-                const entry_label = std.fmt.allocPrint(fa, "{s}  [{s}]", .{ entry.key_ptr.*, type_name }) catch entry.key_ptr.*;
                 const entry_branch = tree.branch(@src(), .{ .expanded = false }, .{ .expand = .horizontal, .id_extra = i });
                 defer entry_branch.deinit();
+                const entry_caret: []const u8 = if (entry_branch.expanded) "v " else "> ";
+                const entry_label = std.fmt.allocPrint(fa, "{s}{s}  [{s}]", .{ entry_caret, entry.key_ptr.*, type_name }) catch entry.key_ptr.*;
                 dvui.labelNoFmt(@src(), entry_label, .{}, .{ .expand = .horizontal });
                 if (entry_branch.expander(@src(), .{ .indent = 10 }, .{ .expand = .horizontal, .id_extra = i })) {
                     showJsonValue(entry.value_ptr.*);
@@ -893,9 +989,10 @@ fn showModelInternals() void {
     // Tensors branch
     {
         const n = file.tensors.items.len;
-        const header = std.fmt.allocPrint(fa, "Tensors ({d})", .{n}) catch "Tensors";
         const tensors_branch = tree.branch(@src(), .{ .expanded = false }, .{ .expand = .horizontal });
         defer tensors_branch.deinit();
+        const tensors_caret: []const u8 = if (tensors_branch.expanded) "v " else "> ";
+        const header = std.fmt.allocPrint(fa, "{s}Tensors ({d})", .{ tensors_caret, n }) catch "Tensors";
         dvui.labelNoFmt(@src(), header, .{}, .{ .expand = .horizontal });
         if (tensors_branch.expander(@src(), .{ .indent = 10 }, .{ .expand = .horizontal })) {
             showTensorsVirtual(file, tensors_branch.data().id, n);
@@ -998,7 +1095,7 @@ fn showTensorBranch(tensor: ggufy.types.Tensor, idx: usize) void {
     var size_buf: [32]u8 = undefined;
     const size_str = formatBytes(tensor.size, &size_buf);
 
-    const line = std.fmt.allocPrint(fa, "{s}  [{s}]  {s}  {d} elem{s}  offset:{d}", .{
+    const line = std.fmt.allocPrint(fa, "{s}  [{s}]  Dimensions: {s}  ({d} total), Size: {s}  Offset: {d}", .{
         tensor.name, tensor.type, fbs.getWritten(), n, size_str, tensor.offset,
     }) catch tensor.name;
 

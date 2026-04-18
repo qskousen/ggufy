@@ -179,7 +179,7 @@ pub fn convert(
 // Quantization level helpers
 // ============================================================================
 
-const QUANTIZATION_THRESHOLD = 1024;
+pub const QUANTIZATION_THRESHOLD: u64 = 1024;
 
 /// Quantization type hierarchy from lowest to highest precision.
 pub const QuantizationLevel = enum(u8) {
@@ -754,7 +754,7 @@ fn writeSafetensors(
     out_st.tensors = model_tensors;
 
     // Copy any metadata from the source, if there is any
-    out_st.metadata = try f.metadata.?.clone();
+    out_st.metadata = if (f.metadata) |meta| try meta.clone() else null;
 
     // Template metadata takes priority over source-file metadata.
     if (template_metadata) |meta| {
@@ -786,6 +786,188 @@ fn writeSafetensors(
     };
     std.log.info("Converted to {s}", .{out_filename});
 
-
     _ = arch;
+}
+
+/// Filter and name-strip a tensor list using architecture rules.
+/// Works on any already-loaded tensor slice — no SafeTensors object required.
+fn filterTensorsForExport(
+    tensors: []const types.Tensor,
+    arch_opt: ?*const imagearch.Arch,
+    arena_alloc: std.mem.Allocator,
+) !std.ArrayList(types.Tensor) {
+    var result = try std.ArrayList(types.Tensor).initCapacity(arena_alloc, tensors.len);
+
+    var has_model_prefix = false;
+    for (tensors) |t| {
+        if (std.mem.startsWith(u8, t.name, "model.")) {
+            has_model_prefix = true;
+            break;
+        }
+    }
+
+    for (tensors) |t| {
+        if (arch_opt) |a| {
+            if (has_model_prefix and !std.mem.startsWith(u8, t.name, "model.")) continue;
+            if (a.shouldIgnore(t.name)) continue;
+        }
+        var duped = try t.dupe(arena_alloc);
+        duped.name = try arena_alloc.dupe(u8, imagearch.stripPrefix(duped.name));
+        try result.append(arena_alloc, duped);
+    }
+    return result;
+}
+
+/// Write a JSON template from a tensor list.
+/// Pass `reverse_dims = true` for SafeTensors source files so that
+/// applyTemplate (which always un-reverses dimensions) round-trips correctly.
+/// GGUF tensor structs already store dims in GGUF (reversed) order — pass false.
+pub fn writeTemplateFromTensors(
+    tensors: []const types.Tensor,
+    arch_opt: ?*const imagearch.Arch,
+    reverse_dims: bool,
+    writer: *std.io.Writer,
+    arena_alloc: std.mem.Allocator,
+) !void {
+    const filtered = try filterTensorsForExport(tensors, arch_opt, arena_alloc);
+
+    var tensors_obj = std.json.ObjectMap.init(arena_alloc);
+    defer tensors_obj.deinit();
+
+    for (filtered.items) |t| {
+        var t_obj = std.json.ObjectMap.init(arena_alloc);
+        errdefer t_obj.deinit();
+
+        var shape_arr = std.json.Array.init(arena_alloc);
+        errdefer shape_arr.deinit();
+        if (reverse_dims) {
+            var i: usize = t.dims.len;
+            while (i > 0) {
+                i -= 1;
+                try shape_arr.append(.{ .integer = @intCast(t.dims[i]) });
+            }
+        } else {
+            for (t.dims) |d| try shape_arr.append(.{ .integer = @intCast(d) });
+        }
+        try t_obj.put("shape", .{ .array = shape_arr });
+        try t_obj.put("type", .{ .string = t.type });
+        try tensors_obj.put(try arena_alloc.dupe(u8, t.name), .{ .object = t_obj });
+    }
+
+    var root_obj = std.json.ObjectMap.init(arena_alloc);
+    defer root_obj.deinit();
+    try root_obj.put("tensors", .{ .object = tensors_obj });
+
+    var stringifier = std.json.Stringify{ .writer = writer, .options = .{ .whitespace = .indent_2 } };
+    try stringifier.write(std.json.Value{ .object = root_obj });
+    _ = root_obj.swapRemove("tensors");
+}
+
+fn safetensorTypePrecision(type_str: []const u8) u8 {
+    var buf: [12]u8 = [_]u8{0} ** 12;
+    const l = std.ascii.lowerString(&buf, type_str[0..@min(type_str.len, buf.len)]);
+    if (std.mem.eql(u8, l, "f8_e4m3") or std.mem.eql(u8, l, "f8_e5m2")) return 0;
+    if (std.mem.eql(u8, l, "f16") or std.mem.eql(u8, l, "fp16")) return 1;
+    if (std.mem.eql(u8, l, "bf16")) return 2;
+    if (std.mem.eql(u8, l, "f32") or std.mem.eql(u8, l, "fp32")) return 3;
+    if (std.mem.eql(u8, l, "f64") or std.mem.eql(u8, l, "fp64")) return 4;
+    return 1;
+}
+
+fn safetensorDisplayType(type_str: []const u8) []const u8 {
+    var buf: [12]u8 = [_]u8{0} ** 12;
+    const l = std.ascii.lowerString(&buf, type_str[0..@min(type_str.len, buf.len)]);
+    if (std.mem.eql(u8, l, "f8_e4m3") or std.mem.eql(u8, l, "f8_e5m2")) return "FP8";
+    return type_str;
+}
+
+/// Derive the filename type-suffix for a template-based conversion.
+/// For GGUF: the lowest (most quantized) QuantizationLevel present.
+/// For SafeTensors: the lowest-precision type; appends "-MIXED" when multiple
+/// distinct types are present. Both FP8 variants display as "FP8".
+pub fn templateTypeSuffix(
+    template_path: []const u8,
+    filetype: types.FileType,
+    arena_alloc: std.mem.Allocator,
+) ![]const u8 {
+    const t_file = try std.fs.cwd().openFile(template_path, .{});
+    defer t_file.close();
+    const content = try t_file.readToEndAlloc(arena_alloc, 10 * 1024 * 1024);
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena_alloc, content, .{});
+
+    const tensors_val = parsed.value.object.get("tensors") orelse return error.InvalidTemplate;
+    var it = tensors_val.object.iterator();
+
+    switch (filetype) {
+        .gguf => {
+            var min_level: ?u8 = null;
+            var min_str: []const u8 = "f16";
+            while (it.next()) |entry| {
+                const type_val = entry.value_ptr.object.get("type") orelse continue;
+                const level = QuantizationLevel.fromString(type_val.string) catch continue;
+                const lv: u8 = @intFromEnum(level);
+                if (min_level == null or lv < min_level.?) {
+                    min_level = lv;
+                    min_str = type_val.string;
+                }
+            }
+            return min_str;
+        },
+        .safetensors => {
+            var min_precision: ?u8 = null;
+            var min_display: []const u8 = "F16";
+            var seen: [16][]const u8 = undefined;
+            var seen_count: usize = 0;
+            while (it.next()) |entry| {
+                const type_val = entry.value_ptr.object.get("type") orelse continue;
+                const display = safetensorDisplayType(type_val.string);
+                var already = false;
+                for (seen[0..seen_count]) |s| {
+                    if (std.mem.eql(u8, s, display)) { already = true; break; }
+                }
+                if (!already and seen_count < seen.len) {
+                    seen[seen_count] = display;
+                    seen_count += 1;
+                }
+                const prec = safetensorTypePrecision(type_val.string);
+                if (min_precision == null or prec < min_precision.?) {
+                    min_precision = prec;
+                    min_display = display;
+                }
+            }
+            if (seen_count > 1) return try std.fmt.allocPrint(arena_alloc, "{s}-MIXED", .{min_display});
+            return min_display;
+        },
+    }
+}
+
+/// Generate a sensitivities JSON file from a tensor list.
+/// Only includes tensors that would actually be quantized:
+/// not architecture-ignored, not too small, not high-precision, not upcast-forced.
+/// All values are initialised to 50.0 (neutral sensitivity).
+pub fn generateSensitivitiesFromTensors(
+    tensors: []const types.Tensor,
+    arch_opt: ?*const imagearch.Arch,
+    threshold: u64,
+    writer: *std.io.Writer,
+    arena_alloc: std.mem.Allocator,
+) !void {
+    const filtered = try filterTensorsForExport(tensors, arch_opt, arena_alloc);
+
+    var sens_obj = std.json.ObjectMap.init(arena_alloc);
+    defer sens_obj.deinit();
+
+    for (filtered.items) |t| {
+        var n_elements: u64 = 1;
+        for (t.dims) |d| n_elements *= d;
+        if (n_elements < threshold) continue;
+        if (arch_opt) |a| {
+            if (a.isHighPrecision(t.name)) continue;
+            if (a.shouldUpcast(t.name)) continue;
+        }
+        try sens_obj.put(try arena_alloc.dupe(u8, t.name), .{ .float = 50.0 });
+    }
+
+    var stringifier = std.json.Stringify{ .writer = writer, .options = .{ .whitespace = .indent_2 } };
+    try stringifier.write(std.json.Value{ .object = sens_obj });
 }
