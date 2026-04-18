@@ -55,15 +55,14 @@ pub const Quantizer = struct {
                 try dequantizeSimple(input_bytes, output_f32, pool, .F8_E5M2);
             },
             .BF16, .bf16 => {
-                const count = input_bytes.len / 2;
-                if (count != output_f32.len)
-                    return error.InputSizeMismatch;
-                try dequantizeSimple(input_bytes, output_f32, pool, .BF16);
+                if (input_bytes.len / 2 != output_f32.len) return error.InputSizeMismatch;
+                const in_ptr: [*]const ggml.ggml_bf16_t = @ptrCast(@alignCast(input_bytes.ptr));
+                ggml.ggml_bf16_to_fp32_row(in_ptr, output_f32.ptr, @intCast(output_f32.len));
             },
             .F16, .f16 => {
-                const f16_count = input_bytes.len / 2;
-                if (f16_count != output_f32.len) return error.InputSizeMismatch;
-                try dequantizeSimple(input_bytes, output_f32, pool, .F16);
+                if (input_bytes.len / 2 != output_f32.len) return error.InputSizeMismatch;
+                const in_ptr: [*]const ggml.ggml_fp16_t = @ptrCast(@alignCast(input_bytes.ptr));
+                ggml.ggml_fp16_to_fp32_row(in_ptr, output_f32.ptr, @intCast(output_f32.len));
             },
             .F32, .f32 => {
                 const input_vals = std.mem.bytesAsSlice(f32, input_bytes);
@@ -90,10 +89,12 @@ pub const Quantizer = struct {
                 @memcpy(out_slice, input_f32);
             },
             .BF16, .bf16 => {
-                try convertTypeSimple(input_f32, output_bytes, pool, .BF16);
+                const out_ptr: [*]ggml.ggml_bf16_t = @ptrCast(@alignCast(output_bytes.ptr));
+                ggml.ggml_fp32_to_bf16_row(input_f32.ptr, out_ptr, @intCast(input_f32.len));
             },
             .f16, .F16 => {
-                try convertTypeSimple(input_f32, output_bytes, pool, dst_type);
+                const out_ptr: [*]ggml.ggml_fp16_t = @ptrCast(@alignCast(output_bytes.ptr));
+                ggml.ggml_fp32_to_fp16_row(input_f32.ptr, out_ptr, @intCast(input_f32.len));
             },
             .F8_E4M3, .F8_E5M2 => {
                 if (output_bytes.len != input_f32.len)
