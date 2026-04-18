@@ -251,12 +251,12 @@ pub const Quantizer = struct {
         switch (src_type) {
             .F8_E4M3 => {
                 for (input_bytes[start..end], start..) |b, i| {
-                    output_f32[i] = fp8_e4m3_to_f32(b);
+                    output_f32[i] = lut_e4m3[b];
                 }
             },
             .F8_E5M2 => {
                 for (input_bytes[start..end], start..) |b, i| {
-                    output_f32[i] = fp8_e5m2_to_f32(b);
+                    output_f32[i] = lut_e5m2[b];
                 }
             },
             .BF16, .bf16 => {
@@ -288,17 +288,15 @@ pub const Quantizer = struct {
         const mant = x & 0x7;
 
         if (exp == 0) {
-            // subnormal
             const m = @as(f32, @floatFromInt(mant)) / 8.0;
-            return (1.0 - 2.0 * sign) * m * std.math.pow(f32, 2.0, -6.0);
+            return (1.0 - 2.0 * sign) * m * @exp2(@as(f32, -6.0));
         } else if (exp == 0xF) {
-            // inf or nan
             if (mant == 0) return std.math.inf(f32) * (1.0 - 2.0 * sign);
             return std.math.nan(f32);
         } else {
             const e = @as(f32, @floatFromInt(exp)) - 7.0;
             const m = 1.0 + @as(f32, @floatFromInt(mant)) / 8.0;
-            return (1.0 - 2.0 * sign) * m * std.math.pow(f32, 2.0, e);
+            return (1.0 - 2.0 * sign) * m * @exp2(e);
         }
     }
 
@@ -308,19 +306,34 @@ pub const Quantizer = struct {
         const mant = x & 0x3;
 
         if (exp == 0) {
-            // subnormal
             const m = @as(f32, @floatFromInt(mant)) / 4.0;
-            return (1.0 - 2.0 * sign) * m * std.math.pow(f32, 2.0, -14.0);
+            return (1.0 - 2.0 * sign) * m * @exp2(@as(f32, -14.0));
         } else if (exp == 0x1F) {
-            // inf or nan
             if (mant == 0) return std.math.inf(f32) * (1.0 - 2.0 * sign);
             return std.math.nan(f32);
         } else {
             const e = @as(f32, @floatFromInt(exp)) - 15.0;
             const m = 1.0 + @as(f32, @floatFromInt(mant)) / 4.0;
-            return (1.0 - 2.0 * sign) * m * std.math.pow(f32, 2.0, e);
+            return (1.0 - 2.0 * sign) * m * @exp2(e);
         }
     }
+
+    // Comptime lookup tables: all 256 F8 values pre-decoded to F32.
+    // Turns dequantization into a single array index — no branches, no float math.
+    const lut_e4m3: [256]f32 = blk: {
+        @setEvalBranchQuota(10000);
+        var t: [256]f32 = undefined;
+        var i: u32 = 0;
+        while (i < 256) : (i += 1) t[i] = fp8_e4m3_to_f32(@intCast(i));
+        break :blk t;
+    };
+    const lut_e5m2: [256]f32 = blk: {
+        @setEvalBranchQuota(10000);
+        var t: [256]f32 = undefined;
+        var i: u32 = 0;
+        while (i < 256) : (i += 1) t[i] = fp8_e5m2_to_f32(@intCast(i));
+        break :blk t;
+    };
 
     fn f32_to_fp8_e4m3(x: f32) u8 {
         if (std.math.isNan(x)) return 0x7F;
