@@ -130,7 +130,7 @@ pub fn convert(
     // --- Assign quantization types (template or auto) -------------------------
     var template_metadata: ?std.json.ObjectMap = null;
     if (opts.template_path) |tp| {
-        template_metadata = try applyTemplate(tp, &model_tensors, arena_alloc);
+        template_metadata = try applyTemplate(tp, &model_tensors, opts.filetype, arena_alloc);
     } else {
         try assignQuantTypes(&model_tensors, arch, threshold, opts, arena_alloc);
     }
@@ -324,6 +324,7 @@ fn filterAndStripTensors(
 fn applyTemplate(
     template_path: []const u8,
     model_tensors: *std.ArrayList(types.Tensor),
+    output_filetype: types.FileType,
     arena_alloc: std.mem.Allocator,
 ) !?std.json.ObjectMap {
     std.log.info("Using template {s}", .{template_path});
@@ -349,7 +350,7 @@ fn applyTemplate(
         const source_tensor = findSourceTensor(model_tensors.items, target_name);
 
         if (source_tensor) |src| {
-            const new_t = try applyTemplateEntry(src, target_name, target_info, arena_alloc);
+            const new_t = try applyTemplateEntry(src, target_name, target_info, output_filetype, arena_alloc);
             try filtered.append(arena_alloc, new_t);
             std.log.info("Matched target tensor {s} to source tensor {s}, setting to type {s}", .{ target_name, src.name, new_t.type });
         } else {
@@ -378,6 +379,7 @@ fn applyTemplateEntry(
     src: types.Tensor,
     target_name: []const u8,
     target_info: std.json.ObjectMap,
+    output_filetype: types.FileType,
     arena_alloc: std.mem.Allocator,
 ) !types.Tensor {
     const target_shape_arr = target_info.get("shape").?.array;
@@ -399,18 +401,25 @@ fn applyTemplateEntry(
         return error.ShapeMismatch;
     }
 
-    const ggml_type = try gguf.GgmlType.fromString(target_type);
-    const bs = ggml_type.getBlockSize();
-    if (bs > 1 and source_elements % bs != 0) {
-        std.log.err("Tensor {s} cannot be quantized to type {s}. Element count {} is not a multiple of block size {}", .{ target_name, target_type, source_elements, bs });
-        return error.InvalidSizeForQuantization;
+    const raw_type = try types.DataType.fromString(target_type);
+    // Normalize to the canonical type for the output format (e.g. bf16 → BF16 for safetensors).
+    const data_type = try raw_type.forFormat(output_filetype);
+
+    // Block-size validation only applies to quantized GGUF types.
+    if (data_type.formatType() == .gguf) {
+        const ggml_type = try gguf.GgmlType.fromString(@tagName(data_type));
+        const bs = ggml_type.getBlockSize();
+        if (bs > 1 and source_elements % bs != 0) {
+            std.log.err("Tensor {s} cannot be quantized to type {s}. Element count {} is not a multiple of block size {}", .{ target_name, @tagName(data_type), source_elements, bs });
+            return error.InvalidSizeForQuantization;
+        }
     }
 
     var new_t = src;
     new_t.name = target_name;
     new_t.dims = target_dims;
-    new_t.type = @tagName(ggml_type);
-    new_t.size = ggml_type.calcSizeInBytes(target_elements);
+    new_t.type = @tagName(data_type);
+    new_t.size = data_type.calcSizeInBytes(target_elements);
     return new_t;
 }
 

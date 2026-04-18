@@ -132,6 +132,18 @@ pub const DataType = enum {
         .{ .I64,  .i64  },
     };
 
+    /// Convert this DataType to the equivalent type for the given file format.
+    /// Returns error.NoEquivalentType if no cross-format equivalent exists
+    /// (e.g. quantized gguf types have no safetensors counterpart).
+    pub fn forFormat(self: DataType, filetype: FileType) !DataType {
+        if (self.formatType() == filetype) return self;
+        for (equivalence_table) |pair| {
+            if (self == pair[0]) return pair[1];
+            if (self == pair[1]) return pair[0];
+        }
+        return error.NoEquivalentType;
+    }
+
     /// Returns true if `self` and `target` (parsed from string) represent the same
     /// underlying data type across formats. Same-format types must be identical.
     /// Types with no cross-format equivalent (FP8, unsigned ints, quantized gguf types)
