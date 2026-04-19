@@ -211,18 +211,116 @@ pub const Quantizer = struct {
                     out_slice[i] = @floatCast(val);
                 }
             },
-            .F8_E4M3 => {
-                for (input_f32[start..end], start..) |val, i| {
-                    output_bytes[i] = f32_to_fp8_e4m3(val);
-                }
-            },
-            .F8_E5M2 => {
-                for (input_f32[start..end], start..) |val, i| {
-                    output_bytes[i] = f32_to_fp8_e5m2(val);
-                }
-            },
+            .F8_E4M3 => quantizeF8Row(.F8_E4M3, input_f32[start..end], output_bytes[start..end]),
+            .F8_E5M2 => quantizeF8Row(.F8_E5M2, input_f32[start..end], output_bytes[start..end]),
             else => unreachable,
         }
+    }
+
+    const fp8_vec_width = 8;
+
+    fn quantizeF8Row(comptime fp8_type: types.DataType, input: []const f32, output: []u8) void {
+        const W = fp8_vec_width;
+        var i: usize = 0;
+        while (i + W <= input.len) : (i += W) {
+            const chunk: @Vector(W, f32) = input[i..][0..W].*;
+            const vec_result: @Vector(W, u8) = switch (fp8_type) {
+                .F8_E4M3 => f32_to_fp8_e4m3_chunk(chunk),
+                .F8_E5M2 => f32_to_fp8_e5m2_chunk(chunk),
+                else => unreachable,
+            };
+            output[i..][0..W].* = vec_result;
+        }
+        while (i < input.len) : (i += 1) {
+            output[i] = switch (fp8_type) {
+                .F8_E4M3 => f32_to_fp8_e4m3(input[i]),
+                .F8_E5M2 => f32_to_fp8_e5m2(input[i]),
+                else => unreachable,
+            };
+        }
+    }
+
+    pub fn f32_to_fp8_e4m3_chunk(chunk: @Vector(fp8_vec_width, f32)) @Vector(fp8_vec_width, u8) {
+        const W = fp8_vec_width;
+        const U32V = @Vector(W, u32);
+        const I32V = @Vector(W, i32);
+        const F32V = @Vector(W, f32);
+
+        const bits: U32V = @bitCast(chunk);
+        const sign: U32V = bits >> @as(U32V, @splat(31));
+        const f32_exp: U32V = (bits >> @as(U32V, @splat(23))) & @as(U32V, @splat(0xFF));
+        const f32_mant: U32V = bits & @as(U32V, @splat(0x7FFFFF));
+
+        // f8_exp_biased = f32_exp_biased - 127 + 7 = f32_exp_biased - 120
+        const f8_exp_i: I32V = @as(I32V, @intCast(f32_exp)) - @as(I32V, @splat(120));
+        // Round-to-nearest: add round bit (f32 mantissa bit 19) before extracting top 3 bits
+        const f8_mant_r: U32V = ((f32_mant >> @as(U32V, @splat(20))) & @as(U32V, @splat(7))) + ((f32_mant >> @as(U32V, @splat(19))) & @as(U32V, @splat(1)));
+        const f8_mant_carry: U32V = f8_mant_r >> @as(U32V, @splat(3)); // 1 if rounded up to 8
+        const f8_mant: U32V = f8_mant_r & @as(U32V, @splat(7));
+        const f8_exp_adj: I32V = f8_exp_i + @as(I32V, @intCast(f8_mant_carry));
+
+        const is_f32_special: @Vector(W, bool) = f32_exp == @as(U32V, @splat(255));
+        // Clamp if exp >= 16, or exp == 15 with mant == 7 (which would encode as NaN 0x7F)
+        const would_encode_nan: @Vector(W, bool) = (f8_exp_adj == @as(I32V, @splat(15))) & (f8_mant == @as(U32V, @splat(7)));
+        const is_overflow: @Vector(W, bool) = ((f8_exp_adj >= @as(I32V, @splat(16))) | would_encode_nan) & !is_f32_special;
+        const is_small: @Vector(W, bool) = (f8_exp_adj <= @as(I32V, @splat(0))) & !is_f32_special;
+
+        // Subnormal F8 E4M3: mant = round(|x| * 2^9), clamped to [0, 7]
+        const abs_v: F32V = @abs(chunk);
+        const subnorm_mant: U32V = @intFromFloat(@min(abs_v * @as(F32V, @splat(512.0)) + @as(F32V, @splat(0.5)), @as(F32V, @splat(7.0))));
+
+        // Clamp exponent for normal path [1..15]
+        const f8_exp_u: U32V = @intCast(@min(@max(f8_exp_adj, @as(I32V, @splat(1))), @as(I32V, @splat(15))));
+        const normal: U32V = (sign << @as(U32V, @splat(7))) | (f8_exp_u << @as(U32V, @splat(3))) | f8_mant;
+
+        var result: U32V = normal;
+        result = @select(u32, is_small,    (sign << @as(U32V, @splat(7))) | subnorm_mant,       result);
+        result = @select(u32, is_overflow, (sign << @as(U32V, @splat(7))) | @as(U32V, @splat(0x7E)), result);
+        result = @select(u32, is_f32_special, @as(U32V, @splat(0x7F)), result);
+
+        return @truncate(result);
+    }
+
+    pub fn f32_to_fp8_e5m2_chunk(chunk: @Vector(fp8_vec_width, f32)) @Vector(fp8_vec_width, u8) {
+        const W = fp8_vec_width;
+        const U32V = @Vector(W, u32);
+        const I32V = @Vector(W, i32);
+        const F32V = @Vector(W, f32);
+
+        const bits: U32V = @bitCast(chunk);
+        const sign: U32V = bits >> @as(U32V, @splat(31));
+        const f32_exp: U32V = (bits >> @as(U32V, @splat(23))) & @as(U32V, @splat(0xFF));
+        const f32_mant: U32V = bits & @as(U32V, @splat(0x7FFFFF));
+
+        // f8_exp_biased = f32_exp_biased - 127 + 15 = f32_exp_biased - 112
+        const f8_exp_i: I32V = @as(I32V, @intCast(f32_exp)) - @as(I32V, @splat(112));
+        // Round-to-nearest: add round bit (f32 mantissa bit 20) before extracting top 2 bits
+        const f8_mant_r: U32V = ((f32_mant >> @as(U32V, @splat(21))) & @as(U32V, @splat(3))) + ((f32_mant >> @as(U32V, @splat(20))) & @as(U32V, @splat(1)));
+        const f8_mant_carry: U32V = f8_mant_r >> @as(U32V, @splat(2)); // 1 if rounded up to 4
+        const f8_mant: U32V = f8_mant_r & @as(U32V, @splat(3));
+        const f8_exp_adj: I32V = f8_exp_i + @as(I32V, @intCast(f8_mant_carry));
+
+        const is_f32_special: @Vector(W, bool) = f32_exp == @as(U32V, @splat(255));
+        const is_nan: @Vector(W, bool) = is_f32_special & (f32_mant != @as(U32V, @splat(0)));
+        const is_inf: @Vector(W, bool) = is_f32_special & (f32_mant == @as(U32V, @splat(0)));
+        const is_overflow: @Vector(W, bool) = (f8_exp_adj >= @as(I32V, @splat(31))) & !is_f32_special;
+        const is_small: @Vector(W, bool) = (f8_exp_adj <= @as(I32V, @splat(0))) & !is_f32_special;
+
+        // Subnormal F8 E5M2: mant = round(|x| * 2^16), clamped to [0, 3]
+        const abs_v: F32V = @abs(chunk);
+        const subnorm_mant: U32V = @intFromFloat(@min(abs_v * @as(F32V, @splat(65536.0)) + @as(F32V, @splat(0.5)), @as(F32V, @splat(3.0))));
+
+        // Clamp exponent for normal path [1..30]
+        const f8_exp_u: U32V = @intCast(@min(@max(f8_exp_adj, @as(I32V, @splat(1))), @as(I32V, @splat(30))));
+        const normal: U32V = (sign << @as(U32V, @splat(7))) | (f8_exp_u << @as(U32V, @splat(2))) | f8_mant;
+
+        var result: U32V = normal;
+        result = @select(u32, is_small,    (sign << @as(U32V, @splat(7))) | subnorm_mant,        result);
+        result = @select(u32, is_overflow, (sign << @as(U32V, @splat(7))) | @as(U32V, @splat(0x7B)), result);
+        result = @select(u32, is_inf,      (sign << @as(U32V, @splat(7))) | @as(U32V, @splat(0x7C)), result);
+        result = @select(u32, is_nan,      @as(U32V, @splat(0x7F)), result);
+
+        return @truncate(result);
     }
 
     fn dequantizeSimple(
@@ -282,25 +380,27 @@ pub const Quantizer = struct {
         }
     }
 
-    fn fp8_e4m3_to_f32(x: u8) f32 {
-        const sign = @as(f32, @floatFromInt((x >> 7) & 0x1));
+    pub fn fp8_e4m3_to_f32(x: u8) f32 {
+        const sign: f32 = @floatFromInt((x >> 7) & 0x1);
         const exp = (x >> 3) & 0xF;
         const mant = x & 0x7;
+        const sign_mult = 1.0 - 2.0 * sign;
 
         if (exp == 0) {
-            const m = @as(f32, @floatFromInt(mant)) / 8.0;
-            return (1.0 - 2.0 * sign) * m * @exp2(@as(f32, -6.0));
-        } else if (exp == 0xF) {
-            if (mant == 0) return std.math.inf(f32) * (1.0 - 2.0 * sign);
-            return std.math.nan(f32);
-        } else {
-            const e = @as(f32, @floatFromInt(exp)) - 7.0;
-            const m = 1.0 + @as(f32, @floatFromInt(mant)) / 8.0;
-            return (1.0 - 2.0 * sign) * m * @exp2(e);
+            // Subnormal: ±mant * 2^(-9)
+            return sign_mult * @as(f32, @floatFromInt(mant)) / 8.0 * @exp2(@as(f32, -6.0));
         }
+        if (exp == 0xF and mant == 0x7) {
+            // E4M3FN: only 0x7F/0xFF are NaN; no Inf representation
+            return std.math.nan(f32);
+        }
+        // Normal (includes exp=0xF with mant 0–6, which encode values up to 448)
+        const e = @as(f32, @floatFromInt(exp)) - 7.0;
+        const m = 1.0 + @as(f32, @floatFromInt(mant)) / 8.0;
+        return sign_mult * m * @exp2(e);
     }
 
-    fn fp8_e5m2_to_f32(x: u8) f32 {
+    pub fn fp8_e5m2_to_f32(x: u8) f32 {
         const sign = @as(f32, @floatFromInt((x >> 7) & 0x1));
         const exp = (x >> 2) & 0x1F;
         const mant = x & 0x3;
@@ -318,16 +418,14 @@ pub const Quantizer = struct {
         }
     }
 
-    // Comptime lookup tables: all 256 F8 values pre-decoded to F32.
-    // Turns dequantization into a single array index — no branches, no float math.
-    const lut_e4m3: [256]f32 = blk: {
+    pub const lut_e4m3: [256]f32 = blk: {
         @setEvalBranchQuota(10000);
         var t: [256]f32 = undefined;
         var i: u32 = 0;
         while (i < 256) : (i += 1) t[i] = fp8_e4m3_to_f32(@intCast(i));
         break :blk t;
     };
-    const lut_e5m2: [256]f32 = blk: {
+    pub const lut_e5m2: [256]f32 = blk: {
         @setEvalBranchQuota(10000);
         var t: [256]f32 = undefined;
         var i: u32 = 0;
@@ -335,7 +433,7 @@ pub const Quantizer = struct {
         break :blk t;
     };
 
-    fn f32_to_fp8_e4m3(x: f32) u8 {
+    pub fn f32_to_fp8_e4m3(x: f32) u8 {
         if (std.math.isNan(x)) return 0x7F;
 
         const sign_bit: u8 = if (x < 0.0 or (x == 0.0 and std.math.signbit(x))) 0x80 else 0x00;
@@ -347,49 +445,50 @@ pub const Quantizer = struct {
 
         if (abs_x == 0.0) return sign_bit;
 
-        const bias: f32 = 7.0;
         const log2_val = std.math.log2(abs_x);
-        var e: i32 = @intFromFloat(@floor(log2_val));
-        e = @max(-6, @min(7, e));
+        const e: i32 = @intFromFloat(@floor(log2_val));
 
         if (e < -6) {
-            const mant_f = abs_x / std.math.pow(f32, 2.0, -6.0) * 8.0;
+            // Subnormal: encoded value = mant * 2^(-9)
+            const mant_f = abs_x * 512.0;
             const mant: u8 = @intFromFloat(@min(7.0, @max(0.0, @round(mant_f))));
             return sign_bit | mant;
         }
 
-        const biased_exp: u8 = @intCast(e + @as(i32, @intFromFloat(bias)));
-        const scale = std.math.pow(f32, 2.0, @floatFromInt(e));
+        // Normal: biased_exp in [1..15]; max representable e=8 (biased 15, mant≤6 = 448)
+        const e_clamped: i32 = @min(8, e);
+        const biased_exp: u8 = @intCast(e_clamped + 7);
+        const scale = std.math.pow(f32, 2.0, @as(f32, @floatFromInt(e_clamped)));
         const mant_f = (abs_x / scale - 1.0) * 8.0;
         const mant: u8 = @intFromFloat(@min(7.0, @max(0.0, @round(mant_f))));
         return sign_bit | (biased_exp << 3) | mant;
     }
 
-    fn f32_to_fp8_e5m2(x: f32) u8 {
+    pub fn f32_to_fp8_e5m2(x: f32) u8 {
         if (std.math.isNan(x)) return 0x7F;
 
         const sign_bit: u8 = if (x < 0.0 or (x == 0.0 and std.math.signbit(x))) 0x80 else 0x00;
         const abs_x = @abs(x);
 
-        if (std.math.isInf(abs_x) or abs_x > 57344.0) {
-            return sign_bit | 0x7B;
-        }
+        if (std.math.isInf(abs_x)) return sign_bit | 0x7C;
+        if (abs_x > 57344.0) return sign_bit | 0x7B;
 
         if (abs_x == 0.0) return sign_bit;
 
-        const bias: f32 = 15.0;
         const log2_val = std.math.log2(abs_x);
-        var e: i32 = @intFromFloat(@floor(log2_val));
-        e = @max(-14, @min(15, e));
+        const e: i32 = @intFromFloat(@floor(log2_val));
 
         if (e < -14) {
-            const mant_f = abs_x / std.math.pow(f32, 2.0, -14.0) * 4.0;
+            // Subnormal: encoded value = mant * 2^(-16)
+            const mant_f = abs_x * 65536.0;
             const mant: u8 = @intFromFloat(@min(3.0, @max(0.0, @round(mant_f))));
             return sign_bit | mant;
         }
 
-        const biased_exp: u8 = @intCast(e + @as(i32, @intFromFloat(bias)));
-        const scale = std.math.pow(f32, 2.0, @floatFromInt(e));
+        // Normal: biased_exp in [1..30]; max e=15 (biased 30, max normal = 57344)
+        const e_clamped: i32 = @min(15, e);
+        const biased_exp: u8 = @intCast(e_clamped + 15);
+        const scale = std.math.pow(f32, 2.0, @as(f32, @floatFromInt(e_clamped)));
         const mant_f = (abs_x / scale - 1.0) * 4.0;
         const mant: u8 = @intFromFloat(@min(3.0, @max(0.0, @round(mant_f))));
         return sign_bit | (biased_exp << 2) | mant;
@@ -409,8 +508,11 @@ pub const Quantizer = struct {
 test "transform f16 to q8_0" {
     const allocator = std.testing.allocator;
 
-    // Load the f16 source file
-    const f16_file = try std.fs.cwd().openFile("test-artifact/output_blocks.1.1.transformer_blocks.1.attn1.to_q.weight.f16", .{});
+    // Load the f16 source file (skip test if artifacts not present)
+    const f16_file = std.fs.cwd().openFile("test-artifact/output_blocks.1.1.transformer_blocks.1.attn1.to_q.weight.f16", .{}) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
     defer f16_file.close();
 
     const f16_data = try f16_file.readToEndAlloc(allocator, 10 * 1024 * 1024);
@@ -419,14 +521,18 @@ test "transform f16 to q8_0" {
     // Calculate element count (f16 is 2 bytes per element)
     const element_count: u64 = @intCast(f16_data.len / 2);
 
+    var pool: std.Thread.Pool = undefined;
+    try pool.init(.{ .allocator = allocator, .n_jobs = 1 });
+    defer pool.deinit();
+
     // Convert f16 to q8_0
     const q8_0_data = try Quantizer.convertTensorData(
         allocator,
         f16_data,
         types.DataType.f16,
-        gguf.GgmlType.q8_0,
+        types.DataType.q8_0,
         element_count,
-        1,
+        &pool,
     );
     defer allocator.free(q8_0_data);
 
@@ -444,186 +550,127 @@ test "transform f16 to q8_0" {
     try std.testing.expectEqualSlices(u8, expected_data, q8_0_data);
 }
 
-test "q5_0 quantization debug" {
-    // Create a simple test block of 32 values
-    var test_input: [32]f32 = undefined;
-    // Fill with a simple pattern: values from -16 to +15
-    for (0..32) |i| {
-        test_input[i] = @as(f32, @floatFromInt(@as(i32, @intCast(i)) - 16));
-    }
+// ============================================================================
+// F8 conversion tests
+// ============================================================================
 
-    var output: [22]u8 = undefined;
-
-    std.debug.print("\n=== Q5_0 Quantization Test ===\n", .{});
-    std.debug.print("Input values:\n", .{});
-    for (test_input, 0..) |val, i| {
-        if (i % 8 == 0) std.debug.print("\n[{:2}]: ", .{i});
-        std.debug.print("{d:6.2} ", .{val});
-    }
-    std.debug.print("\n\n", .{});
-
-    // Find max like the function does
-    var amax: f32 = 0.0;
-    var max: f32 = 0.0;
-    for (test_input) |value| {
-        const abs_val = @abs(value);
-        if (abs_val > amax) {
-            amax = abs_val;
-            max = value;
-        }
-    }
-
-    const d = max / -16.0;
-    const id: f32 = if (d != 0.0) 1.0 / d else 0.0;
-
-    std.debug.print("amax = {d}, max = {d}\n", .{amax, max});
-    std.debug.print("d = {d}, id = {d}\n", .{d, id});
-
-    // Call the function
-    Quantizer.quantizeBlockQ5_0(&test_input, &output);
-
-    // Print the output
-    std.debug.print("\nOutput bytes:\n", .{});
-    std.debug.print("Scale (f16): 0x{X:0>2}{X:0>2}\n", .{output[0], output[1]});
-
-    std.debug.print("\nqs (packed 4-bit, 16 bytes):\n", .{});
-    for (output[2..18], 0..) |byte, i| {
-        if (i % 8 == 0) std.debug.print("\n", .{});
-        const lo = byte & 0x0F;
-        const hi = (byte >> 4) & 0x0F;
-        std.debug.print("{X:1}{X:1} ", .{lo, hi});
-    }
-
-    std.debug.print("\n\nqh (high bits, 4 bytes): ", .{});
-    const qh = std.mem.readInt(u32, output[18..22], .little);
-    std.debug.print("0x{X:0>8}\n", .{qh});
-    std.debug.print("Binary: {b:0>32}\n", .{qh});
-
-    // Decode and verify
-    std.debug.print("\nDecoded values:\n", .{});
-    const d_f16 = std.mem.bytesAsValue(f16, output[0..2]).*;
-    const d_decoded: f32 = @floatCast(d_f16);
-
-    for (0..16) |j| {
-        const byte = output[2 + j];
-        const q0_low = byte & 0x0F;
-        const q1_low = (byte >> 4) & 0x0F;
-
-        const q0_high = (qh >> @intCast(j)) & 1;
-        const q1_high = (qh >> @intCast(j + 16)) & 1;
-
-        const q0_full = q0_low | (@as(u8, @intCast(q0_high)) << 4);
-        const q1_full = q1_low | (@as(u8, @intCast(q1_high)) << 4);
-
-        const v0 = (@as(f32, @floatFromInt(q0_full)) - 16.0) * d_decoded;
-        const v1 = (@as(f32, @floatFromInt(q1_full)) - 16.0) * d_decoded;
-
-        std.debug.print("[{:2}]: {d:6.2} (q={:2}) -> {d:6.2}  |  ", .{j, test_input[j], q0_full, v0});
-        std.debug.print("[{:2}]: {d:6.2} (q={:2}) -> {d:6.2}\n", .{j+16, test_input[j+16], q1_full, v1});
-    }
-    std.debug.print("\n\n\n", .{});
+test "F8_E4M3 scalar encode: exact values" {
+    // 1.0 → 0_0111_000 = 0x38
+    try std.testing.expectEqual(@as(u8, 0x38), Quantizer.f32_to_fp8_e4m3(1.0));
+    // -1.0 → 0xB8
+    try std.testing.expectEqual(@as(u8, 0xB8), Quantizer.f32_to_fp8_e4m3(-1.0));
+    // 2.0 → 0_1000_000 = 0x40
+    try std.testing.expectEqual(@as(u8, 0x40), Quantizer.f32_to_fp8_e4m3(2.0));
+    // 0.5 → 0_0110_000 = 0x30
+    try std.testing.expectEqual(@as(u8, 0x30), Quantizer.f32_to_fp8_e4m3(0.5));
+    // 0.0 → 0x00
+    try std.testing.expectEqual(@as(u8, 0x00), Quantizer.f32_to_fp8_e4m3(0.0));
+    // -0.0 → 0x80
+    try std.testing.expectEqual(@as(u8, 0x80), Quantizer.f32_to_fp8_e4m3(-0.0));
+    // NaN → 0x7F
+    try std.testing.expectEqual(@as(u8, 0x7F), Quantizer.f32_to_fp8_e4m3(std.math.nan(f32)));
+    // 448.0 (max) → 0x7E
+    try std.testing.expectEqual(@as(u8, 0x7E), Quantizer.f32_to_fp8_e4m3(448.0));
+    // Overflow → clamp to 0x7E
+    try std.testing.expectEqual(@as(u8, 0x7E), Quantizer.f32_to_fp8_e4m3(1e10));
+    // Negative overflow → 0xFE
+    try std.testing.expectEqual(@as(u8, 0xFE), Quantizer.f32_to_fp8_e4m3(-1e10));
 }
 
-test "q5_0 real world data" {
-    const allocator = std.testing.allocator;
-
-    // Load the f16 source file
-    const f16_file = try std.fs.cwd().openFile("test-artifact/output_blocks.1.1.transformer_blocks.1.attn1.to_q.weight.f16", .{});
-    defer f16_file.close();
-
-    const f16_data = try f16_file.readToEndAlloc(allocator, 10 * 1024 * 1024);
-    defer allocator.free(f16_data);
-
-    // Convert just the first block (32 values) to f32
-    const input_f16 = std.mem.bytesAsSlice(f16, f16_data[0..64]); // 32 * 2 bytes
-    var f32_block: [32]f32 = undefined;
-    for (input_f16, 0..) |val, i| {
-        f32_block[i] = @floatCast(val);
-    }
-
-    // Quantize using our function
-    var our_output: [22]u8 = undefined;
-    Quantizer.quantizeBlockQ5_0(&f32_block, &our_output);
-
-    std.debug.print("\n=== First block from real data ===\n", .{});
-    std.debug.print("First 32 f32 values: ", .{});
-    for (f32_block[0..]) |v| {
-        std.debug.print("{d:.6} ", .{v});
-    }
-    std.debug.print("\n", .{});
-
-    // Find max like the function does
-    var amax: f32 = 0.0;
-    var max: f32 = 0.0;
-    for (input_f16) |value| {
-        const abs_val = @abs(value);
-        if (abs_val > amax) {
-            amax = abs_val;
-            max = value;
-        }
-    }
-
-    const d = max / -16.0;
-    const id: f32 = if (d != 0.0) 1.0 / d else 0.0;
-
-    const d16: f16 = @floatCast(d);
-    // Convert f16 to its raw bits (u16)
-    const d16_bits: u16 = @bitCast(d16);
-
-    std.debug.print("amax = {d}, max = {d}\n", .{amax, max});
-    std.debug.print("d = {d}, id = {d}, d16 = {d}\n", .{d, id, d16});
-    std.debug.print("d16 as hex: {X:0>4}\n", .{d16_bits});
-
-    std.debug.print("Our output (first 22 bytes):\n", .{});
-    for (our_output, 0..) |b, i| {
-        std.debug.print("{X:0>2} ", .{b});
-        if ((i + 1) % 16 == 0) std.debug.print("\n", .{});
-    }
-    std.debug.print("\n\n\n", .{});
+test "F8_E5M2 scalar encode: exact values" {
+    // 1.0 → 0_01111_00 = 0x3C
+    try std.testing.expectEqual(@as(u8, 0x3C), Quantizer.f32_to_fp8_e5m2(1.0));
+    // -1.0 → 0xBC
+    try std.testing.expectEqual(@as(u8, 0xBC), Quantizer.f32_to_fp8_e5m2(-1.0));
+    // 2.0 → 0_10000_00 = 0x40
+    try std.testing.expectEqual(@as(u8, 0x40), Quantizer.f32_to_fp8_e5m2(2.0));
+    // 0.5 → 0_01110_00 = 0x38
+    try std.testing.expectEqual(@as(u8, 0x38), Quantizer.f32_to_fp8_e5m2(0.5));
+    // 0.0 → 0x00
+    try std.testing.expectEqual(@as(u8, 0x00), Quantizer.f32_to_fp8_e5m2(0.0));
+    // -0.0 → 0x80
+    try std.testing.expectEqual(@as(u8, 0x80), Quantizer.f32_to_fp8_e5m2(-0.0));
+    // +Inf → 0x7C
+    try std.testing.expectEqual(@as(u8, 0x7C), Quantizer.f32_to_fp8_e5m2(std.math.inf(f32)));
+    // -Inf → 0xFC
+    try std.testing.expectEqual(@as(u8, 0xFC), Quantizer.f32_to_fp8_e5m2(-std.math.inf(f32)));
+    // NaN → 0x7F
+    try std.testing.expectEqual(@as(u8, 0x7F), Quantizer.f32_to_fp8_e5m2(std.math.nan(f32)));
+    // 57344.0 (max normal) → 0x7B
+    try std.testing.expectEqual(@as(u8, 0x7B), Quantizer.f32_to_fp8_e5m2(57344.0));
+    // Overflow → 0x7B (max, not Inf)
+    try std.testing.expectEqual(@as(u8, 0x7B), Quantizer.f32_to_fp8_e5m2(1e10));
 }
 
-test "q5_0 round trip accuracy" {
-    // Create test data
-    var test_input: [32]f32 = undefined;
-    for (0..32) |i| {
-        // Use a mix of values to test the full range
-        test_input[i] = (@as(f32, @floatFromInt(i)) - 16.0) * 0.05;
+test "F8_E4M3 round-trip: exact representable values" {
+    const cases = [_]f32{ 1.0, -1.0, 2.0, 0.5, 0.25, 4.0, 0.125, -2.0, -0.5, 448.0, -448.0 };
+    for (cases) |v| {
+        const encoded = Quantizer.f32_to_fp8_e4m3(v);
+        const decoded = Quantizer.lut_e4m3[encoded];
+        try std.testing.expectApproxEqRel(v, decoded, 0.001);
     }
+}
 
-    // Quantize
-    var quantized: [22]u8 = undefined;
-    Quantizer.quantizeBlockQ5_0(&test_input, &quantized);
-
-    // Dequantize manually
-    const scale = std.mem.bytesAsValue(f16, quantized[0..2]).*;
-    const scale_f32: f32 = @floatCast(scale);
-    const qh = std.mem.readInt(u32, quantized[18..22], .little);
-
-    var reconstructed: [32]f32 = undefined;
-    for (0..16) |j| {
-        const byte = quantized[2 + j];
-        const q0_low = byte & 0x0F;
-        const q1_low = (byte >> 4) & 0x0F;
-
-        const q0_high = (qh >> @intCast(j)) & 1;
-        const q1_high = (qh >> @intCast(j + 16)) & 1;
-
-        const q0_full = q0_low | (@as(u8, @intCast(q0_high)) << 4);
-        const q1_full = q1_low | (@as(u8, @intCast(q1_high)) << 4);
-
-        reconstructed[j] = (@as(f32, @floatFromInt(q0_full)) - 16.0) * scale_f32;
-        reconstructed[j + 16] = (@as(f32, @floatFromInt(q1_full)) - 16.0) * scale_f32;
+test "F8_E5M2 round-trip: exact representable values" {
+    const cases = [_]f32{ 1.0, -1.0, 2.0, 0.5, 0.25, 4.0, 0.125, -2.0, -0.5, 57344.0 };
+    for (cases) |v| {
+        const encoded = Quantizer.f32_to_fp8_e5m2(v);
+        const decoded = Quantizer.lut_e5m2[encoded];
+        try std.testing.expectApproxEqRel(v, decoded, 0.001);
     }
+}
 
-    // Check error
-    var max_error: f32 = 0.0;
-    for (test_input, reconstructed) |orig, recon| {
-        const err = @abs(orig - recon);
-        max_error = @max(max_error, err);
+test "F8_E4M3 decode: LUT matches scalar function" {
+    for (0..256) |i| {
+        const b: u8 = @intCast(i);
+        const from_lut = Quantizer.lut_e4m3[b];
+        const from_fn = Quantizer.fp8_e4m3_to_f32(b);
+        if (std.math.isNan(from_fn)) {
+            try std.testing.expect(std.math.isNan(from_lut));
+        } else {
+            try std.testing.expectEqual(from_fn, from_lut);
+        }
     }
+}
 
-    std.debug.print("Max reconstruction error: {d}\n", .{max_error});
+test "F8_E5M2 decode: LUT matches scalar function" {
+    for (0..256) |i| {
+        const b: u8 = @intCast(i);
+        const from_lut = Quantizer.lut_e5m2[b];
+        const from_fn = Quantizer.fp8_e5m2_to_f32(b);
+        if (std.math.isNan(from_fn)) {
+            try std.testing.expect(std.math.isNan(from_lut));
+        } else {
+            try std.testing.expectEqual(from_fn, from_lut);
+        }
+    }
+}
 
-    // For Q5_0, we expect some quantization error, but it should be reasonable
-    try std.testing.expect(max_error < 0.05); // Adjust threshold as needed
+test "F8_E4M3 SIMD chunk matches scalar" {
+    // Build a varied input covering normals, subnormals, zero, large values
+    var input: [16]f32 = .{ 1.0, -1.0, 0.5, 2.0, 0.0, -0.0, 448.0, -448.0, 1e10, -1e10, 0.001, -0.001, 3.14, -2.71, 100.0, 0.0625 };
+    var scalar_out: [16]u8 = undefined;
+    for (input, 0..) |v, i| scalar_out[i] = Quantizer.f32_to_fp8_e4m3(v);
+
+    var simd_out: [16]u8 = undefined;
+    const chunk0: @Vector(8, f32) = input[0..8].*;
+    const chunk1: @Vector(8, f32) = input[8..16].*;
+    simd_out[0..8].* = @as([8]u8, Quantizer.f32_to_fp8_e4m3_chunk(chunk0));
+    simd_out[8..16].* = @as([8]u8, Quantizer.f32_to_fp8_e4m3_chunk(chunk1));
+
+    try std.testing.expectEqualSlices(u8, &scalar_out, &simd_out);
+}
+
+test "F8_E5M2 SIMD chunk matches scalar" {
+    var input: [16]f32 = .{ 1.0, -1.0, 0.5, 2.0, 0.0, -0.0, 57344.0, -57344.0, 1e10, -1e10, 0.001, -0.001, 3.14, -2.71, 100.0, 0.0625 };
+    var scalar_out: [16]u8 = undefined;
+    for (input, 0..) |v, i| scalar_out[i] = Quantizer.f32_to_fp8_e5m2(v);
+
+    var simd_out: [16]u8 = undefined;
+    const chunk0: @Vector(8, f32) = input[0..8].*;
+    const chunk1: @Vector(8, f32) = input[8..16].*;
+    simd_out[0..8].* = @as([8]u8, Quantizer.f32_to_fp8_e5m2_chunk(chunk0));
+    simd_out[8..16].* = @as([8]u8, Quantizer.f32_to_fp8_e5m2_chunk(chunk1));
+
+    try std.testing.expectEqualSlices(u8, &scalar_out, &simd_out);
 }

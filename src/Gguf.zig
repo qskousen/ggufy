@@ -250,13 +250,13 @@ pub const GgmlType = enum(u32) {
     }
 
     pub fn fromSafetensorsType(str: []const u8) !GgmlType {
-        if (std.ascii.eqlIgnoreCase(str, "FP32")) return .f32;
-        if (std.ascii.eqlIgnoreCase(str, "FP16")) return .f16;
+        if (std.ascii.eqlIgnoreCase(str, "F32")) return .f32;
+        if (std.ascii.eqlIgnoreCase(str, "F16")) return .f16;
         if (std.ascii.eqlIgnoreCase(str, "BF16")) return .bf16;
         if (std.ascii.eqlIgnoreCase(str, "I32")) return .i32;
         if (std.ascii.eqlIgnoreCase(str, "I16")) return .i16;
         if (std.ascii.eqlIgnoreCase(str, "I8")) return .i8;
-        if (std.ascii.eqlIgnoreCase(str, "FP64")) return .f64;
+        if (std.ascii.eqlIgnoreCase(str, "F64")) return .f64;
         if (std.ascii.eqlIgnoreCase(str, "I64")) return .i64;
         return error.InvalidGgmlType;
     }
