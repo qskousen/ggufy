@@ -29,6 +29,9 @@ pub const ConvertOptions = struct {
     /// Non-quantized types (f16, bf16, f32, f64) and q8_0 are always allowed.
     /// Defaults to null, meaning "infer from datatype".
     allowed_quant_families: ?QuantizationFamilies = null,
+    /// When true and output is safetensors, only include the main model tensors
+    /// (same filtering as GGUF output) and strip name prefixes. Ignored for GGUF output.
+    model_only: bool = false,
     /// Optional GUI progress/cancel hooks.  No-ops when null.
     callbacks: cb.ConvertCallbacks = .{},
 };
@@ -125,7 +128,7 @@ pub fn convert(
     std.log.info("Detected architecture: {s}", .{arch.name});
 
     // --- Filter and normalise tensor list ------------------------------------
-    var model_tensors = try filterAndStripTensors(f, arch, arena_alloc);
+    var model_tensors = try filterAndStripTensors(f, arch, opts.filetype, opts.model_only, arena_alloc);
 
     // --- Assign quantization types (template or auto) -------------------------
     var template_metadata: ?std.json.ObjectMap = null;
@@ -272,13 +275,32 @@ pub fn calculateQuantizationLevel(
 // ============================================================================
 
 /// Returns a new list containing only the tensors that should be converted,
-/// with name prefixes stripped.
+/// with name prefixes stripped for GGUF output and model-only safetensors output.
+///
+/// For full safetensors output (the default), all tensors are included with
+/// their original names so VAE, text encoders, and other components in a
+/// bundled checkpoint are preserved in the output file.
 fn filterAndStripTensors(
     f: *st,
     arch: *const imagearch.Arch,
+    output_filetype: types.FileType,
+    model_only: bool,
     arena_alloc: std.mem.Allocator,
 ) !std.ArrayList(types.Tensor) {
     var model_tensors = try std.ArrayList(types.Tensor).initCapacity(arena_alloc, f.tensors.items.len);
+
+    if (output_filetype == .safetensors and !model_only) {
+        // Preserve all tensors and their original names so bundled checkpoints
+        // (VAE, text encoders, etc.) round-trip intact.
+        for (f.tensors.items) |t| {
+            if (!arch.shouldIgnore(t.name)) {
+                try model_tensors.append(arena_alloc, try t.dupe(arena_alloc));
+            }
+        }
+        return model_tensors;
+    }
+
+    // GGUF output or model-only safetensors: filter to main model tensors and strip name prefixes.
 
     // Full checkpoints mix "model." (unet) tensors with VAE/text encoder tensors.
     // UNet-only files have no such prefix — we need to know which case we're in.
@@ -441,7 +463,7 @@ fn assignQuantTypes(
     var use_sensitivity = false;
     var sensitivities: std.json.Parsed(std.json.Value) = undefined;
 
-    if (!opts.skip_sensitivity) {
+    if (!opts.skip_sensitivity and opts.filetype == .gguf) {
         if (opts.sensitivities_path) |sp| {
             // User-supplied file overrides the built-in one.
             std.log.info("Using user-supplied sensitivities file: {s}", .{sp});

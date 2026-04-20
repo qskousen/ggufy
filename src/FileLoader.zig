@@ -9,9 +9,17 @@ pub const TensorFile = struct {
     arch: ?arch.Arch = null,
     tensors: std.ArrayList(types.Tensor) = undefined,
     metadata: ?std.json.ObjectMap = null,
+    /// Owns the parsed JSON arena that `metadata` slices point into.
+    /// Must be freed before this TensorFile is discarded.
+    _st_json_data: ?std.json.Parsed(std.json.Value) = null,
     sizeInBytes: u64 = 0,
     type_counts: std.HashMap(types.DataType,usize,std.hash_map.AutoContext(types.DataType), 80) = undefined,
     types_line: []u8 = "",
+
+    pub fn deinit(self: *TensorFile) void {
+        if (self._st_json_data) |*jd| jd.deinit();
+        self._st_json_data = null;
+    }
 
     pub fn loadFile(allocator: std.mem.Allocator, arena_alloc: std.mem.Allocator, path: []const u8) !TensorFile {
         var ret: TensorFile = .{};
@@ -29,6 +37,10 @@ pub const TensorFile = struct {
                 var f = try st.init(path, allocator, arena_alloc, false, false);
                 ret.metadata = f.metadata;
                 ret.tensors = f.tensors;
+                // Transfer json_data ownership so metadata slices remain valid.
+                // deinit() on TensorFile will free it.
+                ret._st_json_data = f.json_data;
+                f.json_data = null;
                 f.deinit();
             },
             .gguf => {

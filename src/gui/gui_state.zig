@@ -39,6 +39,7 @@ pub const State = struct {
     /// 1-100: how aggressively to quantize sensitivity-scaled layers.
     target_aggressiveness: u8 = 50,
     skip_sensitivity: bool = false,
+    model_only: bool = false,
     sensitivity_path_buf: [std.fs.max_path_bytes]u8 = std.mem.zeroes([std.fs.max_path_bytes]u8),
     sensitivity_path: ?[]u8 = null,
     template_path_buf: [std.fs.max_path_bytes]u8 = std.mem.zeroes([std.fs.max_path_bytes]u8),

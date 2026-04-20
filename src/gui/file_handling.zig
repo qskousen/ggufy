@@ -275,6 +275,7 @@ pub fn convertFile(alloc: std.mem.Allocator, arena_alloc: std.mem.Allocator, sta
         .sensitivities_path = state.sensitivity_path,
         .template_path = state.template_path,
         .quantization_aggressiveness = @as(f32, @floatFromInt(state.target_aggressiveness)),
+        .model_only = state.model_only,
         .callbacks = .{
             .progress_fn = progressCallback,
             .progress_ctx = state,

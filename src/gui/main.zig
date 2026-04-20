@@ -60,6 +60,7 @@ pub fn main() !void {
 
     defer if (gpa_instance.deinit() != .ok) @panic("Memory leak on exit!");
     defer arena.deinit();
+    defer if (state.loaded_file) |*lf| lf.deinit();
 
     // Populate CPU count and thread default before first frame.
     state.cpu_count = std.Thread.getCpuCount() catch 4;
@@ -103,6 +104,7 @@ pub fn main() !void {
         if (state.file_selected_ready.load(.acquire)) {
             std.log.debug("Loading file: {s}", .{state.file_selected.?});
             state.file_selected_ready.store(false, .release);
+            if (state.loaded_file) |*lf| lf.deinit();
             _ = arena.reset(.free_all);
             state.loaded_file = null;
             state.convert_options_initialized = false;
@@ -508,153 +510,194 @@ fn showInputFile() void {
             te.deinit();
         }
 
-        // Advanced section
-        dvui.label(@src(), "Advanced", .{}, .{ .expand = .horizontal, .margin = .{ .x = 0, .y = 8, .w = 0, .h = 4 } });
-
-        // Skip sensitivity - only shown when the architecture has built-in data
-        // AND no custom sensitivity file is loaded (they are mutually exclusive).
-        const has_sensitivities = if (file.arch) |a| a.sensitivities.len > 1 else false;
-        if (has_sensitivities and state.sensitivity_path == null) {
-            var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .all(2) });
-            defer row.deinit();
-            var cwd: dvui.WidgetData = undefined;
-            _ = dvui.checkbox(@src(), &state.skip_sensitivity, "Skip built-in sensitivity", .{ .gravity_y = 0.5, .data_out = &cwd });
-            dvui.tooltip(@src(), .{ .active_rect = cwd.borderRectScale().r },
-                "By default, per-layer sensitivity scores preserve precision on important layers. Check this to quantize all eligible layers uniformly.", .{}, .{});
-        }
-
-        // Sensitivity file row
+        // Advanced section (accordion, collapsed by default)
         {
-            const blocked_by_template = state.template_path != null;
-            const row_color: ?dvui.Color = if (blocked_by_template) dim_color else null;
+            var adv_tree = dvui.TreeWidget.tree(@src(), .{ .enable_reordering = false }, .{ .expand = .horizontal });
+            defer adv_tree.deinit();
+            const adv_branch = adv_tree.branch(@src(), .{ .expanded = false }, .{ .expand = .horizontal });
+            defer adv_branch.deinit();
+            const adv_caret: []const u8 = if (adv_branch.expanded) "v " else "> ";
+            const adv_header = std.fmt.allocPrint(fa, "{s}Advanced", .{adv_caret}) catch "> Advanced";
+            dvui.labelNoFmt(@src(), adv_header, .{}, .{ .expand = .horizontal, .margin = .{ .x = 0, .y = 8, .w = 0, .h = 2 } });
+            if (adv_branch.expander(@src(), .{ .indent = 10 }, .{ .expand = .horizontal })) {
+                const is_safetensors_out = state.target_filetype == .safetensors;
+                const has_sensitivities = if (file.arch) |a| a.sensitivities.len > 1 else false;
 
-            var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .all(2) });
-            defer row.deinit();
-            dvui.label(@src(), "Sensitivity file", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 120 }, .color_text = row_color });
-
-            const sens_display = if (state.sensitivity_path) |p| p else "none";
-            dvui.labelNoFmt(@src(), sens_display, .{}, .{ .expand = .horizontal, .gravity_y = 0.5, .color_text = row_color });
-
-            if (state.sensitivity_path != null and !blocked_by_template) {
-                if (dvui.button(@src(), "Clear", .{}, .{ .gravity_y = 0.5 })) {
-                    state.sensitivity_path = null;
+                // Model only checkbox — active for safetensors output, dimmed for GGUF
+                {
+                    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .all(2) });
+                    defer row.deinit();
+                    var cwd: dvui.WidgetData = undefined;
+                    if (is_safetensors_out) {
+                        _ = dvui.checkbox(@src(), &state.model_only, "Model only", .{ .gravity_y = 0.5, .data_out = &cwd });
+                        dvui.tooltip(@src(), .{ .active_rect = cwd.borderRectScale().r },
+                            "Only convert the main model (UNet/transformer). CLIP, VAE, and other components are excluded. Names are stripped of component prefixes.", .{}, .{});
+                    } else {
+                        var dummy_model_only = state.model_only;
+                        _ = dvui.checkbox(@src(), &dummy_model_only, "Model only", .{ .gravity_y = 0.5, .color_text = dim_color, .data_out = &cwd });
+                        dvui.tooltip(@src(), .{ .active_rect = cwd.borderRectScale().r },
+                            "Only applies when outputting to safetensors.", .{}, .{});
+                    }
                 }
-            }
-            var bwd: dvui.WidgetData = undefined;
-            if (dvui.button(@src(), "Browse...", .{}, .{ .gravity_y = 0.5, .color_text = row_color, .data_out = &bwd })) {
-                if (!blocked_by_template and !state.sensitivity_dialog_open) {
-                    state.sensitivity_dialog_open = true;
-                    SDLBackend.c.SDL_ShowOpenFileDialog(
-                        fileHandling.sensitivityFileCallback,
-                        &state,
-                        g_backend.?.window,
-                        &json_filters,
-                        json_filters.len,
-                        null,
-                        false,
-                    );
+
+                // Skip sensitivity — shown when arch has built-in data; dimmed for safetensors output
+                if (has_sensitivities and state.sensitivity_path == null) {
+                    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .all(2) });
+                    defer row.deinit();
+                    var cwd: dvui.WidgetData = undefined;
+                    _ = dvui.checkbox(@src(), &state.skip_sensitivity, "Skip built-in sensitivity", .{
+                        .gravity_y = 0.5,
+                        .color_text = if (is_safetensors_out) dim_color else null,
+                        .data_out = &cwd,
+                    });
+                    if (is_safetensors_out) {
+                        dvui.tooltip(@src(), .{ .active_rect = cwd.borderRectScale().r },
+                            "Sensitivity quantization is only used for GGUF output.", .{}, .{});
+                    } else {
+                        dvui.tooltip(@src(), .{ .active_rect = cwd.borderRectScale().r },
+                            "By default, per-layer sensitivity scores preserve precision on important layers. Check this to quantize all eligible layers uniformly.", .{}, .{});
+                    }
                 }
-            }
-            if (blocked_by_template) {
-                dvui.tooltip(@src(), .{ .active_rect = bwd.borderRectScale().r },
-                    "Cannot use a sensitivity file while a template is selected.", .{}, .{});
-            }
-        }
 
-        // Template file row
-        {
-            const blocked_by_sens = state.sensitivity_path != null;
-            const row_color: ?dvui.Color = if (blocked_by_sens) dim_color else null;
+                // Sensitivity file row — dimmed for safetensors output
+                {
+                    const blocked_by_template = state.template_path != null;
+                    const blocked = is_safetensors_out or blocked_by_template;
+                    const row_color: ?dvui.Color = if (blocked) dim_color else null;
 
-            var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .all(2) });
-            defer row.deinit();
-            dvui.label(@src(), "Template file", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 120 }, .color_text = row_color });
+                    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .all(2) });
+                    defer row.deinit();
+                    dvui.label(@src(), "Sensitivity file", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 120 }, .color_text = row_color });
 
-            const tmpl_display = if (state.template_path) |p| p else "none";
-            dvui.labelNoFmt(@src(), tmpl_display, .{}, .{ .expand = .horizontal, .gravity_y = 0.5, .color_text = row_color });
+                    const sens_display = if (state.sensitivity_path) |p| p else "none";
+                    dvui.labelNoFmt(@src(), sens_display, .{}, .{ .expand = .horizontal, .gravity_y = 0.5, .color_text = row_color });
 
-            if (state.template_path != null and !blocked_by_sens) {
-                if (dvui.button(@src(), "Clear", .{}, .{ .gravity_y = 0.5 })) {
-                    state.template_path = null;
-                    state.prev_template_path_len = 0;
+                    if (state.sensitivity_path != null and !blocked) {
+                        if (dvui.button(@src(), "Clear", .{}, .{ .gravity_y = 0.5 })) {
+                            state.sensitivity_path = null;
+                        }
+                    }
+                    var bwd: dvui.WidgetData = undefined;
+                    if (dvui.button(@src(), "Browse...", .{}, .{ .gravity_y = 0.5, .color_text = row_color, .data_out = &bwd })) {
+                        if (!blocked and !state.sensitivity_dialog_open) {
+                            state.sensitivity_dialog_open = true;
+                            SDLBackend.c.SDL_ShowOpenFileDialog(
+                                fileHandling.sensitivityFileCallback,
+                                &state,
+                                g_backend.?.window,
+                                &json_filters,
+                                json_filters.len,
+                                null,
+                                false,
+                            );
+                        }
+                    }
+                    if (is_safetensors_out) {
+                        dvui.tooltip(@src(), .{ .active_rect = bwd.borderRectScale().r },
+                            "Sensitivity files are only used for GGUF output.", .{}, .{});
+                    } else if (blocked_by_template) {
+                        dvui.tooltip(@src(), .{ .active_rect = bwd.borderRectScale().r },
+                            "Cannot use a sensitivity file while a template is selected.", .{}, .{});
+                    }
                 }
-            }
-            var bwd: dvui.WidgetData = undefined;
-            if (dvui.button(@src(), "Browse...", .{}, .{ .gravity_y = 0.5, .color_text = row_color, .data_out = &bwd })) {
-                if (!blocked_by_sens and !state.template_dialog_open) {
-                    state.template_dialog_open = true;
-                    SDLBackend.c.SDL_ShowOpenFileDialog(
-                        fileHandling.templateFileCallback,
-                        &state,
-                        g_backend.?.window,
-                        &json_filters,
-                        json_filters.len,
-                        null,
-                        false,
-                    );
+
+                // Template file row
+                {
+                    const blocked_by_sens = state.sensitivity_path != null;
+                    const row_color: ?dvui.Color = if (blocked_by_sens) dim_color else null;
+
+                    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .all(2) });
+                    defer row.deinit();
+                    dvui.label(@src(), "Template file", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 120 }, .color_text = row_color });
+
+                    const tmpl_display = if (state.template_path) |p| p else "none";
+                    dvui.labelNoFmt(@src(), tmpl_display, .{}, .{ .expand = .horizontal, .gravity_y = 0.5, .color_text = row_color });
+
+                    if (state.template_path != null and !blocked_by_sens) {
+                        if (dvui.button(@src(), "Clear", .{}, .{ .gravity_y = 0.5 })) {
+                            state.template_path = null;
+                            state.prev_template_path_len = 0;
+                        }
+                    }
+                    var bwd: dvui.WidgetData = undefined;
+                    if (dvui.button(@src(), "Browse...", .{}, .{ .gravity_y = 0.5, .color_text = row_color, .data_out = &bwd })) {
+                        if (!blocked_by_sens and !state.template_dialog_open) {
+                            state.template_dialog_open = true;
+                            SDLBackend.c.SDL_ShowOpenFileDialog(
+                                fileHandling.templateFileCallback,
+                                &state,
+                                g_backend.?.window,
+                                &json_filters,
+                                json_filters.len,
+                                null,
+                                false,
+                            );
+                        }
+                    }
+                    if (blocked_by_sens) {
+                        dvui.tooltip(@src(), .{ .active_rect = bwd.borderRectScale().r },
+                            "Cannot use a template while a sensitivity file is selected.", .{}, .{});
+                    }
                 }
-            }
-            if (blocked_by_sens) {
-                dvui.tooltip(@src(), .{ .active_rect = bwd.borderRectScale().r },
-                    "Cannot use a template while a sensitivity file is selected.", .{}, .{});
-            }
-        }
 
-        // Aggressiveness slider
-        {
-            // Disabled when: sensitivity is skipped, OR no built-in sensitivities AND no custom file
-            const sens_active = !state.skip_sensitivity and
-                (has_sensitivities or state.sensitivity_path != null);
-            const agg_color: ?dvui.Color = if (!sens_active) dim_color else null;
+                // Aggressiveness slider — dimmed for safetensors output or when sensitivity inactive
+                {
+                    const sens_active = !is_safetensors_out and !state.skip_sensitivity and
+                        (has_sensitivities or state.sensitivity_path != null);
+                    const agg_color: ?dvui.Color = if (!sens_active) dim_color else null;
 
-            var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .all(2) });
-            defer row.deinit();
+                    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .all(2) });
+                    defer row.deinit();
 
-            var lwd: dvui.WidgetData = undefined;
-            dvui.label(@src(), "Aggressiveness", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 120 }, .color_text = agg_color, .data_out = &lwd });
-            if (!sens_active) {
-                dvui.tooltip(@src(), .{ .active_rect = lwd.borderRectScale().r },
-                    "Enable sensitivity scoring to use aggressiveness control.", .{}, .{});
-            } else {
-                dvui.tooltip(@src(), .{ .active_rect = lwd.borderRectScale().r },
-                    "How aggressively to quantize sensitive layers. Higher = smaller file, lower = better quality.", .{}, .{});
-            }
+                    var lwd: dvui.WidgetData = undefined;
+                    dvui.label(@src(), "Aggressiveness", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 120 }, .color_text = agg_color, .data_out = &lwd });
+                    if (is_safetensors_out) {
+                        dvui.tooltip(@src(), .{ .active_rect = lwd.borderRectScale().r },
+                            "Sensitivity quantization is only used for GGUF output.", .{}, .{});
+                    } else if (!sens_active) {
+                        dvui.tooltip(@src(), .{ .active_rect = lwd.borderRectScale().r },
+                            "Enable sensitivity scoring to use aggressiveness control.", .{}, .{});
+                    } else {
+                        dvui.tooltip(@src(), .{ .active_rect = lwd.borderRectScale().r },
+                            "How aggressively to quantize sensitive layers. Higher = smaller file, lower = better quality.", .{}, .{});
+                    }
 
-            var agg_label_buf: [8]u8 = undefined;
-            const agg_label = std.fmt.bufPrint(&agg_label_buf, "{d}", .{state.target_aggressiveness}) catch "?";
-            dvui.labelNoFmt(@src(), agg_label, .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 28 }, .color_text = agg_color });
+                    var agg_label_buf: [8]u8 = undefined;
+                    const agg_label = std.fmt.bufPrint(&agg_label_buf, "{d}", .{state.target_aggressiveness}) catch "?";
+                    dvui.labelNoFmt(@src(), agg_label, .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 28 }, .color_text = agg_color });
 
-            var agg_frac: f32 = (@as(f32, @floatFromInt(state.target_aggressiveness)) - 1.0) / 99.0;
-            if (sens_active) {
-                if (dvui.slider(@src(), .{ .fraction = &agg_frac }, .{ .expand = .horizontal, .gravity_y = 0.5 })) {
-                    const raw: u8 = @intFromFloat(@round(agg_frac * 99.0));
-                    state.target_aggressiveness = std.math.clamp(raw + 1, 1, 100);
+                    var agg_frac: f32 = (@as(f32, @floatFromInt(state.target_aggressiveness)) - 1.0) / 99.0;
+                    if (sens_active) {
+                        if (dvui.slider(@src(), .{ .fraction = &agg_frac }, .{ .expand = .horizontal, .gravity_y = 0.5 })) {
+                            const raw: u8 = @intFromFloat(@round(agg_frac * 99.0));
+                            state.target_aggressiveness = std.math.clamp(raw + 1, 1, 100);
+                        }
+                    } else {
+                        dvui.progress(@src(), .{ .percent = agg_frac }, .{ .expand = .horizontal, .gravity_y = 0.5, .color_fill = dim_color });
+                    }
                 }
-            } else {
-                // Render a visual-only progress bar in place of the slider
-                dvui.progress(@src(), .{ .percent = agg_frac }, .{ .expand = .horizontal, .gravity_y = 0.5, .color_fill = dim_color });
-            }
-        }
 
-        // Threads slider
-        {
-            const cpu_f: f32 = @floatFromInt(state.cpu_count);
-            var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .all(2) });
-            defer row.deinit();
+                // Threads slider
+                {
+                    const cpu_f: f32 = @floatFromInt(state.cpu_count);
+                    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .all(2) });
+                    defer row.deinit();
 
-            var lwd: dvui.WidgetData = undefined;
-            dvui.label(@src(), "Threads", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 120 }, .data_out = &lwd });
-            dvui.tooltip(@src(), .{ .active_rect = lwd.borderRectScale().r },
-                "Number of CPU threads to use during quantization.", .{}, .{});
+                    var lwd: dvui.WidgetData = undefined;
+                    dvui.label(@src(), "Threads", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 120 }, .data_out = &lwd });
+                    dvui.tooltip(@src(), .{ .active_rect = lwd.borderRectScale().r },
+                        "Number of CPU threads to use during quantization.", .{}, .{});
 
-            var thr_label_buf: [8]u8 = undefined;
-            const thr_label = std.fmt.bufPrint(&thr_label_buf, "{d}", .{state.target_threads}) catch "?";
-            dvui.labelNoFmt(@src(), thr_label, .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 28 } });
+                    var thr_label_buf: [8]u8 = undefined;
+                    const thr_label = std.fmt.bufPrint(&thr_label_buf, "{d}", .{state.target_threads}) catch "?";
+                    dvui.labelNoFmt(@src(), thr_label, .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 28 } });
 
-            var thr_frac: f32 = (@as(f32, @floatFromInt(state.target_threads)) - 1.0) / (cpu_f - 1.0);
-            if (dvui.slider(@src(), .{ .fraction = &thr_frac }, .{ .expand = .horizontal, .gravity_y = 0.5 })) {
-                const raw = @as(usize, @intFromFloat(@round(thr_frac * (cpu_f - 1.0))));
-                state.target_threads = std.math.clamp(raw + 1, 1, state.cpu_count);
+                    var thr_frac: f32 = (@as(f32, @floatFromInt(state.target_threads)) - 1.0) / (cpu_f - 1.0);
+                    if (dvui.slider(@src(), .{ .fraction = &thr_frac }, .{ .expand = .horizontal, .gravity_y = 0.5 })) {
+                        const raw = @as(usize, @intFromFloat(@round(thr_frac * (cpu_f - 1.0))));
+                        state.target_threads = std.math.clamp(raw + 1, 1, state.cpu_count);
+                    }
+                }
             }
         }
 
@@ -733,6 +776,18 @@ fn showInputFile() void {
         }
     }
 
+    // Divider between conversion options and model internals
+    {
+        var divider = dvui.box(@src(), .{}, .{
+            .expand = .horizontal,
+            .min_size_content = .{ .h = 1 },
+            .background = true,
+            .color_fill = dim_color,
+            .margin = .{ .x = 4, .y = 8, .w = 4, .h = 8 },
+        });
+        defer divider.deinit();
+    }
+
     // Model internals tree
     showModelInternals();
 }
@@ -753,6 +808,7 @@ fn launchConversion(fa: std.mem.Allocator) void {
         .threads = 1,
         .skip_sensitivity = false,
         .quantization_aggressiveness = 50,
+        .model_only = state.model_only,
     };
 
     const out_path = conv.computeOutputPath(opts, fa) catch {
@@ -784,6 +840,7 @@ fn launchConversion(fa: std.mem.Allocator) void {
 }
 
 fn unloadFile() void {
+    if (state.loaded_file) |*lf| lf.deinit();
     _ = arena.reset(.free_all);
     state.loaded_file = null;
     state.convert_options_initialized = false;
@@ -802,7 +859,7 @@ fn showConverting() void {
     var outer = dvui.box(@src(), .{}, .{ .gravity_x = 0.5, .gravity_y = 0.5, .expand = .both });
     defer outer.deinit();
 
-    var inner = dvui.box(@src(), .{}, .{ .gravity_x = 0.5, .gravity_y = 0.5, .min_size_content = .{ .w = 400 } });
+    var inner = dvui.box(@src(), .{}, .{ .gravity_x = 0.5, .expand = .horizontal, .gravity_y = 0.5, .min_size_content = .{ .w = 400 } });
     defer inner.deinit();
 
     // Use .acquire so we read tensor info written before this store.
@@ -816,7 +873,7 @@ fn showConverting() void {
         @as(f32, @floatFromInt(done)) / @as(f32, @floatFromInt(total))
     else
         0.0;
-    dvui.progress(@src(), .{ .percent = frac }, .{ .expand = .horizontal, .margin = .{ .x = 0, .y = 4, .w = 0, .h = 4 } });
+    dvui.progress(@src(), .{ .percent = frac }, .{ .expand = .horizontal, .margin = .{ .x = 50, .y = 4, .w = 50, .h = 4 } });
 
     // Tensor count
     dvui.label(@src(), "{d} / {d} tensors", .{ done, total }, .{ .gravity_x = 0.5 });

@@ -203,6 +203,8 @@ For supported architectures, ggufy can use sensitivity data to apply different q
 This can significantly improve the quality of the model at the cost of slightly larger file sizes.
 For supported models, sensitivity is enabled by default.
 
+Note: Sensitivity data is only available for gguf output, not safetensors.
+
 Generating sensitivity data requires generating a large number of images, which can take a long time.
 More architectures will be added as the sensitivity data is generated for them.
 
@@ -279,8 +281,9 @@ ggufy convert --template template.json --datatype q4_k source-model.safetensors
 -j, --threads           Number of threads for quantization (default: CPU cores - 2)
 -a, --aggressiveness    Aggressiveness of sensitivity-aware quantization (default: 50)
 -x, --skip-sensitivity  Skip sensitivity-aware quantization, quantizing all available layers to target datatype
--s, --sensitivities     Path to custom sensitivity file 
--q, --use-quant-types   Comma-separated list of quantization types to use (0,1,k) (default: based on target datatype)
+-s, --sensitivities <FILENAME> Path to a sensitivities JSON file to use (overrides built-in sensitivities) Sensitivities are only used for GGUF model output.
+-q, --use-quant-types <QTYPES> Quantization families to use with sensitivity (e.g. "k", "0,k", "0,1,k"). Default: match datatype.
+-m, --model-only               When output is safetensors, convert only the main model (UNet/transformer). Ignored for GGUF output.
 
 Commands: 
 header - Display file header information 
