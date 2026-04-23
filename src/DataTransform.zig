@@ -241,6 +241,10 @@ pub const Quantizer = struct {
     }
 
     pub fn f32_to_fp8_e4m3_chunk(chunk: @Vector(fp8_vec_width, f32)) @Vector(fp8_vec_width, u8) {
+        // Vectorized ml_dtypes float8_e4m3fn ConvertFrom<float> (non-saturating, round-to-nearest-even).
+        //
+        // Uses a fixed shift of 20 for the normal path to avoid vpsrlvd (slow variable-shift).
+        // Subnormal f8 values (tbe < 0) are handled with the IEEE 754 add-magic RTE trick.
         const W = fp8_vec_width;
         const U32V = @Vector(W, u32);
         const I32V = @Vector(W, i32);
@@ -248,40 +252,52 @@ pub const Quantizer = struct {
 
         const bits: U32V = @bitCast(chunk);
         const sign: U32V = bits >> @as(U32V, @splat(31));
-        const f32_exp: U32V = (bits >> @as(U32V, @splat(23))) & @as(U32V, @splat(0xFF));
-        const f32_mant: U32V = bits & @as(U32V, @splat(0x7FFFFF));
+        const abs_bits: U32V = bits & @as(U32V, @splat(0x7FFF_FFFF));
 
-        // f8_exp_biased = f32_exp_biased - 127 + 7 = f32_exp_biased - 120
-        const f8_exp_i: I32V = @as(I32V, @intCast(f32_exp)) - @as(I32V, @splat(120));
-        // Round-to-nearest: add round bit (f32 mantissa bit 19) before extracting top 3 bits
-        const f8_mant_r: U32V = ((f32_mant >> @as(U32V, @splat(20))) & @as(U32V, @splat(7))) + ((f32_mant >> @as(U32V, @splat(19))) & @as(U32V, @splat(1)));
-        const f8_mant_carry: U32V = f8_mant_r >> @as(U32V, @splat(3)); // 1 if rounded up to 8
-        const f8_mant: U32V = f8_mant_r & @as(U32V, @splat(7));
-        const f8_exp_adj: I32V = f8_exp_i + @as(I32V, @intCast(f8_mant_carry));
+        const is_special: @Vector(W, bool) = abs_bits >= @as(U32V, @splat(0x7F80_0000));
 
-        const is_f32_special: @Vector(W, bool) = f32_exp == @as(U32V, @splat(255));
-        // Clamp if exp >= 16, or exp == 15 with mant == 7 (which would encode as NaN 0x7F)
-        const would_encode_nan: @Vector(W, bool) = (f8_exp_adj == @as(I32V, @splat(15))) & (f8_mant == @as(U32V, @splat(7)));
-        const is_overflow: @Vector(W, bool) = ((f8_exp_adj >= @as(I32V, @splat(16))) | would_encode_nan) & !is_f32_special;
-        const is_small: @Vector(W, bool) = (f8_exp_adj <= @as(I32V, @splat(0))) & !is_f32_special;
+        const f32_biased_exp: U32V = abs_bits >> @as(U32V, @splat(23));
+        const norm_mant: U32V = @as(U32V, @splat(0x80_0000)) | (abs_bits & @as(U32V, @splat(0x7F_FFFF)));
 
-        // Subnormal F8 E4M3: mant = round(|x| * 2^9), clamped to [0, 7]
-        const abs_v: F32V = @abs(chunk);
-        const subnorm_mant: U32V = @intFromFloat(@min(abs_v * @as(F32V, @splat(512.0)) + @as(F32V, @splat(0.5)), @as(F32V, @splat(7.0))));
+        // tbe = (f32_biased_exp - 127) + 6 = f32_biased_exp - 121
+        const tbe: I32V = @as(I32V, @intCast(f32_biased_exp)) - @as(I32V, @splat(121));
+        const is_subnorm: @Vector(W, bool) = tbe < @as(I32V, @splat(0));
 
-        // Clamp exponent for normal path [1..15]
-        const f8_exp_u: U32V = @intCast(@min(@max(f8_exp_adj, @as(I32V, @splat(1))), @as(I32V, @splat(15))));
-        const normal: U32V = (sign << @as(U32V, @splat(7))) | (f8_exp_u << @as(U32V, @splat(3))) | f8_mant;
+        // Normal path: fixed ashift = 20 → compiles to vpsrld/vpslld (fast).
+        const L: U32V = (norm_mant >> @as(U32V, @splat(20))) & @as(U32V, @splat(1));
+        const rounded: U32V = norm_mant + (L + @as(U32V, @splat(0x7FFFF)));
+        const aligned: U32V = rounded >> @as(U32V, @splat(20));
+        const exp_bits: U32V = @intCast(@max(@as(I32V, @splat(0)), tbe));
+        const result_normal: U32V = aligned + (exp_bits << @as(U32V, @splat(3)));
 
-        var result: U32V = normal;
-        result = @select(u32, is_small,    (sign << @as(U32V, @splat(7))) | subnorm_mant,       result);
-        result = @select(u32, is_overflow, (sign << @as(U32V, @splat(7))) | @as(U32V, @splat(0x7E)), result);
-        result = @select(u32, is_f32_special, @as(U32V, @splat(0x7F)), result);
+        // Subnormal path: mant = RTE(|x| * 512).
+        // IEEE 754 addition with magic constant performs round-to-nearest-even.
+        // No upper clamp: values that round up to 8 correctly become the smallest normal (0x08).
+        // Cap abs_bits at 2^-6 (0x3B800000) before float arithmetic so that NaN/Inf
+        // elements (handled by is_special above) produce a safe finite scaled value
+        // instead of causing @intFromFloat to panic — the @select discards these lanes.
+        const magic: F32V = @splat(0x1p23); // 2^23: forces integer rounding in f32 mantissa
+        const capped_abs: F32V = @bitCast(@as(U32V, @min(abs_bits, @as(U32V, @splat(0x3C80_0000)))));
+        const subnorm_mant: U32V = @intFromFloat(capped_abs * @as(F32V, @splat(512.0)) + magic - magic);
+
+        var result_pre: U32V = @select(u32, is_subnorm, subnorm_mant, result_normal);
+
+        // Overflow: tbe >= 16 OR result > 0x7E → 0x7F (E4M3FN has no infinity, overflow = NaN).
+        const is_overflow: @Vector(W, bool) = (tbe >= @as(I32V, @splat(16))) | (result_pre > @as(U32V, @splat(0x7E)));
+        result_pre = @select(u32, is_overflow, @as(U32V, @splat(0x7F)), result_pre);
+
+        // Apply sign; NaN/Inf override to (sign << 7) | 0x7F.
+        var result: U32V = (sign << @as(U32V, @splat(7))) | result_pre;
+        result = @select(u32, is_special, (sign << @as(U32V, @splat(7))) | @as(U32V, @splat(0x7F)), result);
 
         return @truncate(result);
     }
 
     pub fn f32_to_fp8_e5m2_chunk(chunk: @Vector(fp8_vec_width, f32)) @Vector(fp8_vec_width, u8) {
+        // Vectorized ml_dtypes float8_e5m2 ConvertFrom<float> (non-saturating, round-to-nearest-even).
+        //
+        // Uses a fixed shift of 21 for the normal path to avoid vpsrlvd (slow variable-shift).
+        // Subnormal f8 values (tbe < 0) are handled with the IEEE 754 add-magic RTE trick.
         const W = fp8_vec_width;
         const U32V = @Vector(W, u32);
         const I32V = @Vector(W, i32);
@@ -289,36 +305,43 @@ pub const Quantizer = struct {
 
         const bits: U32V = @bitCast(chunk);
         const sign: U32V = bits >> @as(U32V, @splat(31));
-        const f32_exp: U32V = (bits >> @as(U32V, @splat(23))) & @as(U32V, @splat(0xFF));
-        const f32_mant: U32V = bits & @as(U32V, @splat(0x7FFFFF));
+        const abs_bits: U32V = bits & @as(U32V, @splat(0x7FFF_FFFF));
 
-        // f8_exp_biased = f32_exp_biased - 127 + 15 = f32_exp_biased - 112
-        const f8_exp_i: I32V = @as(I32V, @intCast(f32_exp)) - @as(I32V, @splat(112));
-        // Round-to-nearest: add round bit (f32 mantissa bit 20) before extracting top 2 bits
-        const f8_mant_r: U32V = ((f32_mant >> @as(U32V, @splat(21))) & @as(U32V, @splat(3))) + ((f32_mant >> @as(U32V, @splat(20))) & @as(U32V, @splat(1)));
-        const f8_mant_carry: U32V = f8_mant_r >> @as(U32V, @splat(2)); // 1 if rounded up to 4
-        const f8_mant: U32V = f8_mant_r & @as(U32V, @splat(3));
-        const f8_exp_adj: I32V = f8_exp_i + @as(I32V, @intCast(f8_mant_carry));
+        const is_nan: @Vector(W, bool) = abs_bits > @as(U32V, @splat(0x7F80_0000));
+        const is_inf: @Vector(W, bool) = abs_bits == @as(U32V, @splat(0x7F80_0000));
 
-        const is_f32_special: @Vector(W, bool) = f32_exp == @as(U32V, @splat(255));
-        const is_nan: @Vector(W, bool) = is_f32_special & (f32_mant != @as(U32V, @splat(0)));
-        const is_inf: @Vector(W, bool) = is_f32_special & (f32_mant == @as(U32V, @splat(0)));
-        const is_overflow: @Vector(W, bool) = (f8_exp_adj >= @as(I32V, @splat(31))) & !is_f32_special;
-        const is_small: @Vector(W, bool) = (f8_exp_adj <= @as(I32V, @splat(0))) & !is_f32_special;
+        const f32_biased_exp: U32V = abs_bits >> @as(U32V, @splat(23));
+        const norm_mant: U32V = @as(U32V, @splat(0x80_0000)) | (abs_bits & @as(U32V, @splat(0x7F_FFFF)));
 
-        // Subnormal F8 E5M2: mant = round(|x| * 2^16), clamped to [0, 3]
-        const abs_v: F32V = @abs(chunk);
-        const subnorm_mant: U32V = @intFromFloat(@min(abs_v * @as(F32V, @splat(65536.0)) + @as(F32V, @splat(0.5)), @as(F32V, @splat(3.0))));
+        // tbe = (f32_biased_exp - 127) + 14 = f32_biased_exp - 113
+        const tbe: I32V = @as(I32V, @intCast(f32_biased_exp)) - @as(I32V, @splat(113));
+        const is_subnorm: @Vector(W, bool) = tbe < @as(I32V, @splat(0));
 
-        // Clamp exponent for normal path [1..30]
-        const f8_exp_u: U32V = @intCast(@min(@max(f8_exp_adj, @as(I32V, @splat(1))), @as(I32V, @splat(30))));
-        const normal: U32V = (sign << @as(U32V, @splat(7))) | (f8_exp_u << @as(U32V, @splat(2))) | f8_mant;
+        // Normal path: fixed ashift = 21 → compiles to vpsrld/vpslld (fast).
+        const L: U32V = (norm_mant >> @as(U32V, @splat(21))) & @as(U32V, @splat(1));
+        const rounded: U32V = norm_mant + (L + @as(U32V, @splat(0xFFFFF)));
+        const aligned: U32V = rounded >> @as(U32V, @splat(21));
+        const exp_bits: U32V = @intCast(@max(@as(I32V, @splat(0)), tbe));
+        const result_normal: U32V = aligned + (exp_bits << @as(U32V, @splat(2)));
 
-        var result: U32V = normal;
-        result = @select(u32, is_small,    (sign << @as(U32V, @splat(7))) | subnorm_mant,        result);
-        result = @select(u32, is_overflow, (sign << @as(U32V, @splat(7))) | @as(U32V, @splat(0x7B)), result);
-        result = @select(u32, is_inf,      (sign << @as(U32V, @splat(7))) | @as(U32V, @splat(0x7C)), result);
-        result = @select(u32, is_nan,      @as(U32V, @splat(0x7F)), result);
+        // Subnormal path: mant = RTE(|x| * 65536).
+        // No upper clamp: values that round up to 4 correctly become the smallest normal (0x04).
+        // Cap abs_bits at 2^-14 (0x38800000) before float arithmetic so NaN/Inf elements
+        // produce a safe finite scaled value — the @select discards those lanes anyway.
+        const magic: F32V = @splat(0x1p23);
+        const capped_abs: F32V = @bitCast(@as(U32V, @min(abs_bits, @as(U32V, @splat(0x3880_0000)))));
+        const subnorm_mant: U32V = @intFromFloat(capped_abs * @as(F32V, @splat(65536.0)) + magic - magic);
+
+        var result_pre: U32V = @select(u32, is_subnorm, subnorm_mant, result_normal);
+
+        // Overflow: tbe >= 31 OR result > 0x7B → 0x7C (Inf for E5M2).
+        const is_overflow: @Vector(W, bool) = (tbe >= @as(I32V, @splat(31))) | (result_pre > @as(U32V, @splat(0x7B)));
+        result_pre = @select(u32, is_overflow, @as(U32V, @splat(0x7C)), result_pre);
+
+        // Apply sign; then override Inf and NaN.
+        var result: U32V = (sign << @as(U32V, @splat(7))) | result_pre;
+        result = @select(u32, is_inf, (sign << @as(U32V, @splat(7))) | @as(U32V, @splat(0x7C)), result);
+        result = @select(u32, is_nan, (sign << @as(U32V, @splat(7))) | @as(U32V, @splat(0x7E)), result);
 
         return @truncate(result);
     }
@@ -434,64 +457,109 @@ pub const Quantizer = struct {
     };
 
     pub fn f32_to_fp8_e4m3(x: f32) u8 {
-        if (std.math.isNan(x)) return 0x7F;
+        // Matches ml_dtypes float8_e4m3fn ConvertFrom<float> (non-saturating, round-to-nearest-even).
+        // E4M3FN: bias=7, no infinity encoding — overflow maps to NaN (0x7F).
+        const bits: u32 = @bitCast(x);
+        const from_sign: u8 = @truncate(bits >> 31);
+        const abs_bits: u32 = bits & 0x7FFF_FFFF;
 
-        const sign_bit: u8 = if (x < 0.0 or (x == 0.0 and std.math.signbit(x))) 0x80 else 0x00;
-        const abs_x = @abs(x);
+        // NaN or Inf → NaN/overflow encoding (0x7F), with sign applied.
+        if (abs_bits >= 0x7F80_0000) return (from_sign << 7) | 0x7F;
 
-        if (std.math.isInf(abs_x) or abs_x > 448.0) {
-            return sign_bit | 0x7E;
+        // Zero
+        if (abs_bits == 0) return from_sign << 7;
+
+        const from_biased_exp: u32 = abs_bits >> 23;
+        const from_fraction: u32 = abs_bits & 0x7F_FFFF;
+
+        var unbiased_exp: i32 = undefined;
+        var norm_mant: u32 = undefined;
+
+        if (from_biased_exp != 0) {
+            unbiased_exp = @as(i32, @intCast(from_biased_exp)) - 127;
+            norm_mant = 0x80_0000 | from_fraction;
+        } else {
+            // Subnormal f32: normalize by shifting until implicit 1 is at bit 23.
+            const lz: i32 = @clz(from_fraction);
+            const frac_lz: i32 = lz - 9; // leading zeros within 23-bit field
+            const norm_shift: i32 = frac_lz + 1;
+            norm_mant = from_fraction << @intCast(norm_shift);
+            unbiased_exp = (1 - 127) - norm_shift;
         }
 
-        if (abs_x == 0.0) return sign_bit;
+        // target_biased_exponent_base = unbiased_exp + kToExponentBias - 1 = unbiased_exp + 6
+        const tbe: i32 = unbiased_exp + 6;
 
-        const log2_val = std.math.log2(abs_x);
-        const e: i32 = @intFromFloat(@floor(log2_val));
+        // Shift to align 23-bit source mantissa onto 3-bit target mantissa.
+        const denorm_adj: i32 = @max(0, -tbe);
+        const ashift: i32 = @min(20 + denorm_adj, 25);
+        const roundoff: u5 = @intCast(ashift);
 
-        if (e < -6) {
-            // Subnormal: encoded value = mant * 2^(-9)
-            const mant_f = abs_x * 512.0;
-            const mant: u8 = @intFromFloat(@min(7.0, @max(0.0, @round(mant_f))));
-            return sign_bit | mant;
-        }
+        // Round-to-nearest-even (ml_dtypes RoundBitsToNearestEven).
+        const bias: u32 = ((norm_mant >> roundoff) & 1) + (@as(u32, 1) << (roundoff - 1)) - 1;
+        const rounded: u32 = norm_mant + bias;
+        const aligned: u8 = @truncate(rounded >> roundoff);
 
-        // Normal: biased_exp in [1..15]; max representable e=8 (biased 15, mant≤6 = 448)
-        const e_clamped: i32 = @min(8, e);
-        const biased_exp: u8 = @intCast(e_clamped + 7);
-        const scale = std.math.pow(f32, 2.0, @as(f32, @floatFromInt(e_clamped)));
-        const mant_f = (abs_x / scale - 1.0) * 8.0;
-        const mant: u8 = @intFromFloat(@min(7.0, @max(0.0, @round(mant_f))));
-        return sign_bit | (biased_exp << 3) | mant;
+        const exp_bits: u8 = @intCast(@max(0, tbe));
+        var result: u8 = aligned +% (exp_bits << 3);
+
+        // Overflow: tbe >= max_exponent(9) + kToExponentBias(7) = 16, or result > max_finite(0x7E).
+        if (tbe >= 16 or result > 0x7E) result = 0x7F;
+
+        return (from_sign << 7) | result;
     }
 
     pub fn f32_to_fp8_e5m2(x: f32) u8 {
-        if (std.math.isNan(x)) return 0x7F;
+        // Matches ml_dtypes float8_e5m2 ConvertFrom<float> (non-saturating, round-to-nearest-even).
+        // E5M2: bias=15, infinity=0x7C, overflow maps to infinity.
+        const bits: u32 = @bitCast(x);
+        const from_sign: u8 = @truncate(bits >> 31);
+        const abs_bits: u32 = bits & 0x7FFF_FFFF;
 
-        const sign_bit: u8 = if (x < 0.0 or (x == 0.0 and std.math.signbit(x))) 0x80 else 0x00;
-        const abs_x = @abs(x);
+        // NaN → quiet NaN (0x7E for E5M2), with sign.
+        if (abs_bits > 0x7F80_0000) return (from_sign << 7) | 0x7E;
+        // Inf → ±Inf (0x7C), with sign.
+        if (abs_bits == 0x7F80_0000) return (from_sign << 7) | 0x7C;
+        // Zero
+        if (abs_bits == 0) return from_sign << 7;
 
-        if (std.math.isInf(abs_x)) return sign_bit | 0x7C;
-        if (abs_x > 57344.0) return sign_bit | 0x7B;
+        const from_biased_exp: u32 = abs_bits >> 23;
+        const from_fraction: u32 = abs_bits & 0x7F_FFFF;
 
-        if (abs_x == 0.0) return sign_bit;
+        var unbiased_exp: i32 = undefined;
+        var norm_mant: u32 = undefined;
 
-        const log2_val = std.math.log2(abs_x);
-        const e: i32 = @intFromFloat(@floor(log2_val));
-
-        if (e < -14) {
-            // Subnormal: encoded value = mant * 2^(-16)
-            const mant_f = abs_x * 65536.0;
-            const mant: u8 = @intFromFloat(@min(3.0, @max(0.0, @round(mant_f))));
-            return sign_bit | mant;
+        if (from_biased_exp != 0) {
+            unbiased_exp = @as(i32, @intCast(from_biased_exp)) - 127;
+            norm_mant = 0x80_0000 | from_fraction;
+        } else {
+            // Subnormal f32: normalize by shifting until implicit 1 is at bit 23.
+            const lz: i32 = @clz(from_fraction);
+            const frac_lz: i32 = lz - 9;
+            const norm_shift: i32 = frac_lz + 1;
+            norm_mant = from_fraction << @intCast(norm_shift);
+            unbiased_exp = (1 - 127) - norm_shift;
         }
 
-        // Normal: biased_exp in [1..30]; max e=15 (biased 30, max normal = 57344)
-        const e_clamped: i32 = @min(15, e);
-        const biased_exp: u8 = @intCast(e_clamped + 15);
-        const scale = std.math.pow(f32, 2.0, @as(f32, @floatFromInt(e_clamped)));
-        const mant_f = (abs_x / scale - 1.0) * 4.0;
-        const mant: u8 = @intFromFloat(@min(3.0, @max(0.0, @round(mant_f))));
-        return sign_bit | (biased_exp << 2) | mant;
+        // tbe = unbiased_exp + kToExponentBias - 1 = unbiased_exp + 14
+        const tbe: i32 = unbiased_exp + 14;
+
+        const denorm_adj: i32 = @max(0, -tbe);
+        const ashift: i32 = @min(21 + denorm_adj, 25);
+        const roundoff: u5 = @intCast(ashift);
+
+        // Round-to-nearest-even (ml_dtypes RoundBitsToNearestEven).
+        const bias: u32 = ((norm_mant >> roundoff) & 1) + (@as(u32, 1) << (roundoff - 1)) - 1;
+        const rounded: u32 = norm_mant + bias;
+        const aligned: u8 = @truncate(rounded >> roundoff);
+
+        const exp_bits: u8 = @intCast(@max(0, tbe));
+        var result: u8 = aligned +% (exp_bits << 2);
+
+        // Overflow: tbe >= max_exponent(16) + kToExponentBias(15) = 31, or result > max_finite(0x7B).
+        if (tbe >= 31 or result > 0x7B) result = 0x7C;
+
+        return (from_sign << 7) | result;
     }
 
     fn bf16_to_f32(x: u16) f32 {
@@ -548,131 +616,6 @@ test "transform f16 to q8_0" {
     // Compare the results
     try std.testing.expectEqual(expected_data.len, q8_0_data.len);
     try std.testing.expectEqualSlices(u8, expected_data, q8_0_data);
-}
-
-// ============================================================================
-// F8 conversion tests
-// ============================================================================
-
-test "F8_E4M3 scalar encode: exact values" {
-    // 1.0 → 0_0111_000 = 0x38
-    try std.testing.expectEqual(@as(u8, 0x38), Quantizer.f32_to_fp8_e4m3(1.0));
-    // -1.0 → 0xB8
-    try std.testing.expectEqual(@as(u8, 0xB8), Quantizer.f32_to_fp8_e4m3(-1.0));
-    // 2.0 → 0_1000_000 = 0x40
-    try std.testing.expectEqual(@as(u8, 0x40), Quantizer.f32_to_fp8_e4m3(2.0));
-    // 0.5 → 0_0110_000 = 0x30
-    try std.testing.expectEqual(@as(u8, 0x30), Quantizer.f32_to_fp8_e4m3(0.5));
-    // 0.0 → 0x00
-    try std.testing.expectEqual(@as(u8, 0x00), Quantizer.f32_to_fp8_e4m3(0.0));
-    // -0.0 → 0x80
-    try std.testing.expectEqual(@as(u8, 0x80), Quantizer.f32_to_fp8_e4m3(-0.0));
-    // NaN → 0x7F
-    try std.testing.expectEqual(@as(u8, 0x7F), Quantizer.f32_to_fp8_e4m3(std.math.nan(f32)));
-    // 448.0 (max) → 0x7E
-    try std.testing.expectEqual(@as(u8, 0x7E), Quantizer.f32_to_fp8_e4m3(448.0));
-    // Overflow → clamp to 0x7E
-    try std.testing.expectEqual(@as(u8, 0x7E), Quantizer.f32_to_fp8_e4m3(1e10));
-    // Negative overflow → 0xFE
-    try std.testing.expectEqual(@as(u8, 0xFE), Quantizer.f32_to_fp8_e4m3(-1e10));
-}
-
-test "F8_E5M2 scalar encode: exact values" {
-    // 1.0 → 0_01111_00 = 0x3C
-    try std.testing.expectEqual(@as(u8, 0x3C), Quantizer.f32_to_fp8_e5m2(1.0));
-    // -1.0 → 0xBC
-    try std.testing.expectEqual(@as(u8, 0xBC), Quantizer.f32_to_fp8_e5m2(-1.0));
-    // 2.0 → 0_10000_00 = 0x40
-    try std.testing.expectEqual(@as(u8, 0x40), Quantizer.f32_to_fp8_e5m2(2.0));
-    // 0.5 → 0_01110_00 = 0x38
-    try std.testing.expectEqual(@as(u8, 0x38), Quantizer.f32_to_fp8_e5m2(0.5));
-    // 0.0 → 0x00
-    try std.testing.expectEqual(@as(u8, 0x00), Quantizer.f32_to_fp8_e5m2(0.0));
-    // -0.0 → 0x80
-    try std.testing.expectEqual(@as(u8, 0x80), Quantizer.f32_to_fp8_e5m2(-0.0));
-    // +Inf → 0x7C
-    try std.testing.expectEqual(@as(u8, 0x7C), Quantizer.f32_to_fp8_e5m2(std.math.inf(f32)));
-    // -Inf → 0xFC
-    try std.testing.expectEqual(@as(u8, 0xFC), Quantizer.f32_to_fp8_e5m2(-std.math.inf(f32)));
-    // NaN → 0x7F
-    try std.testing.expectEqual(@as(u8, 0x7F), Quantizer.f32_to_fp8_e5m2(std.math.nan(f32)));
-    // 57344.0 (max normal) → 0x7B
-    try std.testing.expectEqual(@as(u8, 0x7B), Quantizer.f32_to_fp8_e5m2(57344.0));
-    // Overflow → 0x7B (max, not Inf)
-    try std.testing.expectEqual(@as(u8, 0x7B), Quantizer.f32_to_fp8_e5m2(1e10));
-}
-
-test "F8_E4M3 round-trip: exact representable values" {
-    const cases = [_]f32{ 1.0, -1.0, 2.0, 0.5, 0.25, 4.0, 0.125, -2.0, -0.5, 448.0, -448.0 };
-    for (cases) |v| {
-        const encoded = Quantizer.f32_to_fp8_e4m3(v);
-        const decoded = Quantizer.lut_e4m3[encoded];
-        try std.testing.expectApproxEqRel(v, decoded, 0.001);
-    }
-}
-
-test "F8_E5M2 round-trip: exact representable values" {
-    const cases = [_]f32{ 1.0, -1.0, 2.0, 0.5, 0.25, 4.0, 0.125, -2.0, -0.5, 57344.0 };
-    for (cases) |v| {
-        const encoded = Quantizer.f32_to_fp8_e5m2(v);
-        const decoded = Quantizer.lut_e5m2[encoded];
-        try std.testing.expectApproxEqRel(v, decoded, 0.001);
-    }
-}
-
-test "F8_E4M3 decode: LUT matches scalar function" {
-    for (0..256) |i| {
-        const b: u8 = @intCast(i);
-        const from_lut = Quantizer.lut_e4m3[b];
-        const from_fn = Quantizer.fp8_e4m3_to_f32(b);
-        if (std.math.isNan(from_fn)) {
-            try std.testing.expect(std.math.isNan(from_lut));
-        } else {
-            try std.testing.expectEqual(from_fn, from_lut);
-        }
-    }
-}
-
-test "F8_E5M2 decode: LUT matches scalar function" {
-    for (0..256) |i| {
-        const b: u8 = @intCast(i);
-        const from_lut = Quantizer.lut_e5m2[b];
-        const from_fn = Quantizer.fp8_e5m2_to_f32(b);
-        if (std.math.isNan(from_fn)) {
-            try std.testing.expect(std.math.isNan(from_lut));
-        } else {
-            try std.testing.expectEqual(from_fn, from_lut);
-        }
-    }
-}
-
-test "F8_E4M3 SIMD chunk matches scalar" {
-    // Build a varied input covering normals, subnormals, zero, large values
-    var input: [16]f32 = .{ 1.0, -1.0, 0.5, 2.0, 0.0, -0.0, 448.0, -448.0, 1e10, -1e10, 0.001, -0.001, 3.14, -2.71, 100.0, 0.0625 };
-    var scalar_out: [16]u8 = undefined;
-    for (input, 0..) |v, i| scalar_out[i] = Quantizer.f32_to_fp8_e4m3(v);
-
-    var simd_out: [16]u8 = undefined;
-    const chunk0: @Vector(8, f32) = input[0..8].*;
-    const chunk1: @Vector(8, f32) = input[8..16].*;
-    simd_out[0..8].* = @as([8]u8, Quantizer.f32_to_fp8_e4m3_chunk(chunk0));
-    simd_out[8..16].* = @as([8]u8, Quantizer.f32_to_fp8_e4m3_chunk(chunk1));
-
-    try std.testing.expectEqualSlices(u8, &scalar_out, &simd_out);
-}
-
-test "F8_E5M2 SIMD chunk matches scalar" {
-    var input: [16]f32 = .{ 1.0, -1.0, 0.5, 2.0, 0.0, -0.0, 57344.0, -57344.0, 1e10, -1e10, 0.001, -0.001, 3.14, -2.71, 100.0, 0.0625 };
-    var scalar_out: [16]u8 = undefined;
-    for (input, 0..) |v, i| scalar_out[i] = Quantizer.f32_to_fp8_e5m2(v);
-
-    var simd_out: [16]u8 = undefined;
-    const chunk0: @Vector(8, f32) = input[0..8].*;
-    const chunk1: @Vector(8, f32) = input[8..16].*;
-    simd_out[0..8].* = @as([8]u8, Quantizer.f32_to_fp8_e5m2_chunk(chunk0));
-    simd_out[8..16].* = @as([8]u8, Quantizer.f32_to_fp8_e5m2_chunk(chunk1));
-
-    try std.testing.expectEqualSlices(u8, &scalar_out, &simd_out);
 }
 
 // ============================================================================
@@ -844,6 +787,54 @@ test "F8_E5M2 decode: LUT matches ml_dtypes reference" {
         if (!both_nan and !both_inf and got != exp_val) {
             if (mismatches < 8) {
                 std.debug.print("  E5M2 LUT[0x{X:0>2}]: got={d:.6} expected={d:.6}\n", .{ i, got, exp_val });
+            }
+            mismatches += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), mismatches);
+}
+
+test "F8_E4M3FN scalar decode: matches ml_dtypes reference" {
+    const allocator = std.testing.allocator;
+
+    const expected_bytes = (try loadFixture(allocator, "fp8_e4m3fn_decode.f32")) orelse return error.SkipZigTest;
+    defer allocator.free(expected_bytes);
+
+    const expected: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(expected_bytes)));
+    try std.testing.expectEqual(@as(usize, 256), expected.len);
+
+    var mismatches: usize = 0;
+    for (expected, 0..) |exp_val, i| {
+        const got = Quantizer.fp8_e4m3_to_f32(@intCast(i));
+        const both_nan = std.math.isNan(exp_val) and std.math.isNan(got);
+        if (!both_nan and got != exp_val) {
+            if (mismatches < 8) {
+                std.debug.print("  E4M3FN scalar decode[0x{X:0>2}]: got={d:.6} expected={d:.6}\n", .{ i, got, exp_val });
+            }
+            mismatches += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), mismatches);
+}
+
+test "F8_E5M2 scalar decode: matches ml_dtypes reference" {
+    const allocator = std.testing.allocator;
+
+    const expected_bytes = (try loadFixture(allocator, "fp8_e5m2_decode.f32")) orelse return error.SkipZigTest;
+    defer allocator.free(expected_bytes);
+
+    const expected: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(expected_bytes)));
+    try std.testing.expectEqual(@as(usize, 256), expected.len);
+
+    var mismatches: usize = 0;
+    for (expected, 0..) |exp_val, i| {
+        const got = Quantizer.fp8_e5m2_to_f32(@intCast(i));
+        const both_nan = std.math.isNan(exp_val) and std.math.isNan(got);
+        const both_inf = std.math.isInf(exp_val) and std.math.isInf(got) and
+            std.math.signbit(exp_val) == std.math.signbit(got);
+        if (!both_nan and !both_inf and got != exp_val) {
+            if (mismatches < 8) {
+                std.debug.print("  E5M2 scalar decode[0x{X:0>2}]: got={d:.6} expected={d:.6}\n", .{ i, got, exp_val });
             }
             mismatches += 1;
         }

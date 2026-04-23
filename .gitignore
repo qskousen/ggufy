@@ -3,3 +3,5 @@
 zig-out
 # test-models directory for putting testing models
 test-models
+# Python virtual environment for generating comparison data
+venv
