@@ -114,6 +114,8 @@ pub fn main() !void {
             state.sensitivity_path = null;
             state.template_path = null;
             state.skip_sensitivity = false;
+            state.allow_unknown_arch = false;
+            state.arch_override_buf = std.mem.zeroes([64]u8);
             state.tool_status_len = 0;
             state.same_file_error = false;
             const thread = std.Thread.spawn(.{ .allocator = gpa }, fileHandling.loadFile, .{ gpa, arena_alloc, &state }) catch |err| {
@@ -540,6 +542,29 @@ fn showInputFile() void {
                     }
                 }
 
+                // Architecture name override — GGUF only
+                {
+                    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .all(2) });
+                    defer row.deinit();
+                    var lwd: dvui.WidgetData = undefined;
+                    dvui.label(@src(), "Architecture", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 120 }, .color_text = if (is_safetensors_out) dim_color else null, .data_out = &lwd });
+                    if (is_safetensors_out) {
+                        dvui.tooltip(@src(), .{ .active_rect = lwd.borderRectScale().r },
+                            "Architecture name is not stored in safetensors output.", .{}, .{});
+                    } else {
+                        dvui.tooltip(@src(), .{ .active_rect = lwd.borderRectScale().r },
+                            "Override the architecture name written to the GGUF metadata. Leave blank to use the auto-detected name. Does not affect conversion behaviour.", .{}, .{});
+                    }
+                    if (is_safetensors_out) {
+                        var dummy_buf = state.arch_override_buf;
+                        var te = dvui.textEntry(@src(), .{ .text = .{ .buffer = &dummy_buf } }, .{ .expand = .horizontal, .gravity_y = 0.5, .color_text = dim_color });
+                        te.deinit();
+                    } else {
+                        var te = dvui.textEntry(@src(), .{ .text = .{ .buffer = &state.arch_override_buf } }, .{ .expand = .horizontal, .gravity_y = 0.5 });
+                        te.deinit();
+                    }
+                }
+
                 // Skip sensitivity — shown when arch has built-in data; dimmed for safetensors output
                 if (has_sensitivities and state.sensitivity_path == null) {
                     var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .all(2) });
@@ -701,6 +726,24 @@ fn showInputFile() void {
             }
         }
 
+        // Unknown architecture warning + override checkbox
+        const arch_unknown = file.arch == null;
+        if (arch_unknown) {
+            var warn_box = dvui.box(@src(), .{}, .{
+                .expand = .horizontal,
+                .border = dvui.Rect.all(1),
+                .margin = .{ .x = 0, .y = 6, .w = 0, .h = 2 },
+                .padding = .all(6),
+                .color_border = dvui.Color{ .r = 200, .g = 140, .b = 0, .a = 255 },
+            });
+            defer warn_box.deinit();
+            dvui.label(@src(), "Warning: Architecture not recognized. Results may be suboptimal due to the unrecognized architecture.", .{}, .{
+                .color_text = dvui.Color{ .r = 200, .g = 140, .b = 0, .a = 255 },
+                .margin = .{ .x = 0, .y = 0, .w = 0, .h = 4 },
+            });
+            _ = dvui.checkbox(@src(), &state.allow_unknown_arch, "Convert anyway", .{});
+        }
+
         // Action buttons
         if (state.same_file_error) {
             dvui.label(@src(), "Output path cannot be the same as the input file.", .{}, .{
@@ -712,7 +755,10 @@ fn showInputFile() void {
             var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .{ .x = 0, .y = 10, .w = 0, .h = 4 } });
             defer row.deinit();
 
-            if (dvui.button(@src(), "Convert", .{}, .{ .gravity_y = 0.5 })) {
+            const convert_blocked = arch_unknown and !state.allow_unknown_arch;
+            if (convert_blocked) {
+                _ = dvui.button(@src(), "Convert", .{}, .{ .gravity_y = 0.5, .color_text = dim_color });
+            } else if (dvui.button(@src(), "Convert", .{}, .{ .gravity_y = 0.5 })) {
                 launchConversion(fa);
             }
 

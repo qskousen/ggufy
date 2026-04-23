@@ -397,6 +397,14 @@ pub const ArchError = error{
     OutOfMemory,
 };
 
+/// Fallback used when allow_unknown_arch is set and no architecture matches.
+/// Has no detection keys, no ignored keys, no shape fix, and no sensitivities.
+pub const generic_arch: Arch = .{
+    .name = "unknown",
+    .keys_detect = &.{},
+    .threshhold = null,
+};
+
 /// Strip prefixes from a tensor name (e.g. "model.diffusion_model.", etc.)
 pub fn stripPrefix(name: []const u8) []const u8 {
     // Prefixes for mixed state dict

@@ -36,6 +36,8 @@ pub fn main() !void {
         \\-s, --sensitivities <FILENAME> Path to a sensitivities JSON file to use (overrides built-in sensitivities) Sensitivities are only used for GGUF model output.
         \\-q, --use-quant-types <QTYPES> Quantization families to use with sensitivity (e.g. "k", "0,k", "0,1,k"). Default: match datatype.
         \\-m, --model-only               When output is safetensors, convert only the main model (UNet/transformer). Ignored for GGUF output.
+        \\-u, --allow-unknown-arch       Allow converting files with unrecognized architectures. Results may be suboptimal.
+        \\-A, --arch <NAME>              Set the architecture name written to the GGUF metadata (GGUF output only). Free-form; does not affect conversion behaviour.
         \\<COMMAND>    Specify a command: header, tree, metadata, convert, template
         \\<FILENAME>   The file to use for input
     );
@@ -48,6 +50,7 @@ pub fn main() !void {
         .DIR = clap.parsers.string,
         .INT = clap.parsers.int(usize, 10),
         .QTYPES = clap.parsers.string,
+        .NAME = clap.parsers.string,
     };
 
     // Initialize our diagnostics, which can be used for reporting useful errors.
@@ -108,6 +111,8 @@ pub fn main() !void {
     const sensitivities_path = res.args.sensitivities;
 
     const model_only = res.args.@"model-only" != 0;
+    const allow_unknown_arch = res.args.@"allow-unknown-arch" != 0;
+    const arch_override = res.args.arch;
 
     const allowed_quant_families: ?conv.QuantizationFamilies = if (res.args.@"use-quant-types") |s|
         conv.QuantizationFamilies.parse(s) catch {
@@ -144,7 +149,7 @@ pub fn main() !void {
                     try f.printMetadata(stdout);
                 },
                 .convert => {
-                    try conv.convert(&f, .{
+                    conv.convert(&f, .{
                         .path = path,
                         .filetype = filetype,
                         .datatype = datatype,
@@ -157,7 +162,15 @@ pub fn main() !void {
                         .sensitivities_path = sensitivities_path,
                         .allowed_quant_families = allowed_quant_families,
                         .model_only = model_only,
-                    }, allocator, arena_alloc);
+                        .allow_unknown_arch = allow_unknown_arch,
+                        .arch_override = arch_override,
+                    }, allocator, arena_alloc) catch |err| {
+                        if (err == error.UnknownArchitecture) {
+                            std.log.err("Architecture not recognized. Pass --allow-unknown-arch (-u) to convert anyway. Results may be suboptimal.", .{});
+                            return;
+                        }
+                        return err;
+                    };
                 },
                 .template => {
                     const out_path = if (output_name) |n|

@@ -40,6 +40,10 @@ pub const State = struct {
     target_aggressiveness: u8 = 50,
     skip_sensitivity: bool = false,
     model_only: bool = false,
+    allow_unknown_arch: bool = false,
+    /// Free-form architecture name to write as `general.architecture` in GGUF output.
+    /// Null-terminated; empty string means "use auto-detected name".
+    arch_override_buf: [64]u8 = std.mem.zeroes([64]u8),
     sensitivity_path_buf: [std.fs.max_path_bytes]u8 = std.mem.zeroes([std.fs.max_path_bytes]u8),
     sensitivity_path: ?[]u8 = null,
     template_path_buf: [std.fs.max_path_bytes]u8 = std.mem.zeroes([std.fs.max_path_bytes]u8),
@@ -101,6 +105,11 @@ pub const State = struct {
     // Helpers
     pub fn targetFolder(self: *const State) []const u8 {
         return std.mem.sliceTo(&self.target_folder_buf, 0);
+    }
+
+    pub fn archOverride(self: *const State) ?[]const u8 {
+        const s = std.mem.sliceTo(&self.arch_override_buf, 0);
+        return if (s.len > 0) s else null;
     }
 
     pub fn targetFilename(self: *const State) []const u8 {

@@ -32,6 +32,13 @@ pub const ConvertOptions = struct {
     /// When true and output is safetensors, only include the main model tensors
     /// (same filtering as GGUF output) and strip name prefixes. Ignored for GGUF output.
     model_only: bool = false,
+    /// When true, allow conversion even if the architecture is not recognized.
+    /// Results may be suboptimal. Defaults to false.
+    allow_unknown_arch: bool = false,
+    /// When set, write this string as the `general.architecture` metadata value
+    /// in the GGUF output instead of the auto-detected name. Free-form; does
+    /// not affect conversion behaviour. Ignored for safetensors output.
+    arch_override: ?[]const u8 = null,
     /// Optional GUI progress/cancel hooks.  No-ops when null.
     callbacks: cb.ConvertCallbacks = .{},
 };
@@ -123,7 +130,18 @@ pub fn convert(
     arena_alloc: std.mem.Allocator,
 ) !void {
     // --- Detect architecture --------------------------------------------------
-    const arch = try imagearch.detectArchFromTensorsOrError(f.tensors.items, allocator);
+    const arch = blk: {
+        const result = imagearch.detectArchFromTensorsOrError(f.tensors.items, allocator);
+        if (result) |a| {
+            break :blk a;
+        } else |err| {
+            if (err == error.UnknownArchitecture and opts.allow_unknown_arch) {
+                std.log.warn("Unknown architecture; proceeding anyway. Results may be suboptimal.", .{});
+                break :blk &imagearch.generic_arch;
+            }
+            return err;
+        }
+    };
     const threshold = arch.threshhold orelse QUANTIZATION_THRESHOLD;
     std.log.info("Detected architecture: {s}", .{arch.name});
 
@@ -715,7 +733,8 @@ fn writeGguf(
     out_gguf.tensors = model_tensors;
 
     // Standard metadata.
-    try out_gguf.metadata.put(try arena_alloc.dupe(u8, "general.architecture"), .{ .string = arch.name });
+    const arch_name = opts.arch_override orelse arch.name;
+    try out_gguf.metadata.put(try arena_alloc.dupe(u8, "general.architecture"), .{ .string = arch_name });
     try out_gguf.metadata.put(try arena_alloc.dupe(u8, "general.quantization_version"), .{ .integer = 2 });
     // TODO: determine from the target dtype.
     try out_gguf.metadata.put(try arena_alloc.dupe(u8, "general.file_type"), .{ .integer = 7 });
