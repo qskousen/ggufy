@@ -134,4 +134,17 @@ pub fn build(b: *std.Build) void {
     });
     ggml.link(b, arch_detect_test, target, optimize);
     test_step.dependOn(&b.addRunArtifact(arch_detect_test).step);
+
+    const data_transform_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/DataTransform.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ggml.h", .module = ggml_h_module },
+            },
+        }),
+    });
+    ggml.link(b, data_transform_test, target, optimize);
+    test_step.dependOn(&b.addRunArtifact(data_transform_test).step);
 }
