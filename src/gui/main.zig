@@ -32,6 +32,7 @@ const gguf_target_types = [_]ggufy.types.DataType{
     .q5_0, .q5_1, .q5_k,
     .q6_k,
     .q8_0,
+    .F4_E2M1, .FP4, .MXFP4,
 };
 
 const gguf_type_names = blk: {
@@ -42,7 +43,7 @@ const gguf_type_names = blk: {
 
 // Safetensors output types that we can convert
 const st_target_types = [_]ggufy.types.DataType{
-    .F32, .F16, .BF16, .F8_E4M3, .F8_E5M2,
+    .F32, .F16, .BF16, .F8_E4M3, .F8_E5M2, .F4_E2M1, .FP4, .MXFP4,
 };
 
 const st_type_names = blk: {

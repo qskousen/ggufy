@@ -1,0 +1,673 @@
+const std = @import("std");
+const types = @import("types.zig");
+const st = @import("Safetensor.zig");
+const DataTransform = @import("DataTransform.zig");
+
+pub const ComfyQuantScheme = enum { nvfp4, float8_e4m3fn, mxfp4, mxfp8_e4m3fn, unknown };
+
+pub const Fp4Cluster = struct {
+    base_name: []const u8,
+    weight: types.Tensor,
+    weight_scale: types.Tensor,
+    weight_scale_2: types.Tensor,
+    comfy_quant: types.Tensor,
+    rows: usize,
+    cols: usize,
+};
+
+pub const Float8Cluster = struct {
+    base_name: []const u8,
+    weight: types.Tensor,
+    weight_scale: types.Tensor,
+    comfy_quant: types.Tensor,
+    rows: usize,
+    cols: usize,
+};
+
+/// MXFP4 cluster (OCP MX spec): E2M1 packed nibbles + E8M0 per-block scale, block size 32.
+/// Scale layout is linear row-major, distinct from NVFP4's cuBLAS-tiled layout.
+pub const Mxfp4Cluster = struct {
+    base_name: []const u8,
+    weight: types.Tensor,        // U8 packed nibbles, [rows, cols/2]
+    weight_scale: types.Tensor,  // U8 E8M0, [rows, cols/32]
+    comfy_quant: types.Tensor,
+    rows: usize,
+    cols: usize,
+};
+
+/// MXFP8 cluster (OCP MX spec): E4M3 elements + E8M0 per-block scale, block size 32.
+pub const Mxfp8Cluster = struct {
+    base_name: []const u8,
+    weight: types.Tensor,        // F8_E4M3, [rows, cols]
+    weight_scale: types.Tensor,  // U8 E8M0, [rows, cols/32]
+    comfy_quant: types.Tensor,
+    rows: usize,
+    cols: usize,
+};
+
+pub const GroupResult = struct {
+    fp4_clusters: []Fp4Cluster,
+    float8_clusters: []Float8Cluster,
+    mxfp4_clusters: []Mxfp4Cluster,
+    mxfp8_clusters: []Mxfp8Cluster,
+};
+
+/// Parse the JSON payload of a comfy_quant blob to identify the quantization scheme.
+pub fn parseComfyQuantScheme(data: []const u8) ComfyQuantScheme {
+    if (std.mem.indexOf(u8, data, "nvfp4") != null) return .nvfp4;
+    // Check mxfp8 before mxfp4 and before float8_e4m3fn to avoid false matches.
+    if (std.mem.indexOf(u8, data, "mxfp8") != null) return .mxfp8_e4m3fn;
+    if (std.mem.indexOf(u8, data, "mxfp4") != null) return .mxfp4;
+    if (std.mem.indexOf(u8, data, "float8_e4m3fn") != null) return .float8_e4m3fn;
+    return .unknown;
+}
+
+/// Returns true if `stripped` matches `full_name` exactly or as a dot-separated suffix.
+fn nameSuffixMatch(full_name: []const u8, stripped: []const u8) bool {
+    if (std.mem.eql(u8, full_name, stripped)) return true;
+    return full_name.len > stripped.len and
+        full_name[full_name.len - stripped.len - 1] == '.' and
+        std.mem.endsWith(u8, full_name, stripped);
+}
+
+/// Scan source tensors and group them into NVFP4 and FP8 clusters via comfy_quant markers.
+/// Result slices are arena-allocated; `allocator` is used for temporary work only.
+pub fn groupClusters(
+    source: *st,
+    arena_alloc: std.mem.Allocator,
+    allocator: std.mem.Allocator,
+) !GroupResult {
+    var name_map = std.StringHashMap(usize).init(allocator);
+    defer name_map.deinit();
+    for (source.tensors.items, 0..) |t, i| try name_map.put(t.name, i);
+
+    var fp4_list: std.ArrayList(Fp4Cluster) = .{};
+    var float8_list: std.ArrayList(Float8Cluster) = .{};
+    var mxfp4_list: std.ArrayList(Mxfp4Cluster) = .{};
+    var mxfp8_list: std.ArrayList(Mxfp8Cluster) = .{};
+
+    const comfy_suffix = ".comfy_quant";
+    var read_buf: [256]u8 = undefined;
+
+    for (source.tensors.items) |t| {
+        if (!std.mem.endsWith(u8, t.name, comfy_suffix)) continue;
+
+        var reader = try source.getReaderForTensor(t.name, &read_buf);
+        try reader.seekTo(t.offset + source.current_data_begin);
+        const data = try (&reader.interface).readAlloc(allocator, t.size);
+        defer allocator.free(data);
+
+        const scheme = parseComfyQuantScheme(data);
+        const base_name = t.name[0 .. t.name.len - comfy_suffix.len];
+
+        switch (scheme) {
+            .nvfp4 => {
+                const wname = try std.fmt.allocPrint(allocator, "{s}.weight", .{base_name});
+                defer allocator.free(wname);
+                const wsname = try std.fmt.allocPrint(allocator, "{s}.weight_scale", .{base_name});
+                defer allocator.free(wsname);
+                const ws2name = try std.fmt.allocPrint(allocator, "{s}.weight_scale_2", .{base_name});
+                defer allocator.free(ws2name);
+
+                const wi = name_map.get(wname) orelse {
+                    std.log.warn("ScaledQuant: missing .weight for cluster {s}", .{base_name});
+                    continue;
+                };
+                const wsi = name_map.get(wsname) orelse {
+                    std.log.warn("ScaledQuant: missing .weight_scale for cluster {s}", .{base_name});
+                    continue;
+                };
+                const ws2i = name_map.get(ws2name) orelse {
+                    std.log.warn("ScaledQuant: missing .weight_scale_2 for cluster {s}", .{base_name});
+                    continue;
+                };
+
+                const weight = source.tensors.items[wi];
+                const weight_scale = source.tensors.items[wsi];
+                const weight_scale_2 = source.tensors.items[ws2i];
+
+                try fp4_list.append(arena_alloc, .{
+                    .base_name = base_name,
+                    .weight = weight,
+                    .weight_scale = weight_scale,
+                    .weight_scale_2 = weight_scale_2,
+                    .comfy_quant = t,
+                    .rows = weight.dims[0],
+                    .cols = weight.dims[1] * 2,
+                });
+                std.log.debug("ScaledQuant: grouped nvfp4 cluster {s} [{}, {}]", .{
+                    base_name, weight.dims[0], weight.dims[1] * 2,
+                });
+            },
+            .float8_e4m3fn => {
+                const wname = try std.fmt.allocPrint(allocator, "{s}.weight", .{base_name});
+                defer allocator.free(wname);
+                const wsname = try std.fmt.allocPrint(allocator, "{s}.weight_scale", .{base_name});
+                defer allocator.free(wsname);
+
+                const wi = name_map.get(wname) orelse {
+                    std.log.warn("ScaledQuant: missing .weight for fp8 cluster {s}", .{base_name});
+                    continue;
+                };
+                const wsi = name_map.get(wsname) orelse {
+                    std.log.warn("ScaledQuant: missing .weight_scale for fp8 cluster {s}", .{base_name});
+                    continue;
+                };
+
+                const weight = source.tensors.items[wi];
+                const weight_scale = source.tensors.items[wsi];
+
+                try float8_list.append(arena_alloc, .{
+                    .base_name = base_name,
+                    .weight = weight,
+                    .weight_scale = weight_scale,
+                    .comfy_quant = t,
+                    .rows = weight.dims[0],
+                    .cols = weight.dims[1],
+                });
+                std.log.debug("ScaledQuant: grouped fp8 cluster {s} [{}, {}]", .{
+                    base_name, weight.dims[0], weight.dims[1],
+                });
+            },
+            .mxfp4 => {
+                const wname = try std.fmt.allocPrint(allocator, "{s}.weight", .{base_name});
+                defer allocator.free(wname);
+                const wsname = try std.fmt.allocPrint(allocator, "{s}.weight_scale", .{base_name});
+                defer allocator.free(wsname);
+
+                const wi = name_map.get(wname) orelse {
+                    std.log.warn("ScaledQuant: missing .weight for mxfp4 cluster {s}", .{base_name});
+                    continue;
+                };
+                const wsi = name_map.get(wsname) orelse {
+                    std.log.warn("ScaledQuant: missing .weight_scale for mxfp4 cluster {s}", .{base_name});
+                    continue;
+                };
+
+                const weight = source.tensors.items[wi];
+                const weight_scale = source.tensors.items[wsi];
+
+                try mxfp4_list.append(arena_alloc, .{
+                    .base_name = base_name,
+                    .weight = weight,
+                    .weight_scale = weight_scale,
+                    .comfy_quant = t,
+                    .rows = weight.dims[0],
+                    .cols = weight.dims[1] * 2,
+                });
+                std.log.debug("ScaledQuant: grouped mxfp4 cluster {s} [{}, {}]", .{
+                    base_name, weight.dims[0], weight.dims[1] * 2,
+                });
+            },
+            .mxfp8_e4m3fn => {
+                const wname = try std.fmt.allocPrint(allocator, "{s}.weight", .{base_name});
+                defer allocator.free(wname);
+                const wsname = try std.fmt.allocPrint(allocator, "{s}.weight_scale", .{base_name});
+                defer allocator.free(wsname);
+
+                const wi = name_map.get(wname) orelse {
+                    std.log.warn("ScaledQuant: missing .weight for mxfp8 cluster {s}", .{base_name});
+                    continue;
+                };
+                const wsi = name_map.get(wsname) orelse {
+                    std.log.warn("ScaledQuant: missing .weight_scale for mxfp8 cluster {s}", .{base_name});
+                    continue;
+                };
+
+                const weight = source.tensors.items[wi];
+                const weight_scale = source.tensors.items[wsi];
+
+                try mxfp8_list.append(arena_alloc, .{
+                    .base_name = base_name,
+                    .weight = weight,
+                    .weight_scale = weight_scale,
+                    .comfy_quant = t,
+                    .rows = weight.dims[0],
+                    .cols = weight.dims[1],
+                });
+                std.log.debug("ScaledQuant: grouped mxfp8 cluster {s} [{}, {}]", .{
+                    base_name, weight.dims[0], weight.dims[1],
+                });
+            },
+            .unknown => {},
+        }
+    }
+
+    std.log.info("ScaledQuant: found {} nvfp4, {} fp8, {} mxfp4, {} mxfp8 clusters", .{
+        fp4_list.items.len, float8_list.items.len, mxfp4_list.items.len, mxfp8_list.items.len,
+    });
+
+    return GroupResult{
+        .fp4_clusters = fp4_list.items,
+        .float8_clusters = float8_list.items,
+        .mxfp4_clusters = mxfp4_list.items,
+        .mxfp8_clusters = mxfp8_list.items,
+    };
+}
+
+/// Dequantize an NVFP4 cluster to a flat F32 slice of [rows * cols] elements.
+/// Caller owns the returned slice.
+pub fn dequantizeFp4Cluster(
+    cluster: Fp4Cluster,
+    source: *st,
+    allocator: std.mem.Allocator,
+) ![]f32 {
+    if (cluster.cols % 64 != 0) return error.InvalidClusterShape;
+
+    var read_buf: [4096]u8 = undefined;
+
+    var w_reader = try source.getReaderForTensor(cluster.weight.name, &read_buf);
+    try w_reader.seekTo(cluster.weight.offset + source.current_data_begin);
+    const weight_bytes = try (&w_reader.interface).readAlloc(allocator, cluster.weight.size);
+    defer allocator.free(weight_bytes);
+
+    var ws_reader = try source.getReaderForTensor(cluster.weight_scale.name, &read_buf);
+    try ws_reader.seekTo(cluster.weight_scale.offset + source.current_data_begin);
+    const scale_bytes = try (&ws_reader.interface).readAlloc(allocator, cluster.weight_scale.size);
+    defer allocator.free(scale_bytes);
+
+    var ws2_reader = try source.getReaderForTensor(cluster.weight_scale_2.name, &read_buf);
+    try ws2_reader.seekTo(cluster.weight_scale_2.offset + source.current_data_begin);
+    const gs_buf = try (&ws2_reader.interface).readAlloc(allocator, 4);
+    defer allocator.free(gs_buf);
+    const global_scale: f32 = @bitCast(std.mem.readInt(u32, gs_buf[0..4], .little));
+
+    const rows = cluster.rows;
+    const cols = cluster.cols;
+    const out = try allocator.alloc(f32, rows * cols);
+    errdefer allocator.free(out);
+
+    const num_scale_cols = cols / 16;
+    const n_col_blocks = (num_scale_cols + 3) / 4;
+
+    for (0..rows) |row| {
+        for (0..cols) |col| {
+            const byte_idx = row * (cols / 2) + col / 2;
+            // Even-indexed elements are packed in the HIGH nibble, odd in the LOW nibble.
+            const nibble: u4 = if (col % 2 == 0)
+                @intCast(weight_bytes[byte_idx] >> 4)
+            else
+                @intCast(weight_bytes[byte_idx] & 0xF);
+
+            const fp4_val = DataTransform.Quantizer.lut_fp4_e2m1[nibble];
+
+            // cuBLAS tiled block-scale layout (mirrors to_blocked() in the Python reference).
+            const scale_col = col / 16;
+            const r0 = row / 128;
+            const r1 = row % 128;
+            const c0 = scale_col / 4;
+            const c1 = scale_col % 4;
+            const scale_idx = (r0 * n_col_blocks + c0) * 512 + (r1 % 32) * 16 + (r1 / 32) * 4 + c1;
+
+            const block_scale = DataTransform.Quantizer.lut_e4m3[scale_bytes[scale_idx]];
+            out[row * cols + col] = fp4_val * block_scale * global_scale;
+        }
+    }
+
+    return out;
+}
+
+/// Dequantize an FP8 (ComfyUI) cluster to F32: f8_weight × scalar_scale.
+/// Caller owns the returned slice.
+pub fn dequantizeFloat8Cluster(
+    cluster: Float8Cluster,
+    source: *st,
+    allocator: std.mem.Allocator,
+) ![]f32 {
+    var read_buf: [4096]u8 = undefined;
+
+    var w_reader = try source.getReaderForTensor(cluster.weight.name, &read_buf);
+    try w_reader.seekTo(cluster.weight.offset + source.current_data_begin);
+    const weight_bytes = try (&w_reader.interface).readAlloc(allocator, cluster.weight.size);
+    defer allocator.free(weight_bytes);
+
+    var ws_reader = try source.getReaderForTensor(cluster.weight_scale.name, &read_buf);
+    try ws_reader.seekTo(cluster.weight_scale.offset + source.current_data_begin);
+    const scale_buf = try (&ws_reader.interface).readAlloc(allocator, cluster.weight_scale.size);
+    defer allocator.free(scale_buf);
+    const scalar_scale: f32 = @bitCast(std.mem.readInt(u32, scale_buf[0..4], .little));
+
+    const out = try allocator.alloc(f32, weight_bytes.len);
+    errdefer allocator.free(out);
+
+    for (weight_bytes, 0..) |byte, i| {
+        out[i] = DataTransform.Quantizer.lut_e4m3[byte] * scalar_scale;
+    }
+
+    return out;
+}
+
+/// Dequantize an MXFP4 (OCP MX) cluster to F32.
+/// Scale layout is linear row-major; block size is 32. Nibble packing follows OCP:
+/// element[2i] in the low nibble, element[2i+1] in the high nibble.
+/// Caller owns the returned slice.
+pub fn dequantizeMxfp4Cluster(
+    cluster: Mxfp4Cluster,
+    source: *st,
+    allocator: std.mem.Allocator,
+) ![]f32 {
+    if (cluster.cols % 32 != 0) return error.InvalidClusterShape;
+
+    var read_buf: [4096]u8 = undefined;
+
+    var w_reader = try source.getReaderForTensor(cluster.weight.name, &read_buf);
+    try w_reader.seekTo(cluster.weight.offset + source.current_data_begin);
+    const weight_bytes = try (&w_reader.interface).readAlloc(allocator, cluster.weight.size);
+    defer allocator.free(weight_bytes);
+
+    var ws_reader = try source.getReaderForTensor(cluster.weight_scale.name, &read_buf);
+    try ws_reader.seekTo(cluster.weight_scale.offset + source.current_data_begin);
+    const scale_bytes = try (&ws_reader.interface).readAlloc(allocator, cluster.weight_scale.size);
+    defer allocator.free(scale_bytes);
+
+    const rows = cluster.rows;
+    const cols = cluster.cols;
+    const num_scale_cols = cols / 32;
+    const out = try allocator.alloc(f32, rows * cols);
+    errdefer allocator.free(out);
+
+    for (0..rows) |row| {
+        for (0..cols) |col| {
+            const byte_idx = row * (cols / 2) + col / 2;
+            const nibble: u4 = if (col % 2 == 0)
+                @intCast(weight_bytes[byte_idx] & 0xF)
+            else
+                @intCast(weight_bytes[byte_idx] >> 4);
+            const scale_idx = row * num_scale_cols + col / 32;
+            const scale = DataTransform.Quantizer.e8m0_to_f32(scale_bytes[scale_idx]);
+            out[row * cols + col] = DataTransform.Quantizer.lut_fp4_e2m1[nibble] * scale;
+        }
+    }
+
+    return out;
+}
+
+/// Dequantize an MXFP8 E4M3 (OCP MX) cluster to F32.
+/// Scale layout is linear row-major; block size is 32.
+/// Caller owns the returned slice.
+pub fn dequantizeMxfp8Cluster(
+    cluster: Mxfp8Cluster,
+    source: *st,
+    allocator: std.mem.Allocator,
+) ![]f32 {
+    if (cluster.cols % 32 != 0) return error.InvalidClusterShape;
+
+    var read_buf: [4096]u8 = undefined;
+
+    var w_reader = try source.getReaderForTensor(cluster.weight.name, &read_buf);
+    try w_reader.seekTo(cluster.weight.offset + source.current_data_begin);
+    const weight_bytes = try (&w_reader.interface).readAlloc(allocator, cluster.weight.size);
+    defer allocator.free(weight_bytes);
+
+    var ws_reader = try source.getReaderForTensor(cluster.weight_scale.name, &read_buf);
+    try ws_reader.seekTo(cluster.weight_scale.offset + source.current_data_begin);
+    const scale_bytes = try (&ws_reader.interface).readAlloc(allocator, cluster.weight_scale.size);
+    defer allocator.free(scale_bytes);
+
+    const rows = cluster.rows;
+    const cols = cluster.cols;
+    const num_scale_cols = cols / 32;
+    const out = try allocator.alloc(f32, rows * cols);
+    errdefer allocator.free(out);
+
+    for (weight_bytes, 0..) |byte, flat_idx| {
+        const row = flat_idx / cols;
+        const col = flat_idx % cols;
+        const scale_idx = row * num_scale_cols + col / 32;
+        const scale = DataTransform.Quantizer.e8m0_to_f32(scale_bytes[scale_idx]);
+        out[flat_idx] = DataTransform.Quantizer.lut_e4m3[byte] * scale;
+    }
+
+    return out;
+}
+
+/// Check whether `dest_tensor` belongs to any cluster in `groups`.
+/// If so, dequantize it and return the F32 buffer. Returns null if not cluster-sourced.
+/// Caller owns the returned slice.
+pub fn tryDequantCluster(
+    dest_tensor: types.Tensor,
+    source: *st,
+    groups: *const GroupResult,
+    allocator: std.mem.Allocator,
+    pool: *std.Thread.Pool,
+) !?[]f32 {
+    _ = pool;
+
+    for (groups.fp4_clusters) |cluster| {
+        if (nameSuffixMatch(cluster.weight.name, dest_tensor.name)) {
+            return try dequantizeFp4Cluster(cluster, source, allocator);
+        }
+    }
+    for (groups.float8_clusters) |cluster| {
+        if (nameSuffixMatch(cluster.weight.name, dest_tensor.name)) {
+            return try dequantizeFloat8Cluster(cluster, source, allocator);
+        }
+    }
+    for (groups.mxfp4_clusters) |cluster| {
+        if (nameSuffixMatch(cluster.weight.name, dest_tensor.name)) {
+            return try dequantizeMxfp4Cluster(cluster, source, allocator);
+        }
+    }
+    for (groups.mxfp8_clusters) |cluster| {
+        if (nameSuffixMatch(cluster.weight.name, dest_tensor.name)) {
+            return try dequantizeMxfp8Cluster(cluster, source, allocator);
+        }
+    }
+    return null;
+}
+
+/// Replace cluster physical tensors in `model_tensors` with single logical BF16 tensors.
+/// Companion tensors (weight_scale, weight_scale_2, comfy_quant) are removed from the list.
+pub fn collapseModelTensors(
+    model_tensors: *std.ArrayList(types.Tensor),
+    groups: *const GroupResult,
+    arena_alloc: std.mem.Allocator,
+) !void {
+    if (groups.fp4_clusters.len == 0 and groups.float8_clusters.len == 0 and
+        groups.mxfp4_clusters.len == 0 and groups.mxfp8_clusters.len == 0) return;
+
+    var new_tensors: std.ArrayList(types.Tensor) = .{};
+
+    for (model_tensors.items) |t| {
+        var handled = false;
+
+        for (groups.fp4_clusters) |cluster| {
+            if (nameSuffixMatch(cluster.weight.name, t.name)) {
+                var new_t = t;
+                new_t.dims = try arena_alloc.dupe(usize, &[_]usize{ cluster.rows, cluster.cols });
+                new_t.type = "BF16";
+                new_t.size = cluster.rows * cluster.cols * 2;
+                try new_tensors.append(arena_alloc, new_t);
+                handled = true;
+                break;
+            }
+            if (nameSuffixMatch(cluster.weight_scale.name, t.name) or
+                nameSuffixMatch(cluster.weight_scale_2.name, t.name) or
+                nameSuffixMatch(cluster.comfy_quant.name, t.name))
+            {
+                handled = true; // drop companion tensor
+                break;
+            }
+        }
+
+        if (!handled) {
+            for (groups.float8_clusters) |cluster| {
+                if (nameSuffixMatch(cluster.weight.name, t.name)) {
+                    var new_t = t;
+                    new_t.type = "BF16";
+                    var n: usize = 1;
+                    for (t.dims) |d| n *= d;
+                    new_t.size = n * 2;
+                    try new_tensors.append(arena_alloc, new_t);
+                    handled = true;
+                    break;
+                }
+                if (nameSuffixMatch(cluster.weight_scale.name, t.name) or
+                    nameSuffixMatch(cluster.comfy_quant.name, t.name))
+                {
+                    handled = true;
+                    break;
+                }
+            }
+        }
+
+        if (!handled) {
+            for (groups.mxfp4_clusters) |cluster| {
+                if (nameSuffixMatch(cluster.weight.name, t.name)) {
+                    var new_t = t;
+                    new_t.dims = try arena_alloc.dupe(usize, &[_]usize{ cluster.rows, cluster.cols });
+                    new_t.type = "BF16";
+                    new_t.size = cluster.rows * cluster.cols * 2;
+                    try new_tensors.append(arena_alloc, new_t);
+                    handled = true;
+                    break;
+                }
+                if (nameSuffixMatch(cluster.weight_scale.name, t.name) or
+                    nameSuffixMatch(cluster.comfy_quant.name, t.name))
+                {
+                    handled = true;
+                    break;
+                }
+            }
+        }
+
+        if (!handled) {
+            for (groups.mxfp8_clusters) |cluster| {
+                if (nameSuffixMatch(cluster.weight.name, t.name)) {
+                    var new_t = t;
+                    new_t.type = "BF16";
+                    var n: usize = 1;
+                    for (t.dims) |d| n *= d;
+                    new_t.size = n * 2;
+                    try new_tensors.append(arena_alloc, new_t);
+                    handled = true;
+                    break;
+                }
+                if (nameSuffixMatch(cluster.weight_scale.name, t.name) or
+                    nameSuffixMatch(cluster.comfy_quant.name, t.name))
+                {
+                    handled = true;
+                    break;
+                }
+            }
+        }
+
+        if (!handled) try new_tensors.append(arena_alloc, t);
+    }
+
+    model_tensors.* = new_tensors;
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+const testing = std.testing;
+
+test "parseComfyQuantScheme: identifies all known formats" {
+    try testing.expectEqual(.nvfp4,        parseComfyQuantScheme("{\"format\": \"nvfp4\"}"));
+    try testing.expectEqual(.float8_e4m3fn, parseComfyQuantScheme("{\"format\": \"float8_e4m3fn\"}"));
+    try testing.expectEqual(.mxfp4,        parseComfyQuantScheme("{\"format\": \"mxfp4\"}"));
+    try testing.expectEqual(.mxfp8_e4m3fn, parseComfyQuantScheme("{\"format\": \"mxfp8_e4m3fn\"}"));
+    try testing.expectEqual(.mxfp8_e4m3fn, parseComfyQuantScheme("{\"format\": \"mxfp8\"}"));
+    try testing.expectEqual(.unknown,      parseComfyQuantScheme("{\"format\": \"bf16\"}"));
+    try testing.expectEqual(.unknown,      parseComfyQuantScheme("{}"));
+}
+
+test "parseComfyQuantScheme: mxfp8 takes priority over float8_e4m3fn" {
+    // A blob that mentions both strings — mxfp8 wins because it's checked first.
+    try testing.expectEqual(
+        .mxfp8_e4m3fn,
+        parseComfyQuantScheme("{\"format\": \"mxfp8_e4m3fn\", \"note\": \"uses float8_e4m3fn elements\"}"),
+    );
+}
+
+test "parseComfyQuantScheme: nvfp4 not confused with mxfp4" {
+    try testing.expectEqual(.nvfp4, parseComfyQuantScheme("{\"format\": \"nvfp4\"}"));
+    try testing.expectEqual(.mxfp4, parseComfyQuantScheme("{\"format\": \"mxfp4\"}"));
+}
+
+test "NVFP4 cuBLAS tiled block index: spot-checks" {
+    // This matches the formula in dequantizeFp4Cluster.
+    // Parameters: cols=256 → num_scale_cols=16, n_col_blocks=(16+3)/4=4
+    const cols: usize = 256;
+    const num_scale_cols: usize = cols / 16;
+    const n_col_blocks: usize = (num_scale_cols + 3) / 4;
+    try testing.expectEqual(@as(usize, 4), n_col_blocks);
+
+    const blockIdx = struct {
+        fn f(row: usize, col: usize, ncb: usize) usize {
+            const scale_col = col / 16;
+            const r0 = row / 128;
+            const r1 = row % 128;
+            const c0 = scale_col / 4;
+            const c1 = scale_col % 4;
+            return (r0 * ncb + c0) * 512 + (r1 % 32) * 16 + (r1 / 32) * 4 + c1;
+        }
+    }.f;
+
+    // Row 0, first 4 scale columns are consecutive bytes 0-3
+    try testing.expectEqual(@as(usize, 0), blockIdx(0,   0, n_col_blocks)); // scale_col=0, c0=0, c1=0
+    try testing.expectEqual(@as(usize, 1), blockIdx(0,  16, n_col_blocks)); // scale_col=1, c0=0, c1=1
+    try testing.expectEqual(@as(usize, 2), blockIdx(0,  32, n_col_blocks)); // scale_col=2, c0=0, c1=2
+    try testing.expectEqual(@as(usize, 3), blockIdx(0,  48, n_col_blocks)); // scale_col=3, c0=0, c1=3
+    // scale_col=4 starts the next 4-column group (c0=1)
+    try testing.expectEqual(@as(usize, 512), blockIdx(0, 64, n_col_blocks)); // (0*4+1)*512+0
+    // Row 1: (r1%32)*16 = 16
+    try testing.expectEqual(@as(usize, 16), blockIdx(1,  0, n_col_blocks));
+    // Row 128: r0=1, r1=0 → (1*4+0)*512 = 2048
+    try testing.expectEqual(@as(usize, 2048), blockIdx(128, 0, n_col_blocks));
+    // Row 32: r1=32, (r1%32)*16=0, (r1/32)*4=4 → index=4
+    try testing.expectEqual(@as(usize, 4), blockIdx(32, 0, n_col_blocks));
+}
+
+test "MXFP4/MXFP8 linear block scale index" {
+    // Linear layout: scale_idx = row * (cols/32) + col/32
+    const cols: usize = 128;
+    const num_scale_cols: usize = cols / 32; // = 4
+    try testing.expectEqual(@as(usize, 4), num_scale_cols);
+
+    const scaleIdx = struct {
+        fn f(row: usize, col: usize, nsc: usize) usize {
+            return row * nsc + col / 32;
+        }
+    }.f;
+
+    try testing.expectEqual(@as(usize, 0),  scaleIdx(0, 0,   num_scale_cols));
+    try testing.expectEqual(@as(usize, 1),  scaleIdx(0, 32,  num_scale_cols));
+    try testing.expectEqual(@as(usize, 2),  scaleIdx(0, 64,  num_scale_cols));
+    try testing.expectEqual(@as(usize, 3),  scaleIdx(0, 96,  num_scale_cols));
+    try testing.expectEqual(@as(usize, 4),  scaleIdx(1, 0,   num_scale_cols));
+    try testing.expectEqual(@as(usize, 7),  scaleIdx(1, 96,  num_scale_cols));
+    try testing.expectEqual(@as(usize, 8),  scaleIdx(2, 0,   num_scale_cols));
+}
+
+test "MXFP4 cluster dequant: inline spot-check with E8M0 scale" {
+    // Verify the MXFP4 element decode formula used in dequantizeMxfp4Cluster:
+    //   nibble → lut_fp4_e2m1[nibble] * e8m0_to_f32(scale_byte)
+    // Test nibble=2 (fp4=1.0), scale_byte=128 (2.0) → expected 2.0
+    const scale = DataTransform.Quantizer.e8m0_to_f32(128);
+    try testing.expectApproxEqAbs(@as(f32, 2.0), scale, 1e-6);
+
+    const fp4_val = DataTransform.Quantizer.lut_fp4_e2m1[2]; // nibble 2 = 1.0
+    try testing.expectApproxEqAbs(@as(f32, 1.0), fp4_val, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 2.0), fp4_val * scale, 1e-6);
+
+    // nibble=5 (fp4=3.0), scale_byte=130 (8.0) → expected 24.0
+    const scale2 = DataTransform.Quantizer.e8m0_to_f32(130);
+    try testing.expectApproxEqAbs(@as(f32, 8.0), scale2, 1e-6);
+    const fp4_val2 = DataTransform.Quantizer.lut_fp4_e2m1[5]; // nibble 5 = 3.0
+    try testing.expectApproxEqAbs(@as(f32, 24.0), fp4_val2 * scale2, 1e-6);
+}
+
+test "MXFP8 cluster dequant: inline spot-check with E8M0 scale and F8 LUT" {
+    // Verify the MXFP8 element decode formula:
+    //   lut_e4m3[byte] * e8m0_to_f32(scale_byte)
+    // F8_E4M3 byte 0x38: biased_exp=7, mant=0 → 2^(7-7)*1.0 = 1.0
+    const f8_val = DataTransform.Quantizer.lut_e4m3[0x38];
+    try testing.expectApproxEqAbs(@as(f32, 1.0), f8_val, 1e-6);
+
+    // scale_byte=128 → 2.0; product = 2.0
+    const scale = DataTransform.Quantizer.e8m0_to_f32(128);
+    try testing.expectApproxEqAbs(@as(f32, 2.0), f8_val * scale, 1e-6);
+}

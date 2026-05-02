@@ -8,7 +8,11 @@ const types = @import("types.zig");
 const gguf = @import("Gguf.zig");
 const imagearch = @import("ImageArch.zig");
 const cb = @import("callbacks.zig");
-const NvFp4 = @import("NvFp4.zig");
+const ScaledQuant = @import("ScaledQuant.zig");
+const DataTransform = @import("DataTransform.zig");
+
+pub const mxfp4_comfy_json = "{\"format\":\"mxfp4\"}";
+pub const fp8_comfy_json   = "{\"format\": \"float8_e4m3fn\"}";
 
 // ============================================================================
 // Public API
@@ -150,8 +154,8 @@ pub fn convert(
     var model_tensors = try filterAndStripTensors(f, arch, opts.filetype, opts.model_only, arena_alloc);
 
     // --- Group and collapse NVFP4/FP8 clusters --------------------------------
-    var groups = try NvFp4.groupClusters(f, arena_alloc, allocator);
-    try NvFp4.collapseModelTensors(&model_tensors, &groups, arena_alloc);
+    var groups = try ScaledQuant.groupClusters(f, arena_alloc, allocator);
+    try ScaledQuant.collapseModelTensors(&model_tensors, &groups, arena_alloc);
 
     // --- Assign quantization types (template or auto) -------------------------
     var template_metadata: ?std.json.ObjectMap = null;
@@ -599,6 +603,30 @@ fn assignTensorType(
         }
     }
 
+    // MXFP4 safetensors output: expand to a 3-tensor cluster in the file.
+    // F8_E4M3 safetensors output: ComfyUI cluster (F8 weight + F32 scalar + comfy_quant).
+    if (ttype == .F8_E4M3 and opts.filetype == .safetensors) {
+        t.type = "F8_E4M3";
+        t.size = num_elements      // F8_E4M3 weight, 1 byte each
+               + 4                 // F32 scalar scale
+               + fp8_comfy_json.len;
+        return;
+    }
+
+    // MXFP4 safetensors output: ComfyUI cluster (U32 weight + U8 scales + comfy_quant).
+    // Reserve space for weight nibbles + E8M0 scales + comfy_quant JSON in one
+    // contiguous region; Safetensor.saveWithSTData splits the region at write time.
+    if (ttype == .MXFP4 and opts.filetype == .safetensors and t.dims.len >= 1) {
+        const n_cols: u64 = t.dims[t.dims.len - 1];
+        const n_rows: u64 = num_elements / n_cols;
+        const weight_bytes: u64 = n_rows * n_cols / 2;
+        const scale_bytes:  u64 = n_rows * ((n_cols + 31) / 32);  // U8 E8M0, 1 byte each
+        const comfy_bytes:  u64 = mxfp4_comfy_json.len;
+        t.type = "MXFP4";
+        t.size = weight_bytes + scale_bytes + comfy_bytes;
+        return;
+    }
+
     if (use_sensitivity) {
         try applySensitivityQuantization(t, num_elements, ttype,opts.quantization_aggressiveness, resolvedFamilies(opts), sensitivities.?);
     } else {
@@ -715,7 +743,7 @@ fn writeGguf(
     opts: ConvertOptions,
     allocator: std.mem.Allocator,
     arena_alloc: std.mem.Allocator,
-    groups: *const NvFp4.GroupResult,
+    groups: *const ScaledQuant.GroupResult,
 ) !void {
     // --- Resolve output path -------------------------------------------------
     const dir_path = if (opts.output_dir) |od| od else std.fs.path.dirname(opts.path) orelse ".";
@@ -787,7 +815,7 @@ fn writeSafetensors(
     opts: ConvertOptions,
     allocator: std.mem.Allocator,
     arena_alloc: std.mem.Allocator,
-    groups: *const NvFp4.GroupResult,
+    groups: *const ScaledQuant.GroupResult,
 ) !void {
     // --- Resolve output path -------------------------------------------------
     const dir_path = if (opts.output_dir) |od| od else std.fs.path.dirname(opts.path) orelse ".";

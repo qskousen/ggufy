@@ -4,7 +4,7 @@ const types = @import("types.zig");
 const st = @import("Safetensor.zig");
 const DataTransform = @import("DataTransform.zig");
 const cb = @import("callbacks.zig");
-const NvFp4 = @import("NvFp4.zig");
+const ScaledQuant = @import("ScaledQuant.zig");
 
 path: []const u8,
 allocator: std.mem.Allocator,
@@ -232,7 +232,9 @@ pub const GgmlType = enum(u32) {
     iq4_nl_4_8 = 37, // Support has been removed from gguf files
     iq4_nl_8_8 = 38, // Support has been removed from gguf files
     mxfp4 = 39,
-    count = 40,
+    nvfp4 = 40,
+    q1_0 = 41,
+    count = 42, // Tracks how many types there are
 
     pub fn fromInt(value: u32) !GgmlType {
         return std.meta.intToEnum(GgmlType, value) catch error.InvalidGgmlType;
@@ -347,7 +349,7 @@ const GgufMetadata = struct {
     }
 };
 
-pub fn saveWithSTData(self: Gguf, source: *st, threads: usize, callbacks: cb.ConvertCallbacks, groups: *const NvFp4.GroupResult) !void {
+pub fn saveWithSTData(self: Gguf, source: *st, threads: usize, callbacks: cb.ConvertCallbacks, groups: *const ScaledQuant.GroupResult) !void {
     // we need to track bytes written for calculating alignment for the starting tensor
     var bytes_written: u64 = 0;
 
@@ -400,7 +402,7 @@ pub fn saveWithSTData(self: Gguf, source: *st, threads: usize, callbacks: cb.Con
 
         // Cluster dequantization path: checked first to avoid matching the raw U8 weight
         var matched = false;
-        if (try NvFp4.tryDequantCluster(t, source, groups, self.allocator, &pool)) |f32_buf| {
+        if (try ScaledQuant.tryDequantCluster(t, source, groups, self.allocator, &pool)) |f32_buf| {
             defer self.allocator.free(f32_buf);
             const target_dtype = try types.DataType.fromString(t.type);
             std.log.info("Writing tensor data for tensor {}/{} {s} - nvfp4/fp8 to {s}, {} elements", .{
