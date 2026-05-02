@@ -3,6 +3,7 @@ const types = @import("types.zig");
 const gguf = @import("Gguf.zig");
 const DataTransform = @import("DataTransform.zig");
 const cb = @import("callbacks.zig");
+const NvFp4 = @import("NvFp4.zig");
 
 path: []const u8,
 allocator: std.mem.Allocator,
@@ -373,6 +374,8 @@ pub const DType = enum {
     F8_E4M3,
     F8_E5M2,
     F4_E2M1,
+    FP4,
+    MXFP4,
     BF16,
     F16,
     F32,
@@ -408,14 +411,14 @@ pub const DType = enum {
             .F64, .I64, .U64 => 8,
             .I8, .U8, .F8_E4M3, .F8_E5M2 => 1,
             .I16, .U16 => 2,
-            .F4_E2M1 => 1, // sub-byte: use calcSizeInBytes(n) for accurate byte counts
+            .F4_E2M1, .FP4, .MXFP4 => 1, // sub-byte: use calcSizeInBytes(n) for accurate byte counts
         };
     }
 
-    /// Returns byte size for n elements, correctly handling sub-byte types like F4_E2M1.
+    /// Returns byte size for n elements, correctly handling sub-byte types like F4_E2M1/FP4/MXFP4.
     pub fn calcSizeInBytes(self: DType, n: u64) u64 {
         return switch (self) {
-            .F4_E2M1 => (n + 1) / 2,
+            .F4_E2M1, .FP4, .MXFP4 => (n + 1) / 2,
             else => self.getSizeInBytes() * n,
         };
     }
@@ -760,7 +763,7 @@ pub fn writeTensorData(
     }
 }
 
-pub fn saveWithSTData(self: Safetensors, source: *Safetensors, threads: usize, callbacks: cb.ConvertCallbacks) !void {
+pub fn saveWithSTData(self: Safetensors, source: *Safetensors, threads: usize, callbacks: cb.ConvertCallbacks, groups: *const NvFp4.GroupResult) !void {
     // Build the full header JSON object (tensor entries + __metadata__)
     var header_obj = std.json.ObjectMap.init(self.arena_alloc);
 
@@ -824,36 +827,60 @@ pub fn saveWithSTData(self: Safetensors, source: *Safetensors, threads: usize, c
         // Check for cancellation before writing each tensor
         if (callbacks.isCancelled()) return error.Cancelled;
 
-        // try to find the matching tensor in the source
+        var elements: usize = 1;
+        for (t.dims) |d| elements *= d;
+
+        // Cluster dequantization path: checked first to avoid matching the raw U8 weight
         var matched = false;
-        for (source.tensors.items) |source_tensor| {
-            if (std.mem.eql(u8, source_tensor.name, t.name) or
-                (source_tensor.name.len > t.name.len and
-                    source_tensor.name[source_tensor.name.len - t.name.len - 1] == '.' and
-                    std.mem.endsWith(u8, source_tensor.name, t.name)))
-                {
-                    matched = true;
-                    var elements: usize = 1;
-                    for (t.dims) |d| elements *= d;
-                    std.log.info("Writing tensor data for tensor {}/{} {s} - {s} to {s}, {} elements", .{
-                        count,
-                        total_tensors,
-                        t.name,
-                        source_tensor.type,
-                        t.type,
-                        elements,
-                    });
-                    const source_dtype = try types.DataType.fromString(source_tensor.type);
-
-                    // get a reader from the source
-                    var reader = try source.getReaderForTensor(source_tensor.name, &read_buffer);
-                    try reader.seekTo(source_tensor.offset + source.current_data_begin);
-                    try self.writeTensorData(t, source_dtype, &reader.interface, &writer.interface, &pool);
-
-                    callbacks.reportProgress(count, total_tensors, t.name, source_tensor.type, t.type, @intCast(elements));
-                    count += 1;
-                }
+        if (try NvFp4.tryDequantCluster(t, source, groups, self.allocator, &pool)) |f32_buf| {
+            defer self.allocator.free(f32_buf);
+            const target_dtype = try types.DataType.fromString(t.type);
+            std.log.info("Writing tensor data for tensor {}/{} {s} - nvfp4/fp8 to {s}, {} elements", .{
+                count, total_tensors, t.name, t.type, elements,
+            });
+            const out = try DataTransform.Quantizer.convertTensorData(
+                self.allocator,
+                std.mem.sliceAsBytes(f32_buf),
+                .F32,
+                target_dtype,
+                f32_buf.len,
+                &pool,
+            );
+            defer self.allocator.free(out);
+            try self.current_file_handle.?.seekTo(self.current_data_begin + t.offset);
+            try (&writer.interface).writeAll(out);
+            callbacks.reportProgress(count, total_tensors, t.name, "nvfp4", t.type, @intCast(elements));
+            count += 1;
+            matched = true;
         }
+
+        if (!matched) {
+            // Normal single-tensor path
+            for (source.tensors.items) |source_tensor| {
+                if (std.mem.eql(u8, source_tensor.name, t.name) or
+                    (source_tensor.name.len > t.name.len and
+                        source_tensor.name[source_tensor.name.len - t.name.len - 1] == '.' and
+                        std.mem.endsWith(u8, source_tensor.name, t.name)))
+                    {
+                        matched = true;
+                        std.log.info("Writing tensor data for tensor {}/{} {s} - {s} to {s}, {} elements", .{
+                            count,
+                            total_tensors,
+                            t.name,
+                            source_tensor.type,
+                            t.type,
+                            elements,
+                        });
+                        const source_dtype = try types.DataType.fromString(source_tensor.type);
+                        var reader = try source.getReaderForTensor(source_tensor.name, &read_buffer);
+                        try reader.seekTo(source_tensor.offset + source.current_data_begin);
+                        try self.writeTensorData(t, source_dtype, &reader.interface, &writer.interface, &pool);
+                        callbacks.reportProgress(count, total_tensors, t.name, source_tensor.type, t.type, @intCast(elements));
+                        count += 1;
+                    }
+            }
+        }
+
         if (!matched) {
             std.log.warn("Could not find source tensor match for tensor {s}!", .{t.name});
             return error.NoMatchingSourceTensor;

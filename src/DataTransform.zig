@@ -54,7 +54,7 @@ pub const Quantizer = struct {
                     return error.InputSizeMismatch;
                 try dequantizeSimple(input_bytes, output_f32, pool, .F8_E5M2);
             },
-            .F4_E2M1 => {
+            .F4_E2M1, .FP4, .MXFP4 => {
                 if (input_bytes.len * 2 != output_f32.len)
                     return error.InputSizeMismatch;
                 dequantizeFP4(input_bytes, output_f32, pool);
@@ -106,7 +106,7 @@ pub const Quantizer = struct {
                     return error.OutputBufferSizeMismatch;
                 try convertTypeSimple(input_f32, output_bytes, pool, dst_type);
             },
-            .F4_E2M1 => {
+            .F4_E2M1, .FP4, .MXFP4 => {
                 if (output_bytes.len * 2 != input_f32.len)
                     return error.OutputBufferSizeMismatch;
                 quantizeFP4(input_f32, output_bytes, pool);
@@ -573,8 +573,10 @@ pub const Quantizer = struct {
     }
 
     // -------------------------------------------------------------------------
-    // FP4 E2M1 (NV FP4): 1 sign | 2 exp (bias=1) | 1 mantissa, 2 nibbles/byte.
+    // FP4 / E2M1: 1 sign | 2 exp (bias=1) | 1 mantissa, 2 nibbles/byte.
     // Positive values: {0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0}.
+    // Used as the element type for FP4, NV FP4, and MX FP4; block-level scaling
+    // (if any) is stored externally and is not part of this element encoding.
     // Packing: element[2i] in low nibble, element[2i+1] in high nibble.
     // -------------------------------------------------------------------------
 

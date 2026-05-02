@@ -8,6 +8,7 @@ const types = @import("types.zig");
 const gguf = @import("Gguf.zig");
 const imagearch = @import("ImageArch.zig");
 const cb = @import("callbacks.zig");
+const NvFp4 = @import("NvFp4.zig");
 
 // ============================================================================
 // Public API
@@ -148,6 +149,10 @@ pub fn convert(
     // --- Filter and normalise tensor list ------------------------------------
     var model_tensors = try filterAndStripTensors(f, arch, opts.filetype, opts.model_only, arena_alloc);
 
+    // --- Group and collapse NVFP4/FP8 clusters --------------------------------
+    var groups = try NvFp4.groupClusters(f, arena_alloc, allocator);
+    try NvFp4.collapseModelTensors(&model_tensors, &groups, arena_alloc);
+
     // --- Assign quantization types (template or auto) -------------------------
     var template_metadata: ?std.json.ObjectMap = null;
     if (opts.template_path) |tp| {
@@ -182,6 +187,7 @@ pub fn convert(
             opts,
             allocator,
             arena_alloc,
+            &groups,
         ),
         .safetensors => try writeSafetensors(
             f,
@@ -192,6 +198,7 @@ pub fn convert(
             opts,
             allocator,
             arena_alloc,
+            &groups,
         ),
     }
 }
@@ -708,6 +715,7 @@ fn writeGguf(
     opts: ConvertOptions,
     allocator: std.mem.Allocator,
     arena_alloc: std.mem.Allocator,
+    groups: *const NvFp4.GroupResult,
 ) !void {
     // --- Resolve output path -------------------------------------------------
     const dir_path = if (opts.output_dir) |od| od else std.fs.path.dirname(opts.path) orelse ".";
@@ -761,7 +769,7 @@ fn writeGguf(
             try out_gguf.metadata.put(try arena_alloc.dupe(u8, entry.key_ptr.*), entry.value_ptr.*);
     }
 
-    out_gguf.saveWithSTData(f, opts.threads, opts.callbacks) catch |err| {
+    out_gguf.saveWithSTData(f, opts.threads, opts.callbacks, groups) catch |err| {
         if (err == error.Cancelled) {
             std.fs.deleteFileAbsolute(out_filename) catch {};
         }
@@ -779,6 +787,7 @@ fn writeSafetensors(
     opts: ConvertOptions,
     allocator: std.mem.Allocator,
     arena_alloc: std.mem.Allocator,
+    groups: *const NvFp4.GroupResult,
 ) !void {
     // --- Resolve output path -------------------------------------------------
     const dir_path = if (opts.output_dir) |od| od else std.fs.path.dirname(opts.path) orelse ".";
@@ -828,7 +837,7 @@ fn writeSafetensors(
             try out_st.metadata.?.put(try arena_alloc.dupe(u8, entry.key_ptr.*), entry.value_ptr.*);
     }
 
-    out_st.saveWithSTData(f, opts.threads, opts.callbacks) catch |err| {
+    out_st.saveWithSTData(f, opts.threads, opts.callbacks, groups) catch |err| {
         if (err == error.Cancelled) {
             std.fs.deleteFileAbsolute(out_filename) catch {};
         }

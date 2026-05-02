@@ -4,6 +4,7 @@ const types = @import("types.zig");
 const st = @import("Safetensor.zig");
 const DataTransform = @import("DataTransform.zig");
 const cb = @import("callbacks.zig");
+const NvFp4 = @import("NvFp4.zig");
 
 path: []const u8,
 allocator: std.mem.Allocator,
@@ -266,6 +267,7 @@ pub const GgmlType = enum(u32) {
             .q4_0, .q4_1, .q5_0, .q5_1, .q8_0, .q8_1 => 32,
             .q2_k, .q3_k, .q4_k, .q5_k, .q6_k, .q8_k => 256,
             .iq2_xxs, .iq2_xs, .iq3_xxs, .iq1_s, .iq4_nl, .iq3_s, .iq2_s, .iq4_xs, .iq1_m => 256,
+            .mxfp4 => 32,
             else => 1,
         };
     }
@@ -292,6 +294,9 @@ pub const GgmlType = enum(u32) {
             .q5_k => 176,
             .q6_k => 210,
             .q8_k => 292,
+
+            // MX FP4: 1 byte E8M0 scale + 16 bytes of packed E2M1 nibbles (32 elements)
+            .mxfp4 => 17,
 
             else => 0,
         };
@@ -342,7 +347,7 @@ const GgufMetadata = struct {
     }
 };
 
-pub fn saveWithSTData(self: Gguf, source: *st, threads: usize, callbacks: cb.ConvertCallbacks) !void {
+pub fn saveWithSTData(self: Gguf, source: *st, threads: usize, callbacks: cb.ConvertCallbacks, groups: *const NvFp4.GroupResult) !void {
     // we need to track bytes written for calculating alignment for the starting tensor
     var bytes_written: u64 = 0;
 
@@ -390,41 +395,64 @@ pub fn saveWithSTData(self: Gguf, source: *st, threads: usize, callbacks: cb.Con
         // Check for cancellation before writing each tensor
         if (callbacks.isCancelled()) return error.Cancelled;
 
-        // try to find the matching tensor in the source
+        var elements: usize = 1;
+        for (t.dims) |d| elements *= d;
+
+        // Cluster dequantization path: checked first to avoid matching the raw U8 weight
         var matched = false;
-        for (source.tensors.items) |source_tensor| {
-            if (std.mem.eql(u8, source_tensor.name, t.name) or
-                (source_tensor.name.len > t.name.len and
-                    source_tensor.name[source_tensor.name.len - t.name.len - 1] == '.' and
-                    std.mem.endsWith(u8, source_tensor.name, t.name)))
-                {
-                    matched = true;
-                    var elements: usize = 1;
-                    for (t.dims) |d| elements *= d;
-                    std.log.info("Writing tensor data for tensor {}/{} {s} - {s} to {s}, {} elements", .{
-                        count,
-                        total_tensors,
-                        t.name,
-                        source_tensor.type,
-                        t.type,
-                        elements,
-                    });
-                    // convert source tensor type to gguf type
-                    const source_dtype = try types.DataType.fromString(source_tensor.type);
-
-                    // get a reader from the source
-                    var reader = try source.getReaderForTensor(source_tensor.name, &read_buffer);
-                    try reader.seekTo(source_tensor.offset + source.current_data_begin);
-                    try self.writeTensorData(t, source_dtype, &reader.interface, &writer.interface, &pool);
-
-                    // write padding for alignment if needed
-                    const size = try Gguf.calculateTensorSize(t);
-                    try self.maybeWritePadding(size, &writer.interface);
-
-                    callbacks.reportProgress(count, total_tensors, t.name, source_tensor.type, t.type, @intCast(elements));
-                    count += 1;
-                }
+        if (try NvFp4.tryDequantCluster(t, source, groups, self.allocator, &pool)) |f32_buf| {
+            defer self.allocator.free(f32_buf);
+            const target_dtype = try types.DataType.fromString(t.type);
+            std.log.info("Writing tensor data for tensor {}/{} {s} - nvfp4/fp8 to {s}, {} elements", .{
+                count, total_tensors, t.name, t.type, elements,
+            });
+            const out = try DataTransform.Quantizer.convertTensorData(
+                self.allocator,
+                std.mem.sliceAsBytes(f32_buf),
+                .F32,
+                target_dtype,
+                f32_buf.len,
+                &pool,
+            );
+            defer self.allocator.free(out);
+            try self.file.seekTo(self.data_offset + t.offset);
+            try (&writer.interface).writeAll(out);
+            const size = try Gguf.calculateTensorSize(t);
+            try self.maybeWritePadding(size, &writer.interface);
+            callbacks.reportProgress(count, total_tensors, t.name, "nvfp4", t.type, @intCast(elements));
+            count += 1;
+            matched = true;
         }
+
+        if (!matched) {
+            // Normal single-tensor path
+            for (source.tensors.items) |source_tensor| {
+                if (std.mem.eql(u8, source_tensor.name, t.name) or
+                    (source_tensor.name.len > t.name.len and
+                        source_tensor.name[source_tensor.name.len - t.name.len - 1] == '.' and
+                        std.mem.endsWith(u8, source_tensor.name, t.name)))
+                    {
+                        matched = true;
+                        std.log.info("Writing tensor data for tensor {}/{} {s} - {s} to {s}, {} elements", .{
+                            count,
+                            total_tensors,
+                            t.name,
+                            source_tensor.type,
+                            t.type,
+                            elements,
+                        });
+                        const source_dtype = try types.DataType.fromString(source_tensor.type);
+                        var reader = try source.getReaderForTensor(source_tensor.name, &read_buffer);
+                        try reader.seekTo(source_tensor.offset + source.current_data_begin);
+                        try self.writeTensorData(t, source_dtype, &reader.interface, &writer.interface, &pool);
+                        const size = try Gguf.calculateTensorSize(t);
+                        try self.maybeWritePadding(size, &writer.interface);
+                        callbacks.reportProgress(count, total_tensors, t.name, source_tensor.type, t.type, @intCast(elements));
+                        count += 1;
+                    }
+            }
+        }
+
         if (!matched) {
             std.log.warn("Could not find source tensor match for tensor {s}!", .{t.name});
             return error.NoMatchingSourceTensor;

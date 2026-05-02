@@ -5,6 +5,7 @@ pub const convert = @import("Convert.zig");
 pub const dataTransform = @import("DataTransform.zig");
 pub const gguf = @import("Gguf.zig");
 pub const imageArch = @import("ImageArch.zig");
+pub const nvfp4 = @import("NvFp4.zig");
 pub const safetensor = @import("Safetensor.zig");
 pub const types = @import("types.zig");
 pub const fileLoader = @import("FileLoader.zig");
