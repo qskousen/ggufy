@@ -11,9 +11,10 @@ const cb = @import("callbacks.zig");
 const ScaledQuant = @import("ScaledQuant.zig");
 const DataTransform = @import("DataTransform.zig");
 
-pub const mxfp4_comfy_json = "{\"format\":\"mxfp4\"}";
-pub const mxfp8_comfy_json = "{\"format\":\"mxfp8\"}";
-pub const fp8_comfy_json   = "{\"format\": \"float8_e4m3fn\"}";
+pub const mxfp4_comfy_json  = "{\"format\":\"mxfp4\"}";
+pub const mxfp8_comfy_json  = "{\"format\":\"mxfp8\"}";
+pub const fp8_comfy_json    = "{\"format\": \"float8_e4m3fn\"}";
+pub const nvfp4_comfy_json  = "{\"format\":\"nvfp4\"}";
 
 // ============================================================================
 // Public API
@@ -604,11 +605,11 @@ fn assignTensorType(
         }
     }
 
-    // F8_E4M3 safetensors output: ComfyUI cluster (F8 weight + F32 scalar + comfy_quant).
+    // SCALED_F8_E4M3 safetensors output: ComfyUI cluster (F8 weight + F32 scalar + comfy_quant).
     // Only weight matrices get cluster treatment; biases/norms fall back to their source type.
-    if (ttype == .F8_E4M3 and opts.filetype == .safetensors) {
+    if (ttype == .SCALED_F8_E4M3 and opts.filetype == .safetensors) {
         if (std.mem.endsWith(u8, t.name, ".weight")) {
-            t.type = "F8_E4M3";
+            t.type = "SCALED_F8_E4M3";
             t.size = num_elements      // F8_E4M3 weight, 1 byte each
                    + 4                 // F32 scalar scale
                    + fp8_comfy_json.len;
@@ -650,6 +651,27 @@ fn assignTensorType(
                 t.type = "MXFP8_E4M3";
                 t.size = weight_bytes + scale_bytes + comfy_bytes;
                 return;
+            }
+        }
+        return nearestCompatibleType(t, opts, num_elements);
+    }
+
+    // NVFP4 safetensors output: ComfyUI cluster (U8 weight + F8_E4M3 scales + F32 global + comfy_quant).
+    // Requires cols % 64 == 0 and rows % 128 == 0 (cuBLAS tiling constraint).
+    if (ttype == .NVFP4 and opts.filetype == .safetensors and t.dims.len >= 1) {
+        if (std.mem.endsWith(u8, t.name, ".weight")) {
+            const n_cols: u64 = t.dims[t.dims.len - 1];
+            if (n_cols >= 64 and n_cols % 64 == 0) {
+                const n_rows: u64 = num_elements / n_cols;
+                if (n_rows % 128 == 0) {
+                    const weight_bytes: u64 = n_rows * (n_cols / 2);   // nibble-packed
+                    const scale_bytes:  u64 = n_rows * (n_cols / 16);  // F8_E4M3, cuBLAS tiled
+                    const scale2_bytes: u64 = 4;                        // F32 global scalar
+                    const comfy_bytes:  u64 = nvfp4_comfy_json.len;
+                    t.type = "NVFP4";
+                    t.size = weight_bytes + scale_bytes + scale2_bytes + comfy_bytes;
+                    return;
+                }
             }
         }
         return nearestCompatibleType(t, opts, num_elements);

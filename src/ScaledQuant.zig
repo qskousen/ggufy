@@ -319,6 +319,86 @@ pub fn dequantizeFp4Cluster(
     return dequantizeFp4Raw(weight_bytes, scale_bytes, global_scale, cluster.rows, cluster.cols, allocator);
 }
 
+pub const NvFp4Encoded = struct {
+    weight: []u8,       // packed nibbles, rows × (cols/2); even col → HIGH nibble, odd → LOW
+    scale: []u8,        // F8_E4M3 bytes in cuBLAS tiled order, rows × (cols/16)
+    global_scale: f32,
+};
+
+/// Quantize a flat F32 matrix [rows*cols] to NVFP4.
+/// rows must be a multiple of 128; cols must be a multiple of 64.
+/// Caller owns the returned slices.
+pub fn quantizeToNvFp4Raw(
+    data: []const f32,
+    rows: usize,
+    cols: usize,
+    allocator: std.mem.Allocator,
+) !NvFp4Encoded {
+    if (cols % 64 != 0) return error.InvalidClusterShape;
+    if (rows % 128 != 0) return error.InvalidClusterShape;
+
+    const num_scale_cols = cols / 16;
+    const n_col_blocks = (num_scale_cols + 3) / 4;
+
+    // Step 1: global scale = max_abs / (fp4_max × fp8_max)
+    var max_abs: f32 = 0.0;
+    for (data) |v| {
+        if (!std.math.isNan(v) and !std.math.isInf(v))
+            max_abs = @max(max_abs, @abs(v));
+    }
+    const global_scale: f32 = if (max_abs > 0.0) max_abs / (6.0 * 448.0) else 1.0;
+    const inv_global = 1.0 / global_scale;
+
+    // Step 2: per-block F8_E4M3 scale written into cuBLAS tiled positions
+    const scale = try allocator.alloc(u8, rows * num_scale_cols);
+    errdefer allocator.free(scale);
+
+    for (0..rows) |row| {
+        const r0 = row / 128;
+        const r1 = row % 128;
+        for (0..num_scale_cols) |sc| {
+            var block_max: f32 = 0.0;
+            for (data[row * cols + sc * 16 ..][0..16]) |v|
+                block_max = @max(block_max, @abs(v * inv_global));
+            const scale_byte: u8 = if (block_max > 0.0)
+                DataTransform.Quantizer.f32_to_fp8_e4m3(block_max / 6.0)
+            else
+                0;
+            const c0 = sc / 4;
+            const c1 = sc % 4;
+            const idx = (r0 * n_col_blocks + c0) * 512 + (r1 % 32) * 16 + (r1 / 32) * 4 + c1;
+            scale[idx] = scale_byte;
+        }
+    }
+
+    // Step 3: pack FP4 nibbles; even col → HIGH nibble, odd col → LOW nibble
+    const weight = try allocator.alloc(u8, rows * (cols / 2));
+    errdefer allocator.free(weight);
+    @memset(weight, 0);
+
+    for (0..rows) |row| {
+        const r0 = row / 128;
+        const r1 = row % 128;
+        for (0..cols) |col| {
+            const sc = col / 16;
+            const c0 = sc / 4;
+            const c1 = sc % 4;
+            const scale_idx = (r0 * n_col_blocks + c0) * 512 + (r1 % 32) * 16 + (r1 / 32) * 4 + c1;
+            const block_scale = DataTransform.Quantizer.lut_e4m3[scale[scale_idx]];
+            const nibble: u4 = if (block_scale == 0.0) 0 else
+                DataTransform.Quantizer.f32_to_fp4_e2m1(data[row * cols + col] * inv_global / block_scale);
+            const byte_idx = row * (cols / 2) + col / 2;
+            if (col % 2 == 0) {
+                weight[byte_idx] |= @as(u8, nibble) << 4; // even → HIGH nibble
+            } else {
+                weight[byte_idx] |= @as(u8, nibble);      // odd  → LOW nibble
+            }
+        }
+    }
+
+    return .{ .weight = weight, .scale = scale, .global_scale = global_scale };
+}
+
 /// Dequantize an FP8 (ComfyUI) cluster to F32: f8_weight × scalar_scale.
 /// Caller owns the returned slice.
 pub fn dequantizeFloat8Cluster(
@@ -737,6 +817,50 @@ test "MXFP8 dequant: fixture from real ComfyUI model (128×128 slice)" {
         if (@abs(g - e) > 1e-6) {
             if (mismatches < 8) {
                 std.debug.print("  MXFP8[{}]: got={d:.8} expected={d:.8}\n", .{ i, g, e });
+            }
+            mismatches += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), mismatches);
+}
+
+test "NVFP4 encode→decode round-trip: fixture data" {
+    // Encodes nvfp4_expected.f32 (dequantized from a real NVFP4 model) with
+    // quantizeToNvFp4Raw, then decodes with dequantizeFp4Raw, and checks that
+    // every element round-trips within FP4 quantization error.
+    //
+    // Using already-quantized data as input means the encode should be very
+    // faithful; the tolerance is set to 30% relative + small absolute floor,
+    // which is well within the theoretical ~50% worst-case FP4 step error.
+    const allocator = std.testing.allocator;
+
+    const input_bytes = (try loadFixture(allocator, "nvfp4_expected.f32")) orelse return error.SkipZigTest;
+    defer allocator.free(input_bytes);
+
+    const input: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(input_bytes)));
+    const rows: usize = 128;
+    const cols: usize = 256;
+    try testing.expectEqual(rows * cols, input.len);
+
+    const enc = try quantizeToNvFp4Raw(input, rows, cols, allocator);
+    defer allocator.free(enc.weight);
+    defer allocator.free(enc.scale);
+
+    try testing.expectEqual(rows * (cols / 2), enc.weight.len);
+    try testing.expectEqual(rows * (cols / 16), enc.scale.len);
+
+    const got = try dequantizeFp4Raw(enc.weight, enc.scale, enc.global_scale, rows, cols, allocator);
+    defer allocator.free(got);
+
+    var max_input: f32 = 0.0;
+    for (input) |v| max_input = @max(max_input, @abs(v));
+
+    var mismatches: usize = 0;
+    for (got, input, 0..) |g, e, i| {
+        const tol = @max(@abs(e) * 0.30, max_input * 0.005);
+        if (@abs(g - e) > tol) {
+            if (mismatches < 8) {
+                std.debug.print("  NVFP4-enc[{}]: got={d:.6} input={d:.6} tol={d:.6}\n", .{ i, g, e, tol });
             }
             mismatches += 1;
         }

@@ -43,14 +43,17 @@ const gguf_type_names = blk: {
 
 // Safetensors output types that we can convert
 const st_target_types = [_]ggufy.types.DataType{
-    .F32, .F16, .BF16, .F8_E4M3, .F8_E5M2, .F4_E2M1, .FP4, .MXFP8_E4M3,
+    .F32, .F16, .BF16, .F8_E4M3, .SCALED_F8_E4M3, .F8_E5M2, .F4_E2M1, .FP4, .MXFP8_E4M3,
 };
 
-const st_type_names = blk: {
-    var names: [st_target_types.len][]const u8 = undefined;
-    for (st_target_types, 0..) |t, i| names[i] = @tagName(t);
-    break :blk names;
+// User-facing display names — must stay in sync with st_target_types.
+const st_type_names = [_][]const u8{
+    "F32", "F16", "BF16", "F8_E4M3", "Scaled FP8 (ComfyUI)", "F8_E5M2", "F4_E2M1", "FP4", "MXFP8_E4M3",
 };
+
+comptime {
+    std.debug.assert(st_target_types.len == st_type_names.len);
+}
 
 pub fn main() !void {
     if (@import("builtin").os.tag == .windows) {

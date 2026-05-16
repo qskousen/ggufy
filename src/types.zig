@@ -60,10 +60,12 @@ pub const DataType = enum {
     // Safetensor types
     F8_E4M3,
     F8_E5M2,
+    SCALED_F8_E4M3, // ComfyUI scaled FP8 cluster: F8_E4M3 weight + F32 global scale + comfy_quant
     F4_E2M1,
     FP4,
     MXFP4,
     MXFP8_E4M3,
+    NVFP4,
     BF16,
     F16,
     F32,
@@ -171,12 +173,15 @@ pub const DataType = enum {
 
     pub fn formatType(self: DataType) FileType {
         return switch (self) {
-            .F8_E4M3, .F8_E5M2, .F4_E2M1, .FP4, .MXFP4, .MXFP8_E4M3, .BF16, .F16, .F32, .F64, .I8, .I16, .I32, .I64, .U8, .U16, .U32, .U64 => FileType.safetensors,
+            .F8_E4M3, .F8_E5M2, .SCALED_F8_E4M3, .F4_E2M1, .FP4, .MXFP4, .MXFP8_E4M3, .NVFP4, .BF16, .F16, .F32, .F64, .I8, .I16, .I32, .I64, .U8, .U16, .U32, .U64 => FileType.safetensors,
             .f32, .f16, .q4_0, .q4_1, .q4_2, .q4_3, .q5_0, .q5_1, .q8_0, .q8_1, .q2_k, .q3_k, .q4_k, .q5_k, .q6_k, .q8_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq1_s, .iq4_nl, .iq3_s, .iq2_s, .iq4_xs, .i8, .i16, .i32, .i64, .f64, .iq1_m, .bf16, .q4_0_4_4, .q4_0_4_8, .q4_0_8_8, .tq1_0, .tq2_0, .iq4_nl_4_4, .iq4_nl_4_8, .iq4_nl_8_8, .mxfp4, .nvfp4, .q1_0, .count => FileType.gguf,
         };
     }
 
     pub fn calcSizeInBytes(self: DataType, n_elements: u64) u64 {
+        // SCALED_F8_E4M3 is a cluster type; actual total size is set by assignQuantType.
+        // Report just the weight bytes (1 per element) as a conservative lower bound.
+        if (self == .SCALED_F8_E4M3) return n_elements;
         return switch (self.formatType()) {
             .safetensors => {
                 const t = Safetensors.DType.fromString(@tagName(self)) catch unreachable;
