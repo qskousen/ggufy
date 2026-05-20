@@ -120,6 +120,8 @@ pub fn main(init: std.process.Init) !void {
             state.template_path = null;
             state.skip_sensitivity = false;
             state.allow_unknown_arch = false;
+            state.allow_upscale = false;
+            state.upscale_pending = false;
             state.arch_override_buf = std.mem.zeroes([64]u8);
             state.tool_status_len = 0;
             state.same_file_error = false;
@@ -254,6 +256,9 @@ fn gui_frame() bool {
 
     // Overwrite dialog floats on top of everything
     if (state.overwrite_pending_path != null) showOverwriteDialog();
+
+    // Upscale warning dialog
+    if (state.upscale_pending) showUpscaleDialog();
 
     // About modal
     if (state.show_about) showAboutModal();
@@ -877,6 +882,15 @@ fn launchConversion(fa: std.mem.Allocator) void {
     }
     state.same_file_error = false;
 
+    // Warn if converting lossy-quantized tensors to a higher-precision format.
+    if (!state.allow_upscale) {
+        const loaded = &state.loaded_file.?;
+        if (conv.detectUpscaling(loaded.tensors.items, state.target_dtype)) {
+            state.upscale_pending = true;
+            return;
+        }
+    }
+
     const file_exists = blk: {
         std.Io.Dir.cwd().access(state.io, out_path, .{}) catch break :blk false;
         break :blk true;
@@ -1039,6 +1053,40 @@ fn showOverwriteDialog() void {
 
         if (dvui.button(@src(), "Overwrite", .{}, .{ .margin = .all(4) })) {
             state.overwrite_pending_path = null;
+            state.convert_requested = true;
+        }
+    }
+}
+
+// Upscale warning dialog
+
+fn showUpscaleDialog() void {
+    var float = dvui.floatingWindow(@src(), .{ .modal = true }, .{ .min_size_content = .{ .w = 420, .h = 160 } });
+    defer float.deinit();
+
+    var content = dvui.box(@src(), .{}, .{ .expand = .both, .padding = .all(16) });
+    defer content.deinit();
+
+    dvui.label(@src(), "Precision warning", .{}, .{ .font = .theme(.title) });
+    dvui.label(
+        @src(),
+        "The source contains lossy-quantized tensors. Converting to a higher-precision\n" ++
+        "format will NOT recover lost information — the extra bits are fill-in only.",
+        .{},
+        .{ .margin = .{ .x = 0, .y = 8, .w = 0, .h = 12 } },
+    );
+
+    {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .gravity_x = 1.0 });
+        defer row.deinit();
+
+        if (dvui.button(@src(), "Cancel", .{}, .{ .margin = .all(4) })) {
+            state.upscale_pending = false;
+        }
+
+        if (dvui.button(@src(), "Convert anyway", .{}, .{ .margin = .all(4) })) {
+            state.upscale_pending = false;
+            state.allow_upscale = true;
             state.convert_requested = true;
         }
     }

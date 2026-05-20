@@ -47,6 +47,10 @@ pub const ConvertOptions = struct {
     /// in the GGUF output instead of the auto-detected name. Free-form; does
     /// not affect conversion behaviour. Ignored for safetensors output.
     arch_override: ?[]const u8 = null,
+    /// When true, suppress the upscaling guard that fires when the target type
+    /// has higher nominal precision than some source tensors (e.g. q4_k → f16).
+    /// Upscaling does NOT recover lost precision; the extra bits are fill-in.
+    allow_upscale: bool = false,
     /// Optional GUI progress/cancel hooks.  No-ops when null.
     callbacks: cb.ConvertCallbacks = .{},
 };
@@ -107,6 +111,43 @@ pub const QuantizationFamilies = struct {
     }
 };
 
+/// Rough precision rank — higher means more information per element.
+/// Returns 255 for types that are not meaningful to compare (count, unknowns).
+fn precisionRank(type_str: []const u8) u8 {
+    const dt = types.DataType.fromString(type_str) catch return 255;
+    return switch (dt) {
+        .q1_0, .tq1_0, .iq1_s, .iq1_m => 1,
+        .q2_k, .iq2_xxs, .iq2_xs, .iq2_s, .tq2_0 => 2,
+        .q3_k, .iq3_xxs, .iq3_s => 3,
+        .q4_0, .q4_1, .q4_k, .iq4_nl, .iq4_xs,
+        .nvfp4, .mxfp4, .NVFP4, .MXFP4, .F4_E2M1 => 4,
+        .q5_0, .q5_1, .q5_k => 5,
+        .q6_k => 6,
+        .q8_0, .q8_1, .q8_k,
+        .F8_E4M3, .F8_E5M2, .SCALED_F8_E4M3, .MXFP8_E4M3 => 7,
+        .f16, .F16, .bf16, .BF16,
+        .i8, .I8, .I16, .i16, .U8, .U16 => 8,
+        .f32, .F32, .i32, .I32, .U32 => 9,
+        .f64, .F64, .i64, .I64, .U64 => 10,
+        else => 255,
+    };
+}
+
+/// Returns true when converting `source_tensors` to `target_dtype` would store
+/// data at a higher nominal precision than the source — meaning the extra bits
+/// are fill-in only, no information is recovered.
+/// Skipped when target_dtype is null (template-based conversion).
+pub fn detectUpscaling(source_tensors: []const types.Tensor, target_dtype: ?types.DataType) bool {
+    const tgt = target_dtype orelse return false;
+    const target_rank = precisionRank(@tagName(tgt));
+    if (target_rank == 255) return false;
+    for (source_tensors) |t| {
+        const src_rank = precisionRank(t.type);
+        if (src_rank != 255 and target_rank > src_rank) return true;
+    }
+    return false;
+}
+
 /// Compute the output file path that `convert` would write to, without
 /// performing any actual conversion.  Useful for overwrite checks in the GUI.
 pub fn computeOutputPath(opts: ConvertOptions, arena_alloc: std.mem.Allocator) ![]const u8 {
@@ -137,6 +178,17 @@ pub fn convert(
     allocator: std.mem.Allocator,
     arena_alloc: std.mem.Allocator,
 ) !void {
+    // --- Upscaling guard ------------------------------------------------------
+    if (!opts.allow_upscale and detectUpscaling(f.tensors.items, opts.datatype)) {
+        std.log.err(
+            "Source contains lossy-quantized tensors; converting to a higher-precision " ++
+            "format will NOT recover lost information — the extra bits are fill-in only. " ++
+            "Pass --allow-upscale (-U) to convert anyway.",
+            .{},
+        );
+        return error.UpscalingNotAllowed;
+    }
+
     // --- Detect architecture --------------------------------------------------
     const arch = blk: {
         const result = imagearch.detectArchFromTensorsOrError(f.tensors.items, allocator);

@@ -36,6 +36,7 @@ pub fn main(init: std.process.Init) !void {
         \\-q, --use-quant-types <QTYPES> Quantization families to use with sensitivity (e.g. "k", "0,k", "0,1,k"). Default: match datatype.
         \\-m, --model-only               When output is safetensors, convert only the main model (UNet/transformer). Ignored for GGUF output.
         \\-u, --allow-unknown-arch       Allow converting files with unrecognized architectures. Results may be suboptimal.
+        \\-U, --allow-upscale            Allow converting from a lower-precision (quantized/FP8) source to a higher-precision target. The extra bits are fill-in; no quality is recovered.
         \\-A, --arch <NAME>              Set the architecture name written to the GGUF metadata (GGUF output only). Free-form; does not affect conversion behaviour.
         \\<COMMAND>    Specify a command: header, tree, metadata, convert, template
         \\<FILENAME>   The file to use for input
@@ -111,6 +112,7 @@ pub fn main(init: std.process.Init) !void {
 
     const model_only = res.args.@"model-only" != 0;
     const allow_unknown_arch = res.args.@"allow-unknown-arch" != 0;
+    const allow_upscale = res.args.@"allow-upscale" != 0;
     const arch_override = res.args.arch;
 
     const allowed_quant_families: ?conv.QuantizationFamilies = if (res.args.@"use-quant-types") |s|
@@ -163,12 +165,14 @@ pub fn main(init: std.process.Init) !void {
                         .allowed_quant_families = allowed_quant_families,
                         .model_only = model_only,
                         .allow_unknown_arch = allow_unknown_arch,
+                        .allow_upscale = allow_upscale,
                         .arch_override = arch_override,
                     }, allocator, arena_alloc) catch |err| {
                         if (err == error.UnknownArchitecture) {
                             std.log.err("Architecture not recognized. Pass --allow-unknown-arch (-u) to convert anyway. Results may be suboptimal.", .{});
                             return;
                         }
+                        if (err == error.UpscalingNotAllowed) return;
                         return err;
                     };
                 },
@@ -257,12 +261,14 @@ pub fn main(init: std.process.Init) !void {
                         .allowed_quant_families = allowed_quant_families,
                         .model_only = model_only,
                         .allow_unknown_arch = allow_unknown_arch,
+                        .allow_upscale = allow_upscale,
                         .arch_override = arch_override,
                     }, allocator, arena_alloc) catch |err| {
                         if (err == error.UnknownArchitecture) {
                             std.log.err("Architecture not recognized. Pass --allow-unknown-arch (-u) to convert anyway. Results may be suboptimal.", .{});
                             return;
                         }
+                        if (err == error.UpscalingNotAllowed) return;
                         return err;
                     };
                 },

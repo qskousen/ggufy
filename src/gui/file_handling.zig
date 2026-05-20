@@ -278,6 +278,7 @@ pub fn convertFile(alloc: std.mem.Allocator, arena_alloc: std.mem.Allocator, sta
         .quantization_aggressiveness = @as(f32, @floatFromInt(state.target_aggressiveness)),
         .model_only = state.model_only,
         .allow_unknown_arch = state.allow_unknown_arch,
+        .allow_upscale = state.allow_upscale,
         .arch_override = state.archOverride(),
         .callbacks = .{
             .progress_fn = progressCallback,

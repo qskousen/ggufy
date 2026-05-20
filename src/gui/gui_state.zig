@@ -100,6 +100,10 @@ pub const State = struct {
     overwrite_pending_path_buf: [std.fs.max_path_bytes]u8 = undefined,
     overwrite_pending_path: ?[]u8 = null,
 
+    // Upscale confirmation
+    upscale_pending: bool = false,
+    allow_upscale: bool = false,
+
     // Misc UI state
     show_about: bool = false,
     same_file_error: bool = false,
