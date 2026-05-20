@@ -242,7 +242,29 @@ pub fn main(init: std.process.Init) !void {
                     try f.readGgufMetadata(stdout);
                 },
                 .convert => {
-                    return error.Unimplimented;
+                    conv.convert(&f, .{
+                        .io = io,
+                        .path = path,
+                        .filetype = filetype,
+                        .datatype = datatype,
+                        .template_path = template_path,
+                        .output_dir = output_dir,
+                        .output_name = output_name,
+                        .threads = threads,
+                        .skip_sensitivity = skip_sensitivity,
+                        .quantization_aggressiveness = quantization_aggressiveness,
+                        .sensitivities_path = sensitivities_path,
+                        .allowed_quant_families = allowed_quant_families,
+                        .model_only = model_only,
+                        .allow_unknown_arch = allow_unknown_arch,
+                        .arch_override = arch_override,
+                    }, allocator, arena_alloc) catch |err| {
+                        if (err == error.UnknownArchitecture) {
+                            std.log.err("Architecture not recognized. Pass --allow-unknown-arch (-u) to convert anyway. Results may be suboptimal.", .{});
+                            return;
+                        }
+                        return err;
+                    };
                 },
                 .names => {
                     const name_list = try allocator.alloc([]const u8, f.tensors.items.len);

@@ -1,6 +1,5 @@
 const std = @import("std");
 const types = @import("types.zig");
-const st = @import("Safetensor.zig");
 const DataTransform = @import("DataTransform.zig");
 const thread_pool_mod = @import("ThreadPool.zig");
 
@@ -87,7 +86,7 @@ fn nameSuffixMatch(full_name: []const u8, stripped: []const u8) bool {
 /// Scan source tensors and group them into NVFP4 and FP8 clusters via comfy_quant markers.
 /// Result slices are arena-allocated; `allocator` is used for temporary work only.
 pub fn groupClusters(
-    source: *st,
+    source: anytype,
     arena_alloc: std.mem.Allocator,
     allocator: std.mem.Allocator,
 ) !GroupResult {
@@ -325,7 +324,7 @@ pub fn dequantizeFp4Raw(
 /// Caller owns the returned slice.
 pub fn dequantizeFp4Cluster(
     cluster: Fp4Cluster,
-    source: *st,
+    source: anytype,
     allocator: std.mem.Allocator,
     pool: *thread_pool_mod.ThreadPool,
 ) ![]f32 {
@@ -454,7 +453,7 @@ pub fn quantizeToNvFp4Raw(
 /// Caller owns the returned slice.
 pub fn dequantizeFloat8Cluster(
     cluster: Float8Cluster,
-    source: *st,
+    source: anytype,
     allocator: std.mem.Allocator,
 ) ![]f32 {
     const w_file = try source.openFileForTensor(cluster.weight.name);
@@ -484,7 +483,7 @@ pub fn dequantizeFloat8Cluster(
 /// Caller owns the returned slice.
 pub fn dequantizeMxfp4Cluster(
     cluster: Mxfp4Cluster,
-    source: *st,
+    source: anytype,
     allocator: std.mem.Allocator,
 ) ![]f32 {
     if (cluster.cols % 32 != 0) return error.InvalidClusterShape;
@@ -551,7 +550,7 @@ pub fn dequantizeMxfp8Raw(
 /// Caller owns the returned slice.
 pub fn dequantizeMxfp8Cluster(
     cluster: Mxfp8Cluster,
-    source: *st,
+    source: anytype,
     allocator: std.mem.Allocator,
 ) ![]f32 {
     if (cluster.cols % 32 != 0) return error.InvalidClusterShape;
@@ -574,7 +573,7 @@ pub fn dequantizeMxfp8Cluster(
 /// Caller owns the returned slice.
 pub fn tryDequantCluster(
     dest_tensor: types.Tensor,
-    source: *st,
+    source: anytype,
     groups: *const GroupResult,
     allocator: std.mem.Allocator,
     pool: *thread_pool_mod.ThreadPool,

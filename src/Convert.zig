@@ -129,10 +129,10 @@ pub fn computeOutputPath(opts: ConvertOptions, arena_alloc: std.mem.Allocator) !
     );
 }
 
-/// Entry point: convert a SafeTensors file according to `opts`.
-/// `f` is the already-opened SafeTensors handle.
+/// Entry point: convert a SafeTensors or GGUF file according to `opts`.
+/// `f` is the already-opened source handle (either *st or *gguf.Gguf).
 pub fn convert(
-    f: *st,
+    f: anytype,
     opts: ConvertOptions,
     allocator: std.mem.Allocator,
     arena_alloc: std.mem.Allocator,
@@ -313,7 +313,7 @@ pub fn calculateQuantizationLevel(
 /// their original names so VAE, text encoders, and other components in a
 /// bundled checkpoint are preserved in the output file.
 fn filterAndStripTensors(
-    f: *st,
+    f: anytype,
     arch: *const imagearch.Arch,
     output_filetype: types.FileType,
     model_only: bool,
@@ -796,7 +796,7 @@ fn applyShapeFix(
 }
 
 fn writeGguf(
-    f: *st,
+    f: anytype,
     model_tensors: std.ArrayList(types.Tensor),
     arch: *const imagearch.Arch,
     template_metadata: ?std.json.ObjectMap,
@@ -842,7 +842,7 @@ fn writeGguf(
             if (!out_gguf.metadata.contains(entry.key_ptr.*))
                 try out_gguf.metadata.put(arena_alloc,try arena_alloc.dupe(u8, entry.key_ptr.*), entry.value_ptr.*);
         }
-    } else if (f.metadata) |meta| {
+    } else if (f.getSourceMetadata()) |meta| {
         var it = meta.iterator();
         while (it.next()) |entry| {
             if (!out_gguf.metadata.contains(entry.key_ptr.*))
@@ -867,7 +867,7 @@ fn writeGguf(
 }
 
 fn writeSafetensors(
-    f: *st,
+    f: anytype,
     model_tensors: std.ArrayList(types.Tensor),
     arch: *const imagearch.Arch,
     template_metadata: ?std.json.ObjectMap,
@@ -900,16 +900,17 @@ fn writeSafetensors(
     out_st.tensors = model_tensors;
 
     // Copy any metadata from the source, if there is any
-    out_st.metadata = if (f.metadata) |meta| try meta.clone(arena_alloc) else null;
+    out_st.metadata = if (f.getSourceMetadata()) |meta| try meta.clone(arena_alloc) else null;
 
     // Template metadata takes priority over source-file metadata.
     if (template_metadata) |meta| {
+        if (out_st.metadata == null) out_st.metadata = std.json.ObjectMap.empty;
         var it = meta.iterator();
         while (it.next()) |entry| {
             if (!out_st.metadata.?.contains(entry.key_ptr.*))
                 try out_st.metadata.?.put(arena_alloc, try arena_alloc.dupe(u8, entry.key_ptr.*), entry.value_ptr.*);
         }
-    } else if (f.metadata) |meta| {
+    } else if (f.getSourceMetadata()) |meta| {
         var it = meta.iterator();
         while (it.next()) |entry| {
             if (!out_st.metadata.?.contains(entry.key_ptr.*))

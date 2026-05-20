@@ -99,6 +99,11 @@ pub fn deinit(self: *Safetensors) void {
     // tensors and metadata are in an arena allocator, so we don't need to free them specifically
 }
 
+/// Returns source metadata as an optional, matching the Gguf convention.
+pub fn getSourceMetadata(self: Safetensors) ?std.json.ObjectMap {
+    return self.metadata;
+}
+
 fn loadSingle(self: *Safetensors, path: []const u8) !void {
     const file = try std.Io.Dir.cwd().openFile(self.io, path, .{ .mode = .read_only });
     defer file.close(self.io);
@@ -762,7 +767,7 @@ pub fn writeTensorData(
     }
 }
 
-pub fn saveWithSTData(self: Safetensors, source: *Safetensors, threads: usize, callbacks: cb.ConvertCallbacks, groups: *const ScaledQuant.GroupResult) !void {
+pub fn saveWithSTData(self: Safetensors, source: anytype, threads: usize, callbacks: cb.ConvertCallbacks, groups: *const ScaledQuant.GroupResult) !void {
     // Build the full header JSON object (tensor entries + __metadata__)
     var header_obj = std.json.ObjectMap.empty;
 

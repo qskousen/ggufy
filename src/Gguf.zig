@@ -19,6 +19,9 @@ version: u32 = 0,
 
 alignment: u32 = 32,
 data_offset: u64 = 0,
+/// Set equal to data_offset after init; lets Gguf satisfy the source duck-type
+/// used by saveWithSTData (offset + current_data_begin = absolute file position).
+current_data_begin: u64 = 0,
 file_size: u64 = 0,
 
 pub const formatType = types.FileType.gguf;
@@ -156,6 +159,10 @@ pub fn init(path: []const u8, io: std.Io, mem_allocator: std.mem.Allocator, aren
         var n_elements: u64 = 1;
         for (dims) |d| n_elements *= d;
 
+        // Reverse dims from GGUF file order (innermost-first) to natural order (outermost-first)
+        // so the rest of the pipeline matches the SafeTensors convention.
+        std.mem.reverse(usize, dims);
+
         try self.tensors.append(self.arena_alloc, .{
             .name = name,
             .type = @tagName(tensor_type),
@@ -170,6 +177,7 @@ pub fn init(path: []const u8, io: std.Io, mem_allocator: std.mem.Allocator, aren
     const alignment = self.metadata.get("general.alignment") orelse std.json.Value{ .integer = 32 };
     const align_val: u64 = @intCast(alignment.integer);
     self.data_offset = ((header_end + align_val - 1) / align_val) * align_val;
+    self.current_data_begin = self.data_offset;
 
     return self;
 }
@@ -177,6 +185,18 @@ pub fn init(path: []const u8, io: std.Io, mem_allocator: std.mem.Allocator, aren
 pub fn deinit(self: *Gguf) void {
     self.file.close(self.io);
     // tensors info and metadata use arena allocation, so freeing them specifically is not needed
+}
+
+/// Satisfies the duck-typed source interface used by saveWithSTData.
+/// GGUF is never sharded, so every tensor lives in the same file.
+/// After this call, current_data_begin is data_offset (unchanged).
+pub fn openFileForTensor(self: *Gguf, _: []const u8) !std.Io.File {
+    return self.file;
+}
+
+/// Returns source metadata as an optional, matching the SafeTensors convention.
+pub fn getSourceMetadata(self: Gguf) ?std.json.ObjectMap {
+    return if (self.metadata.count() > 0) self.metadata else null;
 }
 
 pub const GgufValueType = enum(u32) {
@@ -355,7 +375,7 @@ const GgufMetadata = struct {
     }
 };
 
-pub fn saveWithSTData(self: Gguf, source: *st, threads: usize, callbacks: cb.ConvertCallbacks, groups: *const ScaledQuant.GroupResult) !void {
+pub fn saveWithSTData(self: Gguf, source: anytype, threads: usize, callbacks: cb.ConvertCallbacks, groups: *const ScaledQuant.GroupResult) !void {
     // we need to track bytes written for calculating alignment for the starting tensor
     var bytes_written: u64 = 0;
 
@@ -853,8 +873,12 @@ pub fn writeTemplate(self: Gguf, writer: *std.Io.Writer) !void {
 
         var shape_arr = std.json.Array.init(self.arena_alloc);
         errdefer shape_arr.deinit();
-        for (t.dims) |dim| {
-            try shape_arr.append(std.json.Value{ .integer = @intCast(dim) });
+        // Reverse dims back to GGUF template convention (innermost-first) so that
+        // applyTemplate (which always un-reverses) round-trips correctly.
+        var di = t.dims.len;
+        while (di > 0) {
+            di -= 1;
+            try shape_arr.append(std.json.Value{ .integer = @intCast(t.dims[di]) });
         }
         try t_obj.put(self.arena_alloc, "shape", std.json.Value{ .array = shape_arr });
         try t_obj.put(self.arena_alloc, "type", std.json.Value{ .string = t.type });

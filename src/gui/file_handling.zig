@@ -336,10 +336,26 @@ pub fn convertFile(alloc: std.mem.Allocator, arena_alloc: std.mem.Allocator, sta
             };
         },
         .gguf => {
-            state.convert_error = error.GgufConversionNotSupported;
-            state.convert_state.store(.err, .release);
-            pushWakeupEvent(state);
-            return;
+            var f = ggufy.gguf.init(path, state.io, alloc, arena_alloc, false) catch |err| {
+                state.convert_error = err;
+                state.convert_state.store(.err, .release);
+                pushWakeupEvent(state);
+                return;
+            };
+            defer f.deinit();
+
+            conv.convert(&f, opts, alloc, arena_alloc) catch |err| {
+                if (err == error.Cancelled) {
+                    state.cancel_requested.store(false, .release);
+                    state.convert_progress.store(0, .release);
+                    state.convert_state.store(.idle, .release);
+                } else {
+                    state.convert_error = err;
+                    state.convert_state.store(.err, .release);
+                }
+                pushWakeupEvent(state);
+                return;
+            };
         },
     }
 
