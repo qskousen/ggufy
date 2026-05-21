@@ -19,6 +19,7 @@ pub const Float8Cluster = struct {
     base_name: []const u8,
     weight: types.Tensor,
     weight_scale: types.Tensor,
+    input_scale: ?types.Tensor,  // optional activation scale (scalar, dropped on conversion)
     comfy_quant: types.Tensor,
     rows: usize,
     cols: usize,
@@ -156,6 +157,8 @@ pub fn groupClusters(
                 defer allocator.free(wname);
                 const wsname = try std.fmt.allocPrint(allocator, "{s}.weight_scale", .{base_name});
                 defer allocator.free(wsname);
+                const isname = try std.fmt.allocPrint(allocator, "{s}.input_scale", .{base_name});
+                defer allocator.free(isname);
 
                 const wi = name_map.get(wname) orelse {
                     std.log.warn("ScaledQuant: missing .weight for fp8 cluster {s}", .{base_name});
@@ -168,11 +171,16 @@ pub fn groupClusters(
 
                 const weight = source.tensors.items[wi];
                 const weight_scale = source.tensors.items[wsi];
+                const input_scale: ?types.Tensor = if (name_map.get(isname)) |isi|
+                    source.tensors.items[isi]
+                else
+                    null;
 
                 try float8_list.append(arena_alloc, .{
                     .base_name = base_name,
                     .weight = weight,
                     .weight_scale = weight_scale,
+                    .input_scale = input_scale,
                     .comfy_quant = t,
                     .rows = weight.dims[0],
                     .cols = weight.dims[1],
@@ -647,8 +655,13 @@ pub fn collapseModelTensors(
                     handled = true;
                     break;
                 }
+                const input_scale_match = if (cluster.input_scale) |is|
+                    nameSuffixMatch(is.name, t.name)
+                else
+                    false;
                 if (nameSuffixMatch(cluster.weight_scale.name, t.name) or
-                    nameSuffixMatch(cluster.comfy_quant.name, t.name))
+                    nameSuffixMatch(cluster.comfy_quant.name, t.name) or
+                    input_scale_match)
                 {
                     handled = true;
                     break;
