@@ -7,6 +7,8 @@ const clap = @import("clap");
 const imagearch = ggufy.imageArch;
 const conv = ggufy.convert;
 
+const build_options = @import("build_options");
+
 const Command = enum {
     header,
     tree,
@@ -15,6 +17,7 @@ const Command = enum {
     template,
     names,
     sensitivities,
+    version,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -38,8 +41,8 @@ pub fn main(init: std.process.Init) !void {
         \\-u, --allow-unknown-arch       Allow converting files with unrecognized architectures. Results may be suboptimal.
         \\-U, --allow-upscale            Allow converting from a lower-precision (quantized/FP8) source to a higher-precision target. The extra bits are fill-in; no quality is recovered.
         \\-A, --arch <NAME>              Set the architecture name written to the GGUF metadata (GGUF output only). Free-form; does not affect conversion behaviour.
-        \\<COMMAND>    Specify a command: header, tree, metadata, convert, template
-        \\<FILENAME>   The file to use for input
+        \\<COMMAND>    Specify a command: header, tree, metadata, convert, template, version
+        \\<FILENAME>   The file to use for input (not required for the version command)
     );
 
     const parsers = comptime .{
@@ -86,7 +89,8 @@ pub fn main(init: std.process.Init) !void {
         try stdout.print("  convert        Convert the specified file into a different format or datatype\n", .{});
         try stdout.print("  template       Creates a json template from the specified file\n", .{});
         try stdout.print("  names          Dump tensor names as a JSON array (for test fixtures)\n", .{});
-        try stdout.print("  sensitivities  Generate a sensitivities JSON template from the specified file\n\n", .{});
+        try stdout.print("  sensitivities  Generate a sensitivities JSON template from the specified file\n", .{});
+        try stdout.print("  version        Print version information\n\n", .{});
         try stdout.print("Options:\n", .{});
         try stdout.flush();
         return clap.helpToFile(io, std.Io.File.stderr(), clap.Help, &params, .{});
@@ -96,6 +100,13 @@ pub fn main(init: std.process.Init) !void {
         std.log.err("No command given. Use --help to get more information.", .{});
         return;
     };
+
+    if (command == .version) {
+        try stdout.print("ggufy {s}\n", .{build_options.version});
+        try stdout.flush();
+        return;
+    }
+
     const path = res.positionals[1] orelse {
         std.log.err("No model file specified.", .{});
         return;
@@ -228,6 +239,7 @@ pub fn main(init: std.process.Init) !void {
                     try stdout.writeAll(json);
                     try stdout.writeByte('\n');
                 },
+                .version => unreachable,
             }
         },
         .gguf => {
@@ -317,6 +329,7 @@ pub fn main(init: std.process.Init) !void {
                     try writer.flush();
                     std.log.info("Sensitivities exported to {s}", .{out_path});
                 },
+                .version => unreachable,
             }
         },
     }

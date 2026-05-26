@@ -3,6 +3,11 @@ const ggml = @import("build_ggml.zig");
 const cimgui = @import("cimgui");
 
 pub fn build(b: *std.Build) void {
+    const git_version = get_git_version(b.allocator, b.graph.io) catch "dev";
+
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", git_version);
+
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
@@ -43,6 +48,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     cli.root_module.addImport("clap", clap.module("clap"));
+    cli.root_module.addOptions("build_options", options);
 
     ggml.link(b, cli, target, optimize);
 
@@ -75,6 +81,7 @@ pub fn build(b: *std.Build) void {
     const dvui_dep = b.dependency("dvui", .{ .target = target, .optimize = optimize, .backend = .sdl3, .@"tree-sitter" = false });
     gui.root_module.addImport("dvui", dvui_dep.module("dvui_sdl3"));
     gui.root_module.addImport("backend", dvui_dep.module("sdl3"));
+    gui.root_module.addOptions("build_options", options);
 
     // When cross-compiling for macOS with an explicit sysroot (e.g. CI),
     // Zig does not automatically add the SDK's framework search path, so we must wire it up ourselves.
@@ -175,4 +182,23 @@ pub fn build(b: *std.Build) void {
     });
     ggml.link(b, scaled_quant_test, target, optimize);
     test_step.dependOn(&b.addRunArtifact(scaled_quant_test).step);
+}
+
+fn get_git_version(allocator: std.mem.Allocator, io: std.Io) ![]const u8 {
+    const version_result = try std.process.run(allocator, io, .{ .argv = &.{ "git", "describe", "--tags", "--always" } });
+    defer allocator.free(version_result.stdout);
+    defer allocator.free(version_result.stderr);
+
+    if (version_result.stdout.len == 0) return error.GitDescribeFailed;
+
+    const status_result = try std.process.run(allocator, io, .{ .argv = &.{ "git", "status", "--porcelain" } });
+    defer allocator.free(status_result.stdout);
+    defer allocator.free(status_result.stderr);
+
+    const trimmed_version = std.mem.trimEnd(u8, version_result.stdout, "\n");
+
+    if (status_result.stdout.len > 0) {
+        return try std.fmt.allocPrint(allocator, "{s}(DIRTY)", .{trimmed_version});
+    }
+    return try allocator.dupe(u8, trimmed_version);
 }

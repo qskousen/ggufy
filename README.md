@@ -6,7 +6,7 @@ ggufy:
 - comes in CLI and GUI flavors
 - is fast and memory efficient
 - supports converting from safetensors to various gguf quantizations
-- supports converting safetensors datatypes (F32, BF16, F16, F8 (E5M2 and E4M3))
+- supports converting safetensors datatypes (F32, BF16, F16, F8 E4M3/E5M2, Scaled F8 E4M3, MXFP8 E4M3, NVFP4)
 - supports converting with "[quantization sensitivity](https://github.com/qskousen/ggufy#sensitivity-aware-quantization)" files (some architectures built-in)
 - currently targets image diffusion models (SD1.5, SDXL, etc.)
 
@@ -278,24 +278,30 @@ ggufy convert --template template.json --datatype q4_k source-model.safetensors
 -t, --template          Use a JSON template for conversion 
 -o, --output-dir        Output directory (default: same as source) 
 -n, --output-name       Output filename without extension (default: source name + datatype) 
--j, --threads           Number of threads for quantization (default: CPU cores - 2)
+-j, --threads           Number of threads for quantization (default: CPU core count)
 -a, --aggressiveness    Aggressiveness of sensitivity-aware quantization (default: 50)
 -x, --skip-sensitivity  Skip sensitivity-aware quantization, quantizing all available layers to target datatype
 -s, --sensitivities <FILENAME> Path to a sensitivities JSON file to use (overrides built-in sensitivities) Sensitivities are only used for GGUF model output.
 -q, --use-quant-types <QTYPES> Quantization families to use with sensitivity (e.g. "k", "0,k", "0,1,k"). Default: match datatype.
 -m, --model-only               When output is safetensors, convert only the main model (UNet/transformer). Ignored for GGUF output.
+-u, --allow-unknown-arch       Allow converting files with unrecognized architectures. Results may be suboptimal.
+-U, --allow-upscale            Allow converting from a lower-precision source to a higher-precision target. The extra bits are fill-in; no quality is recovered.
+-A, --arch <NAME>              Set the architecture name written to GGUF metadata (GGUF output only). Does not affect conversion behaviour.
 
 Commands: 
-header - Display file header information 
-tree - Display tensor hierarchy 
-metadata - Display all metadata key-value pairs 
-convert - Convert model format/quantization 
-template - Export GGUF structure to JSON template
+header        - Display file header information 
+tree          - Display tensor hierarchy 
+metadata      - Display all metadata key-value pairs 
+convert       - Convert model format/quantization 
+template      - Export GGUF structure to JSON template
+names         - Dump tensor names as a JSON array
+sensitivities - Generate a sensitivities JSON template from the specified file
+version       - Print version information
 ```
 
 ## Building
 
-ggufy is built with zig 0.15.2. Clone the repository, with submodules:
+ggufy is built with zig 0.16.0. Clone the repository, with submodules:
 
 ```bash
 git clone --recurse-submodules https://github.com/qskousen/ggufy.git

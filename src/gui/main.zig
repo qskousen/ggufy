@@ -6,6 +6,7 @@ const ggufy = @import("ggufy");
 const guiState = @import("gui_state.zig");
 const fileHandling = @import("file_handling.zig");
 const conv = ggufy.convert;
+const build_options = @import("build_options");
 
 comptime {
     std.debug.assert(@hasDecl(SDLBackend, "SDLBackend"));
@@ -1096,13 +1097,15 @@ fn showUpscaleDialog() void {
 // About modal
 
 fn showAboutModal() void {
-    var float = dvui.floatingWindow(@src(), .{ .modal = true }, .{ .min_size_content = .{ .w = 360, .h = 160 } });
+    var float = dvui.floatingWindow(@src(), .{ .modal = true, .resize = .none }, .{ .min_size_content = .{ .w = 360, .h = 160 } });
     defer float.deinit();
+    float.dragAreaSet(.{});
 
     var content = dvui.box(@src(), .{}, .{ .expand = .both, .padding = .all(20) });
     defer content.deinit();
 
     dvui.label(@src(), "ggufy", .{}, .{ .font = .theme(.title), .margin = .{ .x = 0, .y = 0, .w = 0, .h = 6 } });
+    dvui.label(@src(), "Version: {s}", .{build_options.version}, .{ .margin = .{ .x = 0, .y = 0, .w = 0, .h = 4 } });
     dvui.label(@src(), "Convert ML model files between safetensors and GGUF formats.", .{}, .{ .margin = .{ .x = 0, .y = 0, .w = 0, .h = 4 } });
     dvui.labelNoFmt(@src(), "https://github.com/qskousen/ggufy", .{}, .{ .margin = .{ .x = 0, .y = 0, .w = 0, .h = 16 } });
 
