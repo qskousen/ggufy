@@ -8,6 +8,8 @@ const imagearch = ggufy.imageArch;
 const conv = ggufy.convert;
 
 const build_options = @import("build_options");
+const MergeRepo = ggufy.mergeRepo;
+const TensorClusters = ggufy.tensorClusters;
 
 const Command = enum {
     header,
@@ -18,6 +20,7 @@ const Command = enum {
     names,
     sensitivities,
     version,
+    merge,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -41,8 +44,8 @@ pub fn main(init: std.process.Init) !void {
         \\-u, --allow-unknown-arch       Allow converting files with unrecognized architectures. Results may be suboptimal.
         \\-U, --allow-upscale            Allow converting from a lower-precision (quantized/FP8) source to a higher-precision target. The extra bits are fill-in; no quality is recovered.
         \\-A, --arch <NAME>              Set the architecture name written to the GGUF metadata (GGUF output only). Free-form; does not affect conversion behaviour.
-        \\<COMMAND>    Specify a command: header, tree, metadata, convert, template, version
-        \\<FILENAME>   The file to use for input (not required for the version command)
+        \\<COMMAND>    Specify a command: header, tree, metadata, convert, template, merge, version
+        \\<FILENAME>   The file or directory to use for input (not required for the version command)
     );
 
     const parsers = comptime .{
@@ -90,6 +93,7 @@ pub fn main(init: std.process.Init) !void {
         try stdout.print("  template       Creates a json template from the specified file\n", .{});
         try stdout.print("  names          Dump tensor names as a JSON array (for test fixtures)\n", .{});
         try stdout.print("  sensitivities  Generate a sensitivities JSON template from the specified file\n", .{});
+        try stdout.print("  merge          Merge a HuggingFace diffusers repo directory into a single model file\n", .{});
         try stdout.print("  version        Print version information\n\n", .{});
         try stdout.print("Options:\n", .{});
         try stdout.flush();
@@ -111,6 +115,33 @@ pub fn main(init: std.process.Init) !void {
         std.log.err("No model file specified.", .{});
         return;
     };
+
+    if (command == .merge) {
+        try runMerge(
+            path, io, allocator,
+            res.args.filetype orelse types.FileType.gguf,
+            res.args.datatype,
+            res.args.template,
+            res.args.@"output-dir",
+            res.args.@"output-name",
+            res.args.threads orelse @max(1, try std.Thread.getCpuCount()),
+            res.args.@"skip-sensitivity" != 0,
+            @floatFromInt(res.args.aggressiveness orelse 50),
+            res.args.sensitivities,
+            if (res.args.@"use-quant-types") |s|
+                conv.QuantizationFamilies.parse(s) catch {
+                    std.log.err("Invalid --use-quant-types value '{s}'. Use a comma-separated list of: 0, 1, k", .{s});
+                    return;
+                }
+            else
+                null,
+            res.args.@"allow-unknown-arch" != 0,
+            res.args.@"allow-upscale" != 0,
+            res.args.arch,
+        );
+        try stdout.flush();
+        return;
+    }
     const filetype = res.args.filetype orelse types.FileType.gguf;
     const datatype: ?types.DataType = res.args.datatype;
     const template_path = res.args.template;
@@ -239,7 +270,7 @@ pub fn main(init: std.process.Init) !void {
                     try stdout.writeAll(json);
                     try stdout.writeByte('\n');
                 },
-                .version => unreachable,
+                .version, .merge => unreachable,
             }
         },
         .gguf => {
@@ -329,7 +360,7 @@ pub fn main(init: std.process.Init) !void {
                     try writer.flush();
                     std.log.info("Sensitivities exported to {s}", .{out_path});
                 },
-                .version => unreachable,
+                .version, .merge => unreachable,
             }
         },
     }
@@ -337,4 +368,96 @@ pub fn main(init: std.process.Init) !void {
     std.log.info("Total bytes used in arena allocator: {}", .{arena.queryCapacity()});
     const elapsed = start_ts.durationTo(std.Io.Clock.Timestamp.now(io, .awake));
     std.log.info("Completed in {d:.2} seconds.", .{@as(f64, @floatFromInt(elapsed.raw.nanoseconds)) / std.time.ns_per_s});
+}
+
+fn runMerge(
+    repo_dir: []const u8,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    filetype: types.FileType,
+    datatype: ?types.DataType,
+    template_path: ?[]const u8,
+    output_dir: ?[]const u8,
+    output_name: ?[]const u8,
+    threads: usize,
+    skip_sensitivity: bool,
+    quantization_aggressiveness: f32,
+    sensitivities_path: ?[]const u8,
+    allowed_quant_families: ?conv.QuantizationFamilies,
+    allow_unknown_arch: bool,
+    allow_upscale: bool,
+    arch_override: ?[]const u8,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    var repo = MergeRepo.parseModelIndex(repo_dir, io, allocator) catch |err| {
+        if (err == error.ModelIndexNotFound) {
+            std.log.err("No model_index.json found in {s}. Is this a HuggingFace diffusers repo?", .{repo_dir});
+            return;
+        }
+        return err;
+    };
+    defer repo.deinit();
+
+    std.log.info("Pipeline class: {s}", .{repo.pipeline_class});
+
+    const comp = MergeRepo.getDiffusionComponent(&repo) orelse {
+        std.log.err("No transformer or unet component found in {s}.", .{repo_dir});
+        return;
+    };
+
+    std.log.info("Merging component: {s} ({s})", .{ comp.name, comp.class_name });
+
+    var merged = try MergeRepo.loadMergedSource(
+        comp.dir_path,
+        repo.pipeline_class,
+        io,
+        allocator,
+        arena_alloc,
+    );
+    defer merged.deinit();
+
+    std.log.info("Loaded {} tensors ({} QKV fusions)", .{
+        merged.tensors.items.len,
+        merged.qkv_fusions.items.len,
+    });
+
+    const groups = TensorClusters.GroupResult{
+        .fp4_clusters = &.{},
+        .float8_clusters = &.{},
+        .mxfp4_clusters = &.{},
+        .mxfp8_clusters = &.{},
+        .qkv_fusions = merged.qkv_fusions.items,
+    };
+
+    const default_name = std.fs.path.stem(repo_dir);
+
+    conv.convert(&merged, .{
+        .io = io,
+        .path = repo_dir,
+        .filetype = filetype,
+        .datatype = datatype,
+        .template_path = template_path,
+        .output_dir = output_dir,
+        .output_name = output_name orelse default_name,
+        .threads = threads,
+        .skip_sensitivity = skip_sensitivity,
+        .quantization_aggressiveness = quantization_aggressiveness,
+        .sensitivities_path = sensitivities_path,
+        .allowed_quant_families = allowed_quant_families,
+        .model_only = false,
+        .allow_unknown_arch = allow_unknown_arch,
+        .allow_upscale = allow_upscale,
+        .arch_override = arch_override,
+        .pre_built_groups = groups,
+    }, allocator, arena_alloc) catch |err| {
+        if (err == error.UnknownArchitecture) {
+            std.log.err("Architecture not recognized. Pass --allow-unknown-arch (-u) to convert anyway.", .{});
+            return;
+        }
+        if (err == error.UpscalingNotAllowed) return;
+        return err;
+    };
 }

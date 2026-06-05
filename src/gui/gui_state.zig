@@ -3,9 +3,13 @@ const ggufy = @import("ggufy");
 
 pub const LoadState = enum(u8) { idle, loading, done, err };
 pub const ConvertState = enum(u8) { idle, converting, done, err };
+pub const LoadMode = enum(u8) { file, repo };
 
 pub const State = struct {
     io: std.Io = undefined,
+
+    // Load mode: file vs repo folder
+    load_mode: LoadMode = .file,
 
     // File load
     load_state: std.atomic.Value(LoadState) = .init(.idle),
@@ -17,6 +21,23 @@ pub const State = struct {
     load_error: ?anyerror = null,
     loaded_file: ?ggufy.fileLoader.TensorFile = null,
     wakeup_event_type: u32 = 0,
+
+    // Repo folder selection (parallel to file_selected)
+    folder_selected_buf: [std.fs.max_path_bytes]u8 = undefined,
+    folder_selected: ?[]u8 = null,
+    folder_selected_ready: std.atomic.Value(bool) = .init(false),
+    repo_load_dialog_open: bool = false,
+
+    // Repo info cached after successful load (for display and mergeAndConvert)
+    repo_pipeline_class_buf: [128]u8 = std.mem.zeroes([128]u8),
+    repo_pipeline_class_len: usize = 0,
+    repo_component_name_buf: [64]u8 = std.mem.zeroes([64]u8),
+    repo_component_name_len: usize = 0,
+    repo_component_dir_buf: [std.fs.max_path_bytes]u8 = std.mem.zeroes([std.fs.max_path_bytes]u8),
+    repo_component_dir_len: usize = 0,
+
+    // Merge trigger (parallel to convert_requested)
+    merge_requested: bool = false,
 
     // Conversion options
     /// Set to true after first populating folder/filename buffers from the
@@ -136,5 +157,17 @@ pub const State = struct {
 
     pub fn toolStatus(self: *const State) []const u8 {
         return self.tool_status_buf[0..self.tool_status_len];
+    }
+
+    pub fn repoPipelineClass(self: *const State) []const u8 {
+        return self.repo_pipeline_class_buf[0..self.repo_pipeline_class_len];
+    }
+
+    pub fn repoComponentName(self: *const State) []const u8 {
+        return self.repo_component_name_buf[0..self.repo_component_name_len];
+    }
+
+    pub fn repoComponentDir(self: *const State) []const u8 {
+        return self.repo_component_dir_buf[0..self.repo_component_dir_len];
     }
 };

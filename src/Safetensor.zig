@@ -3,7 +3,7 @@ const types = @import("types.zig");
 const gguf = @import("Gguf.zig");
 const DataTransform = @import("DataTransform.zig");
 const cb = @import("callbacks.zig");
-const ScaledQuant = @import("ScaledQuant.zig");
+const ScaledQuant = @import("TensorClusters.zig");
 const Convert = @import("Convert.zig");
 const thread_pool_mod = @import("ThreadPool.zig");
 
@@ -67,7 +67,7 @@ pub fn init(path: []const u8, io: std.Io, allocator: std.mem.Allocator, arena_al
     var entry_path = path;
     const stat = try std.Io.Dir.cwd().statFile(io, path, .{});
     if (stat.kind == .directory) {
-        // Look for index.json
+        // Look for index.json (model.safetensors.index.json first, then diffusion_pytorch_model)
         const paths_index = [_][]const u8{ path, "model.safetensors.index.json" };
         const index_path = try std.fs.path.join(allocator, &paths_index);
         if (std.Io.Dir.cwd().access(io, index_path, .{})) {
@@ -79,7 +79,19 @@ pub fn init(path: []const u8, io: std.Io, allocator: std.mem.Allocator, arena_al
             if (std.Io.Dir.cwd().access(io, single_path, .{})) {
                 entry_path = single_path;
             } else |_| {
-                return error.ModelNotFound;
+                // Look for diffusion_pytorch_model.safetensors.index.json
+                const dp_index_path = try std.fs.path.join(allocator, &[_][]const u8{ path, "diffusion_pytorch_model.safetensors.index.json" });
+                if (std.Io.Dir.cwd().access(io, dp_index_path, .{})) {
+                    entry_path = dp_index_path;
+                } else |_| {
+                    // Look for diffusion_pytorch_model.safetensors
+                    const dp_single_path = try std.fs.path.join(allocator, &[_][]const u8{ path, "diffusion_pytorch_model.safetensors" });
+                    if (std.Io.Dir.cwd().access(io, dp_single_path, .{})) {
+                        entry_path = dp_single_path;
+                    } else |_| {
+                        return error.ModelNotFound;
+                    }
+                }
             }
         }
     }
@@ -195,26 +207,17 @@ fn loadSharded(self: *Safetensors, index_path: []const u8) !void {
                 self.metadata = m.object;
             }
             first = false;
+            try self.extractTensorsFromObject(self.json_data.?.value.object, full_path);
         } else {
-            // For subsequent shards, we just extract tensors and discard the JSON
-            // Check for metadata if we haven't found it yet
+            defer shard_json.deinit();
             if (self.metadata == null) {
                 if (shard_json.value.object.get("__metadata__")) |m| {
-                    // We need to copy this metadata out because we are about to deinit shard_json
-                    // Actually, simpler to just swap ownership of this json_data if we find metadata
-                    // But that gets messy.
-                    // Let's assume metadata is in the first shard or duplicated.
-                    _ = m;
+                    _ = m; // metadata in non-first shard; copy not implemented yet
                 }
             }
-            defer shard_json.deinit();
+            try self.extractTensorsFromObject(shard_json.value.object, full_path);
+            // defer shard_json.deinit() runs here, after extractTensorsFromObject copied strings
         }
-
-        // We use the JSON object to extract tensors
-        // Note: For the 'first' shard, we are using self.json_data which is valid.
-        // For others, we use shard_json.
-        //const root = if (!first and self.json_data.value == shard_json.value) self.json_data.value.object else shard_json.value.object;
-        try self.extractTensorsFromObject(self.json_data.?.value.object, full_path);
     }
 }
 

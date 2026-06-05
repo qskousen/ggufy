@@ -4,7 +4,7 @@ const types = @import("types.zig");
 const st = @import("Safetensor.zig");
 const DataTransform = @import("DataTransform.zig");
 const cb = @import("callbacks.zig");
-const ScaledQuant = @import("ScaledQuant.zig");
+const ScaledQuant = @import("TensorClusters.zig");
 const thread_pool_mod = @import("ThreadPool.zig");
 
 path: []const u8,

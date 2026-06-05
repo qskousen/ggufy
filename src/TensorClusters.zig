@@ -46,11 +46,22 @@ pub const Mxfp8Cluster = struct {
     cols: usize,
 };
 
+/// Represents three separate Q/K/V source tensors that should be concatenated
+/// (along dim 0) into a single fused QKV tensor during write.
+/// Used by the merge pipeline to avoid materializing temp files.
+pub const QkvFusionCluster = struct {
+    output_name: []const u8,  // name of the fused output tensor (e.g. "*.attention.qkv.weight")
+    q_tensor: types.Tensor,   // to_q — source_path + offset point into the original shard file
+    k_tensor: types.Tensor,
+    v_tensor: types.Tensor,
+};
+
 pub const GroupResult = struct {
     fp4_clusters: []Fp4Cluster,
     float8_clusters: []Float8Cluster,
     mxfp4_clusters: []Mxfp4Cluster,
     mxfp8_clusters: []Mxfp8Cluster,
+    qkv_fusions: []const QkvFusionCluster = &.{},
 };
 
 /// Parse the JSON payload of a comfy_quant blob to identify the quantization scheme.
@@ -123,15 +134,15 @@ pub fn groupClusters(
                 defer allocator.free(ws2name);
 
                 const wi = name_map.get(wname) orelse {
-                    std.log.warn("ScaledQuant: missing .weight for cluster {s}", .{base_name});
+                    std.log.warn("TensorClusters: missing .weight for cluster {s}", .{base_name});
                     continue;
                 };
                 const wsi = name_map.get(wsname) orelse {
-                    std.log.warn("ScaledQuant: missing .weight_scale for cluster {s}", .{base_name});
+                    std.log.warn("TensorClusters: missing .weight_scale for cluster {s}", .{base_name});
                     continue;
                 };
                 const ws2i = name_map.get(ws2name) orelse {
-                    std.log.warn("ScaledQuant: missing .weight_scale_2 for cluster {s}", .{base_name});
+                    std.log.warn("TensorClusters: missing .weight_scale_2 for cluster {s}", .{base_name});
                     continue;
                 };
 
@@ -148,7 +159,7 @@ pub fn groupClusters(
                     .rows = weight.dims[0],
                     .cols = weight.dims[1] * 2,
                 });
-                std.log.debug("ScaledQuant: grouped nvfp4 cluster {s} [{}, {}]", .{
+                std.log.debug("TensorClusters: grouped nvfp4 cluster {s} [{}, {}]", .{
                     base_name, weight.dims[0], weight.dims[1] * 2,
                 });
             },
@@ -161,11 +172,11 @@ pub fn groupClusters(
                 defer allocator.free(isname);
 
                 const wi = name_map.get(wname) orelse {
-                    std.log.warn("ScaledQuant: missing .weight for fp8 cluster {s}", .{base_name});
+                    std.log.warn("TensorClusters: missing .weight for fp8 cluster {s}", .{base_name});
                     continue;
                 };
                 const wsi = name_map.get(wsname) orelse {
-                    std.log.warn("ScaledQuant: missing .weight_scale for fp8 cluster {s}", .{base_name});
+                    std.log.warn("TensorClusters: missing .weight_scale for fp8 cluster {s}", .{base_name});
                     continue;
                 };
 
@@ -185,7 +196,7 @@ pub fn groupClusters(
                     .rows = weight.dims[0],
                     .cols = weight.dims[1],
                 });
-                std.log.debug("ScaledQuant: grouped fp8 cluster {s} [{}, {}]", .{
+                std.log.debug("TensorClusters: grouped fp8 cluster {s} [{}, {}]", .{
                     base_name, weight.dims[0], weight.dims[1],
                 });
             },
@@ -196,11 +207,11 @@ pub fn groupClusters(
                 defer allocator.free(wsname);
 
                 const wi = name_map.get(wname) orelse {
-                    std.log.warn("ScaledQuant: missing .weight for mxfp4 cluster {s}", .{base_name});
+                    std.log.warn("TensorClusters: missing .weight for mxfp4 cluster {s}", .{base_name});
                     continue;
                 };
                 const wsi = name_map.get(wsname) orelse {
-                    std.log.warn("ScaledQuant: missing .weight_scale for mxfp4 cluster {s}", .{base_name});
+                    std.log.warn("TensorClusters: missing .weight_scale for mxfp4 cluster {s}", .{base_name});
                     continue;
                 };
 
@@ -215,7 +226,7 @@ pub fn groupClusters(
                     .rows = weight.dims[0],
                     .cols = weight.dims[1] * 2,
                 });
-                std.log.debug("ScaledQuant: grouped mxfp4 cluster {s} [{}, {}]", .{
+                std.log.debug("TensorClusters: grouped mxfp4 cluster {s} [{}, {}]", .{
                     base_name, weight.dims[0], weight.dims[1] * 2,
                 });
             },
@@ -226,11 +237,11 @@ pub fn groupClusters(
                 defer allocator.free(wsname);
 
                 const wi = name_map.get(wname) orelse {
-                    std.log.warn("ScaledQuant: missing .weight for mxfp8 cluster {s}", .{base_name});
+                    std.log.warn("TensorClusters: missing .weight for mxfp8 cluster {s}", .{base_name});
                     continue;
                 };
                 const wsi = name_map.get(wsname) orelse {
-                    std.log.warn("ScaledQuant: missing .weight_scale for mxfp8 cluster {s}", .{base_name});
+                    std.log.warn("TensorClusters: missing .weight_scale for mxfp8 cluster {s}", .{base_name});
                     continue;
                 };
 
@@ -245,7 +256,7 @@ pub fn groupClusters(
                     .rows = weight.dims[0],
                     .cols = weight.dims[1],
                 });
-                std.log.debug("ScaledQuant: grouped mxfp8 cluster {s} [{}, {}]", .{
+                std.log.debug("TensorClusters: grouped mxfp8 cluster {s} [{}, {}]", .{
                     base_name, weight.dims[0], weight.dims[1],
                 });
             },
@@ -253,7 +264,7 @@ pub fn groupClusters(
         }
     }
 
-    std.log.info("ScaledQuant: found {} nvfp4, {} fp8, {} mxfp4, {} mxfp8 clusters", .{
+    std.log.info("TensorClusters: found {} nvfp4, {} fp8, {} mxfp4, {} mxfp8 clusters", .{
         fp4_list.items.len, float8_list.items.len, mxfp4_list.items.len, mxfp8_list.items.len,
     });
 
@@ -576,6 +587,64 @@ pub fn dequantizeMxfp8Cluster(
     return dequantizeMxfp8Raw(weight_bytes, scale_bytes, cluster.rows, cluster.cols, allocator);
 }
 
+/// Read a single tensor from its shard file and return it as an F32 slice.
+/// Supports BF16 and F32 source types. Caller owns the returned slice.
+fn readShardTensorAsF32(tensor: types.Tensor, io: std.Io, allocator: std.mem.Allocator) ![]f32 {
+    const path = tensor.source_path orelse return error.NoSourcePath;
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+
+    var len_bytes: [8]u8 = undefined;
+    _ = try file.readPositionalAll(io, len_bytes[0..], 0);
+    const header_len = std.mem.readInt(u64, len_bytes[0..8], .little);
+    const data_begin = 8 + header_len;
+
+    const raw_bytes = try allocator.alloc(u8, tensor.size);
+    defer allocator.free(raw_bytes);
+    _ = try file.readPositionalAll(io, raw_bytes, tensor.offset + data_begin);
+
+    if (std.mem.eql(u8, tensor.type, "BF16")) {
+        const n = tensor.size / 2;
+        const out = try allocator.alloc(f32, n);
+        const src_u16 = std.mem.bytesAsSlice(u16, raw_bytes);
+        for (src_u16, 0..) |v, i| {
+            const bits: u32 = @as(u32, v) << 16;
+            out[i] = @bitCast(bits);
+        }
+        return out;
+    } else if (std.mem.eql(u8, tensor.type, "F32")) {
+        const n = tensor.size / 4;
+        const out = try allocator.alloc(f32, n);
+        @memcpy(std.mem.sliceAsBytes(out), raw_bytes);
+        return out;
+    } else {
+        return error.UnsupportedQkvSourceType;
+    }
+}
+
+/// Dequantize a QKV fusion cluster by reading Q, K, V tensors from their shard files
+/// and concatenating them (dim 0) into a single F32 buffer.
+/// Caller owns the returned slice.
+pub fn dequantizeQkvFusion(
+    fusion: QkvFusionCluster,
+    source: anytype,
+    allocator: std.mem.Allocator,
+) ![]f32 {
+    const q_f32 = try readShardTensorAsF32(fusion.q_tensor, source.io, allocator);
+    defer allocator.free(q_f32);
+    const k_f32 = try readShardTensorAsF32(fusion.k_tensor, source.io, allocator);
+    defer allocator.free(k_f32);
+    const v_f32 = try readShardTensorAsF32(fusion.v_tensor, source.io, allocator);
+    defer allocator.free(v_f32);
+
+    const total = q_f32.len + k_f32.len + v_f32.len;
+    const out = try allocator.alloc(f32, total);
+    @memcpy(out[0..q_f32.len], q_f32);
+    @memcpy(out[q_f32.len .. q_f32.len + k_f32.len], k_f32);
+    @memcpy(out[q_f32.len + k_f32.len ..], v_f32);
+    return out;
+}
+
 /// Check whether `dest_tensor` belongs to any cluster in `groups`.
 /// If so, dequantize it and return the F32 buffer. Returns null if not cluster-sourced.
 /// Caller owns the returned slice.
@@ -586,6 +655,11 @@ pub fn tryDequantCluster(
     allocator: std.mem.Allocator,
     pool: *thread_pool_mod.ThreadPool,
 ) !?[]f32 {
+    for (groups.qkv_fusions) |fusion| {
+        if (std.mem.eql(u8, fusion.output_name, dest_tensor.name)) {
+            return try dequantizeQkvFusion(fusion, source, allocator);
+        }
+    }
     for (groups.fp4_clusters) |cluster| {
         if (nameSuffixMatch(cluster.weight.name, dest_tensor.name)) {
             return try dequantizeFp4Cluster(cluster, source, allocator, pool);

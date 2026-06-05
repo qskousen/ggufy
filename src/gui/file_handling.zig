@@ -2,6 +2,8 @@ const std = @import("std");
 const guiState = @import("gui_state.zig");
 const ggufy = @import("ggufy");
 const conv = ggufy.convert;
+const MergeRepo = ggufy.mergeRepo;
+const TensorClusters = ggufy.tensorClusters;
 const SDLBackend = @import("backend");
 
 // Wakeup helper
@@ -364,6 +366,180 @@ pub fn convertFile(alloc: std.mem.Allocator, arena_alloc: std.mem.Allocator, sta
     state.convert_elapsed_ns = @intCast(@max(@as(i96, 0), elapsed.raw.nanoseconds));
 
     // Store output path for display on the done screen.
+    const path_len = @min(output_path_str.len, state.convert_output_path_buf.len);
+    @memcpy(state.convert_output_path_buf[0..path_len], output_path_str[0..path_len]);
+    state.convert_output_path = state.convert_output_path_buf[0..path_len];
+
+    state.convert_state.store(.done, .release);
+    pushWakeupEvent(state);
+}
+
+// Repo folder loading
+
+/// SDL open-folder dialog callback for repo selection — stores path and sets ready flag.
+pub fn repoFolderDialogCallback(userdata: ?*anyopaque, filelist: [*c]const [*c]const u8, _: c_int) callconv(.c) void {
+    const state: *guiState.State = @ptrCast(@alignCast(userdata));
+    state.repo_load_dialog_open = false;
+
+    const files = filelist orelse {
+        std.log.err("Repo folder dialog error: {s}", .{SDLBackend.c.SDL_GetError()});
+        return;
+    };
+    if (files[0] == null) {
+        std.log.info("Repo folder dialog cancelled", .{});
+        return;
+    }
+
+    const path = std.mem.span(files[0]);
+    const can_copy = path.len <= state.folder_selected_buf.len;
+    if (can_copy) {
+        @memcpy(state.folder_selected_buf[0..path.len], path);
+        state.folder_selected = state.folder_selected_buf[0..path.len];
+        state.folder_selected_ready.store(true, .release);
+    } else {
+        state.load_error = error.FilePathTooLong;
+        state.load_state.store(.err, .release);
+        pushWakeupEvent(state);
+    }
+}
+
+/// Validate a HuggingFace diffusers repo folder and cache component info in state.
+/// Handles load_state transitions.  Runs on a detached thread.
+pub fn loadRepoFolder(alloc: std.mem.Allocator, _: std.mem.Allocator, state: *guiState.State) void {
+    state.load_state.store(.loading, .release);
+    pushWakeupEvent(state);
+
+    const path = state.folder_selected.?;
+
+    var repo = MergeRepo.parseModelIndex(path, state.io, alloc) catch |err| {
+        state.load_error = err;
+        state.load_state.store(.err, .release);
+        pushWakeupEvent(state);
+        return;
+    };
+    defer repo.deinit();
+
+    const comp = MergeRepo.getDiffusionComponent(&repo) orelse {
+        state.load_error = error.NoDiffusionComponent;
+        state.load_state.store(.err, .release);
+        pushWakeupEvent(state);
+        return;
+    };
+
+    const cls = repo.pipeline_class;
+    const cls_len = @min(cls.len, state.repo_pipeline_class_buf.len);
+    @memcpy(state.repo_pipeline_class_buf[0..cls_len], cls[0..cls_len]);
+    state.repo_pipeline_class_len = cls_len;
+
+    const name_len = @min(comp.name.len, state.repo_component_name_buf.len);
+    @memcpy(state.repo_component_name_buf[0..name_len], comp.name[0..name_len]);
+    state.repo_component_name_len = name_len;
+
+    const dir_len = @min(comp.dir_path.len, state.repo_component_dir_buf.len);
+    @memcpy(state.repo_component_dir_buf[0..dir_len], comp.dir_path[0..dir_len]);
+    state.repo_component_dir_len = dir_len;
+
+    state.load_state.store(.done, .release);
+    pushWakeupEvent(state);
+}
+
+/// Merge repo shards and convert to a single output file.
+/// Handles convert_state transitions.  Runs on a detached thread.
+pub fn mergeAndConvert(alloc: std.mem.Allocator, arena_alloc: std.mem.Allocator, state: *guiState.State) void {
+    state.convert_state.store(.converting, .release);
+    pushWakeupEvent(state);
+
+    const repo_path = state.folder_selected.?;
+    const comp_dir = state.repoComponentDir();
+    const pipeline_class = state.repoPipelineClass();
+    const folder = state.targetFolder();
+    const filename = state.targetFilename();
+
+    const opts = conv.ConvertOptions{
+        .io = state.io,
+        .path = repo_path,
+        .filetype = state.target_filetype,
+        .datatype = state.target_dtype,
+        .output_dir = if (folder.len > 0) folder else null,
+        .output_name = if (filename.len > 0) filename else null,
+        .threads = state.target_threads,
+        .skip_sensitivity = state.skip_sensitivity,
+        .sensitivities_path = state.sensitivity_path,
+        .template_path = state.template_path,
+        .quantization_aggressiveness = @as(f32, @floatFromInt(state.target_aggressiveness)),
+        .model_only = false,
+        .allow_unknown_arch = state.allow_unknown_arch,
+        .allow_upscale = state.allow_upscale,
+        .arch_override = state.archOverride(),
+        .callbacks = .{
+            .progress_fn = progressCallback,
+            .progress_ctx = state,
+            .cancel_fn = cancelCallback,
+            .cancel_ctx = state,
+        },
+    };
+
+    const output_path_str = conv.computeOutputPath(opts, arena_alloc) catch |err| {
+        state.convert_error = err;
+        state.convert_state.store(.err, .release);
+        pushWakeupEvent(state);
+        return;
+    };
+
+    var merged = MergeRepo.loadMergedSource(comp_dir, pipeline_class, state.io, alloc, arena_alloc) catch |err| {
+        state.convert_error = err;
+        state.convert_state.store(.err, .release);
+        pushWakeupEvent(state);
+        return;
+    };
+    defer merged.deinit();
+
+    const groups = TensorClusters.GroupResult{
+        .fp4_clusters = &.{},
+        .float8_clusters = &.{},
+        .mxfp4_clusters = &.{},
+        .mxfp8_clusters = &.{},
+        .qkv_fusions = merged.qkv_fusions.items,
+    };
+
+    const convert_start_ts = std.Io.Clock.Timestamp.now(state.io, .awake);
+
+    const merge_opts = conv.ConvertOptions{
+        .io = opts.io,
+        .path = opts.path,
+        .filetype = opts.filetype,
+        .datatype = opts.datatype,
+        .output_dir = opts.output_dir,
+        .output_name = opts.output_name,
+        .threads = opts.threads,
+        .skip_sensitivity = opts.skip_sensitivity,
+        .sensitivities_path = opts.sensitivities_path,
+        .template_path = opts.template_path,
+        .quantization_aggressiveness = opts.quantization_aggressiveness,
+        .model_only = false,
+        .allow_unknown_arch = opts.allow_unknown_arch,
+        .allow_upscale = opts.allow_upscale,
+        .arch_override = opts.arch_override,
+        .callbacks = opts.callbacks,
+        .pre_built_groups = groups,
+    };
+
+    conv.convert(&merged, merge_opts, alloc, arena_alloc) catch |err| {
+        if (err == error.Cancelled) {
+            state.cancel_requested.store(false, .release);
+            state.convert_progress.store(0, .release);
+            state.convert_state.store(.idle, .release);
+        } else {
+            state.convert_error = err;
+            state.convert_state.store(.err, .release);
+        }
+        pushWakeupEvent(state);
+        return;
+    };
+
+    const elapsed = convert_start_ts.durationTo(std.Io.Clock.Timestamp.now(state.io, .awake));
+    state.convert_elapsed_ns = @intCast(@max(@as(i96, 0), elapsed.raw.nanoseconds));
+
     const path_len = @min(output_path_str.len, state.convert_output_path_buf.len);
     @memcpy(state.convert_output_path_buf[0..path_len], output_path_str[0..path_len]);
     state.convert_output_path = state.convert_output_path_buf[0..path_len];

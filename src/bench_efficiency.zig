@@ -1,6 +1,6 @@
 const std = @import("std");
 const DataTransform = @import("DataTransform.zig");
-const ScaledQuant = @import("ScaledQuant.zig");
+const ScaledQuant = @import("TensorClusters.zig");
 const types = @import("types.zig");
 const ThreadPool = @import("ThreadPool.zig");
 

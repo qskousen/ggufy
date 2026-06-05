@@ -172,7 +172,7 @@ pub fn build(b: *std.Build) void {
 
     const scaled_quant_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/ScaledQuant.zig"),
+            .root_source_file = b.path("src/TensorClusters.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{

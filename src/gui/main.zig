@@ -110,6 +110,7 @@ pub fn main(init: std.process.Init) !void {
         if (state.file_selected_ready.load(.acquire)) {
             std.log.debug("Loading file: {s}", .{state.file_selected.?});
             state.file_selected_ready.store(false, .release);
+            state.load_mode = .file;
             state.load_state.store(.loading, .release);
             if (state.loaded_file) |*lf| lf.deinit();
             _ = arena.reset(.free_all);
@@ -135,6 +136,36 @@ pub fn main(init: std.process.Init) !void {
             thread.detach();
         }
 
+        // Repo folder load trigger
+        if (state.folder_selected_ready.load(.acquire)) {
+            std.log.debug("Loading repo: {s}", .{state.folder_selected.?});
+            state.folder_selected_ready.store(false, .release);
+            state.load_mode = .repo;
+            state.load_state.store(.loading, .release);
+            if (state.loaded_file) |*lf| lf.deinit();
+            _ = arena.reset(.free_all);
+            state.loaded_file = null;
+            state.convert_options_initialized = false;
+            state.convert_state.store(.idle, .release);
+            state.convert_progress.store(0, .release);
+            state.convert_output_path = null;
+            state.sensitivity_path = null;
+            state.template_path = null;
+            state.skip_sensitivity = false;
+            state.allow_unknown_arch = false;
+            state.allow_upscale = false;
+            state.upscale_pending = false;
+            state.arch_override_buf = std.mem.zeroes([64]u8);
+            state.tool_status_len = 0;
+            state.same_file_error = false;
+            const repo_thread = std.Thread.spawn(.{ .allocator = gpa }, fileHandling.loadRepoFolder, .{ gpa, arena_alloc, &state }) catch |err| {
+                state.load_error = err;
+                state.load_state.store(.err, .release);
+                continue :main_loop;
+            };
+            repo_thread.detach();
+        }
+
         // Conversion trigger
         if (state.convert_requested) {
             state.convert_requested = false;
@@ -150,6 +181,23 @@ pub fn main(init: std.process.Init) !void {
                 continue :main_loop;
             };
             thread.detach();
+        }
+
+        // Merge trigger
+        if (state.merge_requested) {
+            state.merge_requested = false;
+            state.convert_progress.store(0, .release);
+            state.convert_tensor_name_len = 0;
+            state.convert_tensor_src_type_len = 0;
+            state.convert_tensor_dst_type_len = 0;
+            state.convert_tensor_elements = 0;
+            state.convert_error = null;
+            const merge_thread = std.Thread.spawn(.{ .allocator = gpa }, fileHandling.mergeAndConvert, .{ gpa, arena_alloc, &state }) catch |err| {
+                state.convert_error = err;
+                state.convert_state.store(.err, .release);
+                continue :main_loop;
+            };
+            merge_thread.detach();
         }
 
         // Export template trigger (synchronous — fast file write)
@@ -215,6 +263,19 @@ fn gui_frame() bool {
                 }
             }
 
+            if (dvui.menuItemLabel(@src(), "Open Repo...", .{}, .{ .expand = .horizontal }) != null) {
+                if (!state.repo_load_dialog_open) {
+                    state.repo_load_dialog_open = true;
+                    SDLBackend.c.SDL_ShowOpenFolderDialog(
+                        fileHandling.repoFolderDialogCallback,
+                        &state,
+                        g_backend.?.window,
+                        null,
+                        false,
+                    );
+                }
+            }
+
             if (dvui.menuItemLabel(@src(), "Exit", .{}, .{ .expand = .horizontal }) != null) {
                 return false;
             }
@@ -248,7 +309,7 @@ fn gui_frame() bool {
         .idle => showIntro(),
         .loading => showLoading(),
         .done => switch (state.convert_state.load(.acquire)) {
-            .idle => showInputFile(),
+            .idle => if (state.load_mode == .repo) showInputRepo() else showInputFile(),
             .converting => showConverting(),
             .done => showConvertDone(),
             .err => showConvertError(),
@@ -335,7 +396,23 @@ fn showIntro() void {
             );
         }
     }
-    dvui.label(@src(), "Or drag and drop a file", .{}, .{ .gravity_x = 0.5, .font = .theme(.title) });
+
+    dvui.label(@src(), "Or merge a HuggingFace diffusers repo folder", .{}, .{ .gravity_x = 0.5, .font = .theme(.title), .margin = .{ .x = 0, .y = 12, .w = 0, .h = 0 } });
+
+    if (dvui.button(@src(), "Load Repo Folder", .{}, .{ .gravity_x = 0.5 })) {
+        if (!state.repo_load_dialog_open) {
+            state.repo_load_dialog_open = true;
+            SDLBackend.c.SDL_ShowOpenFolderDialog(
+                fileHandling.repoFolderDialogCallback,
+                &state,
+                g_backend.?.window,
+                null,
+                false,
+            );
+        }
+    }
+
+    dvui.label(@src(), "Or drag and drop a file", .{}, .{ .gravity_x = 0.5, .font = .theme(.title), .margin = .{ .x = 0, .y = 12, .w = 0, .h = 0 } });
 }
 
 // Screen: loading
@@ -911,6 +988,7 @@ fn unloadFile() void {
     if (state.loaded_file) |*lf| lf.deinit();
     _ = arena.reset(.free_all);
     state.loaded_file = null;
+    state.load_mode = .file;
     state.convert_options_initialized = false;
     state.convert_state.store(.idle, .release);
     state.convert_progress.store(0, .release);
@@ -919,6 +997,451 @@ fn unloadFile() void {
     state.same_file_error = false;
     state.tool_status_len = 0;
     state.load_state.store(.idle, .release);
+}
+
+// Screen: repo input + conversion options
+
+fn showInputRepo() void {
+    const fa = frameArena();
+
+    // Auto-populate folder/filename once on first display.
+    const first_init = !state.convert_options_initialized;
+    if (first_init) {
+        state.convert_options_initialized = true;
+        // Folder: the repo directory itself
+        const repo_path = state.folder_selected.?;
+        const dir = std.fs.path.dirname(repo_path) orelse repo_path;
+        const dir_len = @min(dir.len, state.target_folder_buf.len - 1);
+        @memcpy(state.target_folder_buf[0..dir_len], dir[0..dir_len]);
+        state.target_folder_buf[dir_len] = 0;
+        // Base stem from repo folder name
+        const stem = std.fs.path.stem(repo_path);
+        const stem_len = @min(stem.len, state.filename_base_stem_buf.len - 1);
+        @memcpy(state.filename_base_stem_buf[0..stem_len], stem[0..stem_len]);
+        state.filename_base_stem_len = stem_len;
+    }
+
+    // Repo info banner
+    {
+        var info_box = dvui.box(@src(), .{}, .{ .expand = .horizontal, .border = dvui.Rect.all(1), .margin = .all(4), .padding = .all(6) });
+        defer info_box.deinit();
+
+        dvui.label(@src(), "{s}", .{state.folder_selected.?}, .{ .font = .theme(.body) });
+        dvui.label(
+            @src(),
+            "Pipeline: {s}   Component: {s}",
+            .{ state.repoPipelineClass(), state.repoComponentName() },
+            .{},
+        );
+    }
+
+    const dim_color = dvui.themeGet().color(.control, .text).opacity(0.45);
+
+    // Conversion options
+    {
+        var opts_box = dvui.box(@src(), .{}, .{ .expand = .horizontal, .margin = .{ .x = 4, .y = 8, .w = 4, .h = 4 } });
+        defer opts_box.deinit();
+
+        const active_types: []const ggufy.types.DataType = if (state.target_filetype == .gguf) &gguf_target_types else &st_target_types;
+        const active_names: []const []const u8 = if (state.target_filetype == .gguf) &gguf_type_names else &st_type_names;
+
+        // Target format row
+        {
+            var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .all(2) });
+            defer row.deinit();
+            var lwd: dvui.WidgetData = undefined;
+            dvui.label(@src(), "Target format", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 120 }, .data_out = &lwd });
+            dvui.tooltip(@src(), .{ .active_rect = lwd.borderRectScale().r },
+                "Choose the output file format.", .{}, .{});
+
+            const prev_filetype = state.target_filetype;
+            _ = dvui.dropdownEnum(@src(), ggufy.types.FileType, .{ .choice = &state.target_filetype }, .{}, .{ .gravity_y = 0.5 });
+            if (state.target_filetype != prev_filetype) {
+                state.target_dtype = null;
+            }
+        }
+
+        // Data type row
+        {
+            var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .all(2) });
+            defer row.deinit();
+            var lwd: dvui.WidgetData = undefined;
+            dvui.label(@src(), "Data type", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 120 }, .data_out = &lwd });
+            dvui.tooltip(@src(), .{ .active_rect = lwd.borderRectScale().r },
+                "Quantization or precision type for the output tensors.", .{}, .{});
+
+            var dtype_idx: ?usize = if (state.target_dtype) |dt| blk: {
+                for (active_types, 0..) |t, i| { if (t == dt) break :blk i; }
+                break :blk null;
+            } else null;
+
+            if (dvui.dropdown(@src(), active_names, .{ .choice_nullable = &dtype_idx }, .{ .placeholder = "Select type..." }, .{ .expand = .horizontal, .gravity_y = 0.5 })) {
+                state.target_dtype = if (dtype_idx) |i| active_types[i] else null;
+            }
+        }
+
+        // Auto-regenerate filename when dtype or template changes (or on first display).
+        const cur_tmpl_len = if (state.template_path) |tp| tp.len else 0;
+        const template_changed = cur_tmpl_len != state.prev_template_path_len;
+        if (first_init or state.target_dtype != state.prev_target_dtype or template_changed) {
+            state.prev_target_dtype = state.target_dtype;
+            state.prev_template_path_len = cur_tmpl_len;
+            const type_name: []const u8 = if (state.template_path) |tp|
+                conv.templateTypeSuffix(state.io, tp, state.target_filetype, fa) catch ""
+            else if (state.target_dtype) |dt|
+                @tagName(dt)
+            else
+                "";
+            const stem = state.filename_base_stem_buf[0..state.filename_base_stem_len];
+            if (type_name.len > 0) {
+                const written = std.fmt.bufPrint(
+                    state.target_filename_buf[0..state.target_filename_buf.len - 1],
+                    "{s}-{s}",
+                    .{ stem, type_name },
+                ) catch state.target_filename_buf[0..stem.len];
+                state.target_filename_buf[written.len] = 0;
+            } else {
+                @memcpy(state.target_filename_buf[0..stem.len], stem);
+                state.target_filename_buf[stem.len] = 0;
+            }
+        }
+
+        // Output folder row
+        {
+            var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .all(2) });
+            defer row.deinit();
+            var lwd: dvui.WidgetData = undefined;
+            dvui.label(@src(), "Output folder", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 120 }, .data_out = &lwd });
+            dvui.tooltip(@src(), .{ .active_rect = lwd.borderRectScale().r },
+                "Directory where the output file will be written. Defaults to the repo's parent directory.", .{}, .{});
+
+            var te = dvui.textEntry(@src(), .{ .text = .{ .buffer = &state.target_folder_buf } }, .{ .expand = .horizontal, .gravity_y = 0.5 });
+            te.deinit();
+
+            if (dvui.button(@src(), "Browse...", .{}, .{ .gravity_y = 0.5 })) {
+                if (!state.folder_dialog_open) {
+                    state.folder_dialog_open = true;
+                    SDLBackend.c.SDL_ShowOpenFolderDialog(
+                        fileHandling.folderDialogCallback,
+                        &state,
+                        g_backend.?.window,
+                        null,
+                        false,
+                    );
+                }
+            }
+        }
+
+        // Output filename row
+        {
+            var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .all(2) });
+            defer row.deinit();
+            var lwd: dvui.WidgetData = undefined;
+            dvui.label(@src(), "Output filename", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 120 }, .data_out = &lwd });
+            dvui.tooltip(@src(), .{ .active_rect = lwd.borderRectScale().r },
+                "Base filename without extension. The correct extension (.gguf / .safetensors) is appended automatically.", .{}, .{});
+
+            var te = dvui.textEntry(@src(), .{ .text = .{ .buffer = &state.target_filename_buf } }, .{ .expand = .horizontal, .gravity_y = 0.5 });
+            te.deinit();
+        }
+
+        // Advanced section
+        {
+            var adv_tree = dvui.TreeWidget.tree(@src(), .{ .enable_reordering = false }, .{ .expand = .horizontal });
+            defer adv_tree.deinit();
+            const adv_branch = adv_tree.branch(@src(), .{ .expanded = false }, .{ .expand = .horizontal });
+            defer adv_branch.deinit();
+            const adv_caret: []const u8 = if (adv_branch.expanded) "v " else "> ";
+            const adv_header = std.fmt.allocPrint(fa, "{s}Advanced", .{adv_caret}) catch "> Advanced";
+            dvui.labelNoFmt(@src(), adv_header, .{}, .{ .expand = .horizontal, .margin = .{ .x = 0, .y = 8, .w = 0, .h = 2 } });
+            if (adv_branch.expander(@src(), .{ .indent = 10 }, .{ .expand = .horizontal })) {
+                const is_safetensors_out = state.target_filetype == .safetensors;
+
+                // Architecture name override — GGUF only
+                {
+                    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .all(2) });
+                    defer row.deinit();
+                    var lwd: dvui.WidgetData = undefined;
+                    dvui.label(@src(), "Architecture", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 120 }, .color_text = if (is_safetensors_out) dim_color else null, .data_out = &lwd });
+                    if (is_safetensors_out) {
+                        dvui.tooltip(@src(), .{ .active_rect = lwd.borderRectScale().r },
+                            "Architecture name is not stored in safetensors output.", .{}, .{});
+                    } else {
+                        dvui.tooltip(@src(), .{ .active_rect = lwd.borderRectScale().r },
+                            "Override the architecture name written to the GGUF metadata. Leave blank to use the auto-detected name.", .{}, .{});
+                    }
+                    if (is_safetensors_out) {
+                        var dummy_buf = state.arch_override_buf;
+                        var te = dvui.textEntry(@src(), .{ .text = .{ .buffer = &dummy_buf } }, .{ .expand = .horizontal, .gravity_y = 0.5, .color_text = dim_color });
+                        te.deinit();
+                    } else {
+                        var te = dvui.textEntry(@src(), .{ .text = .{ .buffer = &state.arch_override_buf } }, .{ .expand = .horizontal, .gravity_y = 0.5 });
+                        te.deinit();
+                    }
+                }
+
+                // Skip sensitivity
+                {
+                    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .all(2) });
+                    defer row.deinit();
+                    var cwd: dvui.WidgetData = undefined;
+                    _ = dvui.checkbox(@src(), &state.skip_sensitivity, "Skip sensitivity", .{
+                        .gravity_y = 0.5,
+                        .color_text = if (is_safetensors_out) dim_color else null,
+                        .data_out = &cwd,
+                    });
+                    if (is_safetensors_out) {
+                        dvui.tooltip(@src(), .{ .active_rect = cwd.borderRectScale().r },
+                            "Sensitivity quantization is only used for GGUF output.", .{}, .{});
+                    } else {
+                        dvui.tooltip(@src(), .{ .active_rect = cwd.borderRectScale().r },
+                            "Quantize all eligible layers uniformly instead of using per-layer sensitivity scores.", .{}, .{});
+                    }
+                }
+
+                // Sensitivity file row
+                {
+                    const blocked_by_template = state.template_path != null;
+                    const blocked = is_safetensors_out or blocked_by_template;
+                    const row_color: ?dvui.Color = if (blocked) dim_color else null;
+
+                    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .all(2) });
+                    defer row.deinit();
+                    dvui.label(@src(), "Sensitivity file", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 120 }, .color_text = row_color });
+
+                    const sens_display = if (state.sensitivity_path) |p| p else "none";
+                    dvui.labelNoFmt(@src(), sens_display, .{}, .{ .expand = .horizontal, .gravity_y = 0.5, .color_text = row_color });
+
+                    if (state.sensitivity_path != null and !blocked) {
+                        if (dvui.button(@src(), "Clear", .{}, .{ .gravity_y = 0.5 })) {
+                            state.sensitivity_path = null;
+                        }
+                    }
+                    var bwd: dvui.WidgetData = undefined;
+                    if (dvui.button(@src(), "Browse...", .{}, .{ .gravity_y = 0.5, .color_text = row_color, .data_out = &bwd })) {
+                        if (!blocked and !state.sensitivity_dialog_open) {
+                            state.sensitivity_dialog_open = true;
+                            SDLBackend.c.SDL_ShowOpenFileDialog(
+                                fileHandling.sensitivityFileCallback,
+                                &state,
+                                g_backend.?.window,
+                                &json_filters,
+                                json_filters.len,
+                                null,
+                                false,
+                            );
+                        }
+                    }
+                    if (is_safetensors_out) {
+                        dvui.tooltip(@src(), .{ .active_rect = bwd.borderRectScale().r },
+                            "Sensitivity files are only used for GGUF output.", .{}, .{});
+                    } else if (blocked_by_template) {
+                        dvui.tooltip(@src(), .{ .active_rect = bwd.borderRectScale().r },
+                            "Cannot use a sensitivity file while a template is selected.", .{}, .{});
+                    }
+                }
+
+                // Template file row
+                {
+                    const blocked_by_sens = state.sensitivity_path != null;
+                    const row_color: ?dvui.Color = if (blocked_by_sens) dim_color else null;
+
+                    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .all(2) });
+                    defer row.deinit();
+                    dvui.label(@src(), "Template file", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 120 }, .color_text = row_color });
+
+                    const tmpl_display = if (state.template_path) |p| p else "none";
+                    dvui.labelNoFmt(@src(), tmpl_display, .{}, .{ .expand = .horizontal, .gravity_y = 0.5, .color_text = row_color });
+
+                    if (state.template_path != null and !blocked_by_sens) {
+                        if (dvui.button(@src(), "Clear", .{}, .{ .gravity_y = 0.5 })) {
+                            state.template_path = null;
+                            state.prev_template_path_len = 0;
+                        }
+                    }
+                    var bwd: dvui.WidgetData = undefined;
+                    if (dvui.button(@src(), "Browse...", .{}, .{ .gravity_y = 0.5, .color_text = row_color, .data_out = &bwd })) {
+                        if (!blocked_by_sens and !state.template_dialog_open) {
+                            state.template_dialog_open = true;
+                            SDLBackend.c.SDL_ShowOpenFileDialog(
+                                fileHandling.templateFileCallback,
+                                &state,
+                                g_backend.?.window,
+                                &json_filters,
+                                json_filters.len,
+                                null,
+                                false,
+                            );
+                        }
+                    }
+                    if (blocked_by_sens) {
+                        dvui.tooltip(@src(), .{ .active_rect = bwd.borderRectScale().r },
+                            "Cannot use a template while a sensitivity file is selected.", .{}, .{});
+                    }
+                }
+
+                // Aggressiveness slider
+                {
+                    const sens_active = !is_safetensors_out and !state.skip_sensitivity and
+                        (state.sensitivity_path != null);
+                    const agg_color: ?dvui.Color = if (!sens_active) dim_color else null;
+
+                    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .all(2) });
+                    defer row.deinit();
+
+                    var lwd: dvui.WidgetData = undefined;
+                    dvui.label(@src(), "Aggressiveness", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 120 }, .color_text = agg_color, .data_out = &lwd });
+                    if (is_safetensors_out) {
+                        dvui.tooltip(@src(), .{ .active_rect = lwd.borderRectScale().r },
+                            "Sensitivity quantization is only used for GGUF output.", .{}, .{});
+                    } else if (!sens_active) {
+                        dvui.tooltip(@src(), .{ .active_rect = lwd.borderRectScale().r },
+                            "Provide a sensitivity file to use aggressiveness control.", .{}, .{});
+                    } else {
+                        dvui.tooltip(@src(), .{ .active_rect = lwd.borderRectScale().r },
+                            "How aggressively to quantize sensitive layers. Higher = smaller file, lower = better quality.", .{}, .{});
+                    }
+
+                    var agg_label_buf: [8]u8 = undefined;
+                    const agg_label = std.fmt.bufPrint(&agg_label_buf, "{d}", .{state.target_aggressiveness}) catch "?";
+                    dvui.labelNoFmt(@src(), agg_label, .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 28 }, .color_text = agg_color });
+
+                    var agg_frac: f32 = (@as(f32, @floatFromInt(state.target_aggressiveness)) - 1.0) / 99.0;
+                    if (sens_active) {
+                        if (dvui.slider(@src(), .{ .fraction = &agg_frac }, .{ .expand = .horizontal, .gravity_y = 0.5 })) {
+                            const raw: u8 = @intFromFloat(@round(agg_frac * 99.0));
+                            state.target_aggressiveness = std.math.clamp(raw + 1, 1, 100);
+                        }
+                    } else {
+                        dvui.progress(@src(), .{ .percent = agg_frac }, .{ .expand = .horizontal, .gravity_y = 0.5, .color_fill = dim_color });
+                    }
+                }
+
+                // Threads slider
+                {
+                    const cpu_f: f32 = @floatFromInt(state.cpu_count);
+                    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .all(2) });
+                    defer row.deinit();
+
+                    var lwd: dvui.WidgetData = undefined;
+                    dvui.label(@src(), "Threads", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 120 }, .data_out = &lwd });
+                    dvui.tooltip(@src(), .{ .active_rect = lwd.borderRectScale().r },
+                        "Number of CPU threads to use during quantization.", .{}, .{});
+
+                    var thr_label_buf: [8]u8 = undefined;
+                    const thr_label = std.fmt.bufPrint(&thr_label_buf, "{d}", .{state.target_threads}) catch "?";
+                    dvui.labelNoFmt(@src(), thr_label, .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 28 } });
+
+                    var thr_frac: f32 = (@as(f32, @floatFromInt(state.target_threads)) - 1.0) / (cpu_f - 1.0);
+                    if (dvui.slider(@src(), .{ .fraction = &thr_frac }, .{ .expand = .horizontal, .gravity_y = 0.5 })) {
+                        const raw = @as(usize, @intFromFloat(@round(thr_frac * (cpu_f - 1.0))));
+                        state.target_threads = std.math.clamp(raw + 1, 1, state.cpu_count);
+                    }
+                }
+            }
+        }
+
+        // Unknown architecture warning + override checkbox
+        {
+            var warn_box = dvui.box(@src(), .{}, .{
+                .expand = .horizontal,
+                .border = dvui.Rect.all(1),
+                .margin = .{ .x = 0, .y = 6, .w = 0, .h = 2 },
+                .padding = .all(6),
+                .color_border = dvui.Color{ .r = 200, .g = 140, .b = 0, .a = 255 },
+            });
+            defer warn_box.deinit();
+            dvui.label(@src(), "Note: Architecture detection runs during conversion (not at load time for repos).", .{}, .{
+                .color_text = dvui.Color{ .r = 200, .g = 140, .b = 0, .a = 200 },
+                .margin = .{ .x = 0, .y = 0, .w = 0, .h = 4 },
+            });
+            _ = dvui.checkbox(@src(), &state.allow_unknown_arch, "Allow unknown architecture", .{});
+        }
+
+        // Action buttons
+        if (state.same_file_error) {
+            dvui.label(@src(), "Output path cannot be the same as the input folder.", .{}, .{
+                .color_text = dvui.Color{ .r = 220, .g = 60, .b = 60, .a = 255 },
+                .margin = .{ .x = 0, .y = 4, .w = 0, .h = 2 },
+            });
+        }
+        {
+            var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .{ .x = 0, .y = 10, .w = 0, .h = 4 } });
+            defer row.deinit();
+
+            if (dvui.button(@src(), "Convert", .{}, .{ .gravity_y = 0.5 })) {
+                launchMerge(fa);
+            }
+
+            // Spacer pushes Unload to the right
+            {
+                var spacer = dvui.box(@src(), .{}, .{ .expand = .horizontal });
+                defer spacer.deinit();
+            }
+
+            if (dvui.button(@src(), "Unload Repo", .{}, .{ .gravity_y = 0.5 })) {
+                unloadFile();
+            }
+        }
+
+        // Status message from tool operations
+        {
+            const status = state.toolStatus();
+            if (status.len > 0) {
+                const color: dvui.Color = if (state.tool_status_is_error)
+                    .{ .r = 220, .g = 60, .b = 60, .a = 255 }
+                else
+                    .{ .r = 80, .g = 180, .b = 80, .a = 255 };
+                dvui.labelNoFmt(@src(), status, .{}, .{ .color_text = color, .margin = .{ .x = 0, .y = 2, .w = 0, .h = 2 } });
+            }
+        }
+    }
+}
+
+/// Compute the output path and either trigger the merge or show a dialog.
+fn launchMerge(fa: std.mem.Allocator) void {
+    const folder = state.targetFolder();
+    const filename = state.targetFilename();
+
+    const opts = conv.ConvertOptions{
+        .io = state.io,
+        .path = state.folder_selected.?,
+        .filetype = state.target_filetype,
+        .datatype = state.target_dtype,
+        .template_path = null,
+        .output_dir = if (folder.len > 0) folder else null,
+        .output_name = if (filename.len > 0) filename else null,
+        .threads = 1,
+        .skip_sensitivity = false,
+        .quantization_aggressiveness = 50,
+        .model_only = false,
+    };
+
+    const out_path = conv.computeOutputPath(opts, fa) catch {
+        state.same_file_error = false;
+        state.merge_requested = true;
+        return;
+    };
+
+    // Reject if output would land inside the source repo folder.
+    if (std.mem.eql(u8, out_path, state.folder_selected.?)) {
+        state.same_file_error = true;
+        return;
+    }
+    state.same_file_error = false;
+
+    const file_exists = blk: {
+        std.Io.Dir.cwd().access(state.io, out_path, .{}) catch break :blk false;
+        break :blk true;
+    };
+
+    if (file_exists) {
+        const len = @min(out_path.len, state.overwrite_pending_path_buf.len);
+        @memcpy(state.overwrite_pending_path_buf[0..len], out_path[0..len]);
+        state.overwrite_pending_path = state.overwrite_pending_path_buf[0..len];
+    } else {
+        state.merge_requested = true;
+    }
 }
 
 // Screen: converting
@@ -1055,7 +1578,11 @@ fn showOverwriteDialog() void {
 
         if (dvui.button(@src(), "Overwrite", .{}, .{ .margin = .all(4) })) {
             state.overwrite_pending_path = null;
-            state.convert_requested = true;
+            if (state.load_mode == .repo) {
+                state.merge_requested = true;
+            } else {
+                state.convert_requested = true;
+            }
         }
     }
 }
@@ -1089,7 +1616,11 @@ fn showUpscaleDialog() void {
         if (dvui.button(@src(), "Convert anyway", .{}, .{ .margin = .all(4) })) {
             state.upscale_pending = false;
             state.allow_upscale = true;
-            state.convert_requested = true;
+            if (state.load_mode == .repo) {
+                state.merge_requested = true;
+            } else {
+                state.convert_requested = true;
+            }
         }
     }
 }

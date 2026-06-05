@@ -8,7 +8,7 @@ const types = @import("types.zig");
 const gguf = @import("Gguf.zig");
 const imagearch = @import("ImageArch.zig");
 const cb = @import("callbacks.zig");
-const ScaledQuant = @import("ScaledQuant.zig");
+const ScaledQuant = @import("TensorClusters.zig");
 const DataTransform = @import("DataTransform.zig");
 
 pub const mxfp4_comfy_json  = "{\"format\":\"mxfp4\"}";
@@ -53,6 +53,9 @@ pub const ConvertOptions = struct {
     allow_upscale: bool = false,
     /// Optional GUI progress/cancel hooks.  No-ops when null.
     callbacks: cb.ConvertCallbacks = .{},
+    /// When set, skip groupClusters() and use these pre-built groups instead.
+    /// Used by the merge command to inject QkvFusionCluster groups.
+    pre_built_groups: ?ScaledQuant.GroupResult = null,
 };
 
 /// Which sub-families of quantized types may be used during sensitivity-aware
@@ -209,7 +212,7 @@ pub fn convert(
     var model_tensors = try filterAndStripTensors(f, arch, opts.filetype, opts.model_only, arena_alloc);
 
     // --- Group and collapse NVFP4/FP8 clusters --------------------------------
-    var groups = try ScaledQuant.groupClusters(f, arena_alloc, allocator);
+    var groups = if (opts.pre_built_groups) |pg| pg else try ScaledQuant.groupClusters(f, arena_alloc, allocator);
     try ScaledQuant.collapseModelTensors(&model_tensors, &groups, arena_alloc);
 
     // --- Assign quantization types (template or auto) -------------------------
