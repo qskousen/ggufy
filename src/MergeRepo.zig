@@ -217,8 +217,129 @@ fn zImageRename(name: []const u8, arena_alloc: std.mem.Allocator) !?[]const u8 {
 }
 
 // ============================================================================
+// Krea2Pipeline transform helpers
+// ============================================================================
+
+const Krea2Renamed = struct {
+    name: []const u8,
+    /// Possibly reshaped (flattened) dims; arena-allocated.
+    dims: []usize,
+};
+
+const Krea2Sub = struct {
+    suffix: []const u8,
+    /// When true, the source tensor's dims are flattened to 1-D in the output.
+    flatten: bool,
+};
+
+/// Map the per-block sub-key of a Krea2 diffusers tensor to its native name.
+/// Shared by transformer_blocks / text_fusion.layerwise_blocks / refiner_blocks.
+/// Returns null for an unrecognised sub-key.
+fn krea2BlockSub(sub: []const u8) ?Krea2Sub {
+    const table = [_]struct { src: []const u8, dst: []const u8, flatten: bool }{
+        .{ .src = "attn.norm_k.weight", .dst = "attn.qknorm.knorm.scale", .flatten = false },
+        .{ .src = "attn.norm_q.weight", .dst = "attn.qknorm.qnorm.scale", .flatten = false },
+        .{ .src = "attn.to_gate.weight", .dst = "attn.gate.weight", .flatten = false },
+        .{ .src = "attn.to_k.weight", .dst = "attn.wk.weight", .flatten = false },
+        .{ .src = "attn.to_out.0.weight", .dst = "attn.wo.weight", .flatten = false },
+        .{ .src = "attn.to_q.weight", .dst = "attn.wq.weight", .flatten = false },
+        .{ .src = "attn.to_v.weight", .dst = "attn.wv.weight", .flatten = false },
+        .{ .src = "ff.down.weight", .dst = "mlp.down.weight", .flatten = false },
+        .{ .src = "ff.gate.weight", .dst = "mlp.gate.weight", .flatten = false },
+        .{ .src = "ff.up.weight", .dst = "mlp.up.weight", .flatten = false },
+        .{ .src = "norm1.weight", .dst = "prenorm.scale", .flatten = false },
+        .{ .src = "norm2.weight", .dst = "postnorm.scale", .flatten = false },
+        // scale_shift_table is stored [6, hidden] in diffusers but flattened to
+        // [6*hidden] under the native name.
+        .{ .src = "scale_shift_table", .dst = "mod.lin", .flatten = true },
+    };
+    for (table) |e| {
+        if (std.mem.eql(u8, sub, e.src)) return .{ .suffix = e.dst, .flatten = e.flatten };
+    }
+    return null;
+}
+
+fn flattenDims(dims: []const usize, arena_alloc: std.mem.Allocator) ![]usize {
+    var total: usize = 1;
+    for (dims) |d| total *= d;
+    const out = try arena_alloc.alloc(usize, 1);
+    out[0] = total;
+    return out;
+}
+
+/// Map a Krea2 diffusers transformer tensor name to the native single-file
+/// (ComfyUI) naming, reshaping block scale_shift_table tensors to 1-D.
+/// All returned slices are arena-allocated.  Unrecognised names pass through
+/// unchanged (with a warning) so a partial model is still produced.
+fn krea2Rename(name: []const u8, dims: []const usize, arena_alloc: std.mem.Allocator) !Krea2Renamed {
+    // Block-structured groups: "<src>{idx}.<sub>" -> "<dst>{idx}.<mapped-sub>"
+    const block_groups = [_]struct { src: []const u8, dst: []const u8 }{
+        .{ .src = "transformer_blocks.", .dst = "blocks." },
+        .{ .src = "text_fusion.layerwise_blocks.", .dst = "txtfusion.layerwise_blocks." },
+        .{ .src = "text_fusion.refiner_blocks.", .dst = "txtfusion.refiner_blocks." },
+    };
+    for (block_groups) |g| {
+        if (!std.mem.startsWith(u8, name, g.src)) continue;
+        const rest = name[g.src.len..]; // "{idx}.{sub}"
+        const dot = std.mem.indexOfScalar(u8, rest, '.') orelse break;
+        const idx = rest[0..dot];
+        const sub = rest[dot + 1 ..];
+        if (krea2BlockSub(sub)) |mapped| {
+            return .{
+                .name = try std.fmt.allocPrint(arena_alloc, "{s}{s}.{s}", .{ g.dst, idx, mapped.suffix }),
+                .dims = if (mapped.flatten) try flattenDims(dims, arena_alloc) else try arena_alloc.dupe(usize, dims),
+            };
+        }
+        std.log.warn("krea2Rename: unmapped block sub-key '{s}' in '{s}'", .{ sub, name });
+        return .{
+            .name = try std.fmt.allocPrint(arena_alloc, "{s}{s}.{s}", .{ g.dst, idx, sub }),
+            .dims = try arena_alloc.dupe(usize, dims),
+        };
+    }
+
+    // Singletons (exact matches).
+    const singletons = [_]struct { src: []const u8, dst: []const u8 }{
+        .{ .src = "img_in.weight", .dst = "first.weight" },
+        .{ .src = "img_in.bias", .dst = "first.bias" },
+        .{ .src = "txt_in.norm.weight", .dst = "txtmlp.0.scale" },
+        .{ .src = "txt_in.linear_1.weight", .dst = "txtmlp.1.weight" },
+        .{ .src = "txt_in.linear_1.bias", .dst = "txtmlp.1.bias" },
+        .{ .src = "txt_in.linear_2.weight", .dst = "txtmlp.3.weight" },
+        .{ .src = "txt_in.linear_2.bias", .dst = "txtmlp.3.bias" },
+        .{ .src = "time_embed.linear_1.weight", .dst = "tmlp.0.weight" },
+        .{ .src = "time_embed.linear_1.bias", .dst = "tmlp.0.bias" },
+        .{ .src = "time_embed.linear_2.weight", .dst = "tmlp.2.weight" },
+        .{ .src = "time_embed.linear_2.bias", .dst = "tmlp.2.bias" },
+        .{ .src = "time_mod_proj.weight", .dst = "tproj.1.weight" },
+        .{ .src = "time_mod_proj.bias", .dst = "tproj.1.bias" },
+        .{ .src = "text_fusion.projector.weight", .dst = "txtfusion.projector.weight" },
+        .{ .src = "final_layer.linear.weight", .dst = "last.linear.weight" },
+        .{ .src = "final_layer.linear.bias", .dst = "last.linear.bias" },
+        .{ .src = "final_layer.norm.weight", .dst = "last.norm.scale" },
+        // final_layer.scale_shift_table keeps its 2-D shape (unlike block tables).
+        .{ .src = "final_layer.scale_shift_table", .dst = "last.modulation.lin" },
+    };
+    for (singletons) |s| {
+        if (std.mem.eql(u8, name, s.src)) {
+            return .{ .name = try arena_alloc.dupe(u8, s.dst), .dims = try arena_alloc.dupe(usize, dims) };
+        }
+    }
+
+    std.log.warn("krea2Rename: unmapped tensor '{s}' passed through unchanged", .{name});
+    return .{ .name = try arena_alloc.dupe(u8, name), .dims = try arena_alloc.dupe(usize, dims) };
+}
+
+// ============================================================================
 // loadMergedSource
 // ============================================================================
+
+const Pipeline = enum { zimage, krea2, generic };
+
+fn detectPipeline(pipeline_class: []const u8) Pipeline {
+    if (std.mem.eql(u8, pipeline_class, "ZImagePipeline")) return .zimage;
+    if (std.mem.eql(u8, pipeline_class, "Krea2Pipeline")) return .krea2;
+    return .generic;
+}
 
 const PendingQkv = struct {
     q: ?types.Tensor = null,
@@ -239,7 +360,13 @@ pub fn loadMergedSource(
     var st_source = try Safetensor.init(component_dir, io, allocator, arena_alloc, false, false);
     defer st_source.deinit();
 
-    const is_zimage = std.mem.eql(u8, pipeline_class, "ZImagePipeline");
+    const pipeline = detectPipeline(pipeline_class);
+    if (pipeline == .generic) {
+        std.log.warn(
+            "No tensor-renaming rules for pipeline '{s}'; tensors will be written with their original diffusers names.",
+            .{pipeline_class},
+        );
+    }
 
     var out_tensors: std.ArrayList(types.Tensor) = .empty;
     var qkv_fusions: std.ArrayList(ScaledQuant.QkvFusionCluster) = .empty;
@@ -250,39 +377,54 @@ pub fn loadMergedSource(
     defer pending_qkv.deinit();
 
     for (st_source.tensors.items) |raw_t| {
-        if (is_zimage) {
-            const renamed = try zImageRename(raw_t.name, arena_alloc);
-            if (renamed == null) {
-                // QKV component — store for later fusion
-                const m = matchQkv(raw_t.name).?;
-                const prefix_key = try arena_alloc.dupe(u8, m.prefix);
-                const entry = try pending_qkv.getOrPut(prefix_key);
-                if (!entry.found_existing) entry.value_ptr.* = .{};
-                const t_copy = types.Tensor{
-                    .name = try arena_alloc.dupe(u8, raw_t.name),
-                    .type = try arena_alloc.dupe(u8, raw_t.type),
-                    .dims = try arena_alloc.dupe(usize, raw_t.dims),
-                    .size = raw_t.size,
-                    .offset = raw_t.offset,
-                    .source_path = if (raw_t.source_path) |sp| try arena_alloc.dupe(u8, sp) else null,
-                };
-                switch (m.component) {
-                    .q => entry.value_ptr.q = t_copy,
-                    .k => entry.value_ptr.k = t_copy,
-                    .v => entry.value_ptr.v = t_copy,
+        switch (pipeline) {
+            .zimage => {
+                const renamed = try zImageRename(raw_t.name, arena_alloc);
+                if (renamed == null) {
+                    // QKV component — store for later fusion
+                    const m = matchQkv(raw_t.name).?;
+                    const prefix_key = try arena_alloc.dupe(u8, m.prefix);
+                    const entry = try pending_qkv.getOrPut(prefix_key);
+                    if (!entry.found_existing) entry.value_ptr.* = .{};
+                    const t_copy = types.Tensor{
+                        .name = try arena_alloc.dupe(u8, raw_t.name),
+                        .type = try arena_alloc.dupe(u8, raw_t.type),
+                        .dims = try arena_alloc.dupe(usize, raw_t.dims),
+                        .size = raw_t.size,
+                        .offset = raw_t.offset,
+                        .source_path = if (raw_t.source_path) |sp| try arena_alloc.dupe(u8, sp) else null,
+                    };
+                    switch (m.component) {
+                        .q => entry.value_ptr.q = t_copy,
+                        .k => entry.value_ptr.k = t_copy,
+                        .v => entry.value_ptr.v = t_copy,
+                    }
+                } else {
+                    // Normal (possibly renamed) tensor — preserve source_path and offset
+                    var out_t = raw_t;
+                    out_t.name = renamed.?;
+                    if (raw_t.source_path) |sp| {
+                        out_t.source_path = try arena_alloc.dupe(u8, sp);
+                    }
+                    try out_tensors.append(arena_alloc, out_t);
                 }
-            } else {
-                // Normal (possibly renamed) tensor — preserve source_path and offset
+            },
+            .krea2 => {
+                // Krea2 keeps Q/K/V separate (no fusion): rename only, with a
+                // reshape for the block scale_shift_table tensors.
+                const r = try krea2Rename(raw_t.name, raw_t.dims, arena_alloc);
                 var out_t = raw_t;
-                out_t.name = renamed.?;
+                out_t.name = r.name;
+                out_t.dims = r.dims;
                 if (raw_t.source_path) |sp| {
                     out_t.source_path = try arena_alloc.dupe(u8, sp);
                 }
                 try out_tensors.append(arena_alloc, out_t);
-            }
-        } else {
-            // No arch-specific transforms — pass through as-is
-            try out_tensors.append(arena_alloc, raw_t);
+            },
+            .generic => {
+                // No arch-specific transforms — pass through as-is
+                try out_tensors.append(arena_alloc, raw_t);
+            },
         }
     }
 
@@ -334,4 +476,215 @@ pub fn loadMergedSource(
         .tensors = out_tensors,
         .qkv_fusions = qkv_fusions,
     };
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+const testing = std.testing;
+
+test "matchQkv: identifies q/k/v components and strips the suffix" {
+    const mq = matchQkv("blocks.0.attention.to_q.weight").?;
+    try testing.expectEqual(QkvComponent.q, mq.component);
+    try testing.expectEqualStrings("blocks.0", mq.prefix);
+
+    try testing.expectEqual(QkvComponent.k, matchQkv("a.b.attention.to_k.weight").?.component);
+    try testing.expectEqual(QkvComponent.v, matchQkv("a.b.attention.to_v.weight").?.component);
+
+    // to_out / norms / unrelated names are not QKV components
+    try testing.expect(matchQkv("blocks.0.attention.to_out.0.weight") == null);
+    try testing.expect(matchQkv("blocks.0.attention.norm_q.weight") == null);
+    try testing.expect(matchQkv("img_in.weight") == null);
+    // bias variants are not matched (only ".weight" suffixes)
+    try testing.expect(matchQkv("blocks.0.attention.to_q.bias") == null);
+}
+
+test "zImageRename: top-level prefix renames" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try testing.expectEqualStrings(
+        "final_layer.linear.weight",
+        (try zImageRename("all_final_layer.2-1.linear.weight", a)).?,
+    );
+    try testing.expectEqualStrings(
+        "x_embedder.proj.weight",
+        (try zImageRename("all_x_embedder.2-1.proj.weight", a)).?,
+    );
+}
+
+test "zImageRename: attention sub-key renames" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try testing.expectEqualStrings(
+        "blocks.0.attention.k_norm.weight",
+        (try zImageRename("blocks.0.attention.norm_k.weight", a)).?,
+    );
+    try testing.expectEqualStrings(
+        "blocks.0.attention.q_norm.weight",
+        (try zImageRename("blocks.0.attention.norm_q.weight", a)).?,
+    );
+    try testing.expectEqualStrings(
+        "blocks.0.attention.out.weight",
+        (try zImageRename("blocks.0.attention.to_out.0.weight", a)).?,
+    );
+}
+
+test "zImageRename: QKV components signal null, others pass through" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // QKV weights are deferred to a fusion cluster, signalled with null
+    try testing.expect((try zImageRename("blocks.0.attention.to_q.weight", a)) == null);
+    try testing.expect((try zImageRename("blocks.0.attention.to_k.weight", a)) == null);
+    try testing.expect((try zImageRename("blocks.0.attention.to_v.weight", a)) == null);
+
+    // Unrecognised names are passed through unchanged
+    try testing.expectEqualStrings("img_in.weight", (try zImageRename("img_in.weight", a)).?);
+    try testing.expectEqualStrings("blocks.0.mlp.fc1.weight", (try zImageRename("blocks.0.mlp.fc1.weight", a)).?);
+}
+
+test "defaultPrefix: component name mapping" {
+    try testing.expectEqualStrings("model.diffusion_model.", defaultPrefix("transformer"));
+    try testing.expectEqualStrings("model.diffusion_model.", defaultPrefix("unet"));
+    try testing.expectEqualStrings("first_stage_model.", defaultPrefix("vae"));
+    try testing.expectEqualStrings("cond_stage_model.", defaultPrefix("text_encoder"));
+    try testing.expectEqualStrings("", defaultPrefix("scheduler"));
+}
+
+test "parseModelIndex + getDiffusionComponent: parse a diffusers model_index.json" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Mirrors the structure of a real HF diffusers repo (e.g. Krea2/Z-Image).
+    const json =
+        \\{
+        \\  "_class_name": "ZImagePipeline",
+        \\  "_diffusers_version": "0.39.0.dev0",
+        \\  "scheduler": ["diffusers", "FlowMatchEulerDiscreteScheduler"],
+        \\  "transformer": ["diffusers", "ZImageTransformer2DModel"],
+        \\  "vae": ["diffusers", "AutoencoderKL"],
+        \\  "patch_size": 2
+        \\}
+    ;
+    {
+        const f = try tmp.dir.createFile(io, "model_index.json", .{});
+        defer f.close(io);
+        try f.writePositionalAll(io, json, 0);
+    }
+
+    var path_buf: [256]u8 = undefined;
+    const dir_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+
+    var repo = try parseModelIndex(dir_path, io, testing.allocator);
+    defer repo.deinit();
+
+    try testing.expectEqualStrings("ZImagePipeline", repo.pipeline_class);
+    // Keys starting with "_" and scalar values (patch_size) are excluded;
+    // scheduler/transformer/vae remain.
+    try testing.expectEqual(@as(usize, 3), repo.components.len);
+
+    const comp = getDiffusionComponent(&repo).?;
+    try testing.expectEqualStrings("transformer", comp.name);
+    try testing.expectEqualStrings("ZImageTransformer2DModel", comp.class_name);
+}
+
+test "parseModelIndex: missing file returns ModelIndexNotFound" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [256]u8 = undefined;
+    const dir_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+
+    try testing.expectError(error.ModelIndexNotFound, parseModelIndex(dir_path, io, testing.allocator));
+}
+
+test "detectPipeline: maps class names to handlers" {
+    try testing.expectEqual(Pipeline.zimage, detectPipeline("ZImagePipeline"));
+    try testing.expectEqual(Pipeline.krea2, detectPipeline("Krea2Pipeline"));
+    try testing.expectEqual(Pipeline.generic, detectPipeline("FluxPipeline"));
+}
+
+// Ground-truth pairs below were derived by content-hashing every tensor in the
+// distributed Krea2 `transformer/` shards against the native `turbo.safetensors`
+// single-file model (all 430 matched 1:1, zero ambiguity).
+fn expectKrea2(
+    a: std.mem.Allocator,
+    src: []const u8,
+    src_dims: []const usize,
+    exp_name: []const u8,
+    exp_dims: []const usize,
+) !void {
+    const r = try krea2Rename(src, src_dims, a);
+    try testing.expectEqualStrings(exp_name, r.name);
+    try testing.expectEqualSlices(usize, exp_dims, r.dims);
+}
+
+test "krea2Rename: block sub-keys across all three block groups" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const d2 = [_]usize{ 6144, 6144 };
+    // transformer_blocks
+    try expectKrea2(a, "transformer_blocks.0.attn.to_q.weight", &d2, "blocks.0.attn.wq.weight", &d2);
+    try expectKrea2(a, "transformer_blocks.0.attn.to_k.weight", &d2, "blocks.0.attn.wk.weight", &d2);
+    try expectKrea2(a, "transformer_blocks.0.attn.to_v.weight", &d2, "blocks.0.attn.wv.weight", &d2);
+    try expectKrea2(a, "transformer_blocks.0.attn.to_gate.weight", &d2, "blocks.0.attn.gate.weight", &d2);
+    try expectKrea2(a, "transformer_blocks.0.attn.to_out.0.weight", &d2, "blocks.0.attn.wo.weight", &d2);
+    try expectKrea2(a, "transformer_blocks.27.attn.norm_k.weight", &.{128}, "blocks.27.attn.qknorm.knorm.scale", &.{128});
+    try expectKrea2(a, "transformer_blocks.27.attn.norm_q.weight", &.{128}, "blocks.27.attn.qknorm.qnorm.scale", &.{128});
+    try expectKrea2(a, "transformer_blocks.3.ff.down.weight", &d2, "blocks.3.mlp.down.weight", &d2);
+    try expectKrea2(a, "transformer_blocks.3.ff.gate.weight", &d2, "blocks.3.mlp.gate.weight", &d2);
+    try expectKrea2(a, "transformer_blocks.3.ff.up.weight", &d2, "blocks.3.mlp.up.weight", &d2);
+    try expectKrea2(a, "transformer_blocks.0.norm1.weight", &.{6144}, "blocks.0.prenorm.scale", &.{6144});
+    try expectKrea2(a, "transformer_blocks.0.norm2.weight", &.{6144}, "blocks.0.postnorm.scale", &.{6144});
+
+    // text_fusion sub-groups reuse the same sub-key rules
+    try expectKrea2(a, "text_fusion.layerwise_blocks.1.ff.up.weight", &d2, "txtfusion.layerwise_blocks.1.mlp.up.weight", &d2);
+    try expectKrea2(a, "text_fusion.refiner_blocks.0.attn.to_v.weight", &d2, "txtfusion.refiner_blocks.0.attn.wv.weight", &d2);
+    try expectKrea2(a, "text_fusion.layerwise_blocks.0.norm1.weight", &.{2560}, "txtfusion.layerwise_blocks.0.prenorm.scale", &.{2560});
+}
+
+test "krea2Rename: scale_shift_table flattens only inside blocks" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Block scale_shift_table [6, 6144] -> [36864]
+    try expectKrea2(a, "transformer_blocks.0.scale_shift_table", &.{ 6, 6144 }, "blocks.0.mod.lin", &.{36864});
+    // final_layer.scale_shift_table keeps its 2-D shape
+    try expectKrea2(a, "final_layer.scale_shift_table", &.{ 2, 6144 }, "last.modulation.lin", &.{ 2, 6144 });
+}
+
+test "krea2Rename: singletons with inserted indices" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try expectKrea2(a, "img_in.weight", &.{ 6144, 64 }, "first.weight", &.{ 6144, 64 });
+    try expectKrea2(a, "img_in.bias", &.{6144}, "first.bias", &.{6144});
+    try expectKrea2(a, "txt_in.norm.weight", &.{2560}, "txtmlp.0.scale", &.{2560});
+    try expectKrea2(a, "txt_in.linear_1.weight", &.{ 6144, 2560 }, "txtmlp.1.weight", &.{ 6144, 2560 });
+    try expectKrea2(a, "txt_in.linear_2.bias", &.{6144}, "txtmlp.3.bias", &.{6144});
+    try expectKrea2(a, "time_embed.linear_1.weight", &.{ 6144, 256 }, "tmlp.0.weight", &.{ 6144, 256 });
+    try expectKrea2(a, "time_embed.linear_2.weight", &.{ 6144, 6144 }, "tmlp.2.weight", &.{ 6144, 6144 });
+    try expectKrea2(a, "time_mod_proj.weight", &.{ 36864, 6144 }, "tproj.1.weight", &.{ 36864, 6144 });
+    try expectKrea2(a, "text_fusion.projector.weight", &.{ 1, 12 }, "txtfusion.projector.weight", &.{ 1, 12 });
+    try expectKrea2(a, "final_layer.norm.weight", &.{6144}, "last.norm.scale", &.{6144});
+    try expectKrea2(a, "final_layer.linear.weight", &.{ 64, 6144 }, "last.linear.weight", &.{ 64, 6144 });
+}
+
+test "krea2Rename: unknown tensor passes through unchanged" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try expectKrea2(a, "some.unexpected.tensor", &.{4}, "some.unexpected.tensor", &.{4});
 }

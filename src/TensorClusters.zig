@@ -588,8 +588,15 @@ pub fn dequantizeMxfp8Cluster(
 }
 
 /// Read a single tensor from its shard file and return it as an F32 slice.
-/// Supports BF16 and F32 source types. Caller owns the returned slice.
-fn readShardTensorAsF32(tensor: types.Tensor, io: std.Io, allocator: std.mem.Allocator) ![]f32 {
+/// Any source dtype supported by DataTransform (F8/FP4/F16/BF16/F32/F64/GGUF
+/// block types) is dequantized via the shared converter.
+/// Caller owns the returned slice.
+fn readShardTensorAsF32(
+    tensor: types.Tensor,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    pool: *thread_pool_mod.ThreadPool,
+) ![]f32 {
     const path = tensor.source_path orelse return error.NoSourcePath;
     const file = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
@@ -603,23 +610,15 @@ fn readShardTensorAsF32(tensor: types.Tensor, io: std.Io, allocator: std.mem.All
     defer allocator.free(raw_bytes);
     _ = try file.readPositionalAll(io, raw_bytes, tensor.offset + data_begin);
 
-    if (std.mem.eql(u8, tensor.type, "BF16")) {
-        const n = tensor.size / 2;
-        const out = try allocator.alloc(f32, n);
-        const src_u16 = std.mem.bytesAsSlice(u16, raw_bytes);
-        for (src_u16, 0..) |v, i| {
-            const bits: u32 = @as(u32, v) << 16;
-            out[i] = @bitCast(bits);
-        }
-        return out;
-    } else if (std.mem.eql(u8, tensor.type, "F32")) {
-        const n = tensor.size / 4;
-        const out = try allocator.alloc(f32, n);
-        @memcpy(std.mem.sliceAsBytes(out), raw_bytes);
-        return out;
-    } else {
-        return error.UnsupportedQkvSourceType;
-    }
+    const src_type = types.DataType.fromString(tensor.type) catch return error.UnsupportedQkvSourceType;
+
+    var element_count: u64 = 1;
+    for (tensor.dims) |d| element_count *= d;
+
+    return DataTransform.Quantizer.dequantizeToF32Alloc(allocator, raw_bytes, src_type, element_count, pool) catch |err| switch (err) {
+        error.UnsupportedSourceType => error.UnsupportedQkvSourceType,
+        else => err,
+    };
 }
 
 /// Dequantize a QKV fusion cluster by reading Q, K, V tensors from their shard files
@@ -629,12 +628,13 @@ pub fn dequantizeQkvFusion(
     fusion: QkvFusionCluster,
     source: anytype,
     allocator: std.mem.Allocator,
+    pool: *thread_pool_mod.ThreadPool,
 ) ![]f32 {
-    const q_f32 = try readShardTensorAsF32(fusion.q_tensor, source.io, allocator);
+    const q_f32 = try readShardTensorAsF32(fusion.q_tensor, source.io, allocator, pool);
     defer allocator.free(q_f32);
-    const k_f32 = try readShardTensorAsF32(fusion.k_tensor, source.io, allocator);
+    const k_f32 = try readShardTensorAsF32(fusion.k_tensor, source.io, allocator, pool);
     defer allocator.free(k_f32);
-    const v_f32 = try readShardTensorAsF32(fusion.v_tensor, source.io, allocator);
+    const v_f32 = try readShardTensorAsF32(fusion.v_tensor, source.io, allocator, pool);
     defer allocator.free(v_f32);
 
     const total = q_f32.len + k_f32.len + v_f32.len;
@@ -657,7 +657,7 @@ pub fn tryDequantCluster(
 ) !?[]f32 {
     for (groups.qkv_fusions) |fusion| {
         if (std.mem.eql(u8, fusion.output_name, dest_tensor.name)) {
-            return try dequantizeQkvFusion(fusion, source, allocator);
+            return try dequantizeQkvFusion(fusion, source, allocator, pool);
         }
     }
     for (groups.fp4_clusters) |cluster| {
@@ -1060,4 +1060,162 @@ test "NVFP4 dequant: fixture from real ComfyUI model (128×256 slice)" {
         }
     }
     try testing.expectEqual(@as(usize, 0), mismatches);
+}
+
+// ----------------------------------------------------------------------------
+// QKV fusion (merge pipeline)
+// ----------------------------------------------------------------------------
+
+/// Write a minimal safetensors file (8-byte header length + JSON header + raw
+/// data) into `tmp` and return a cwd-relative path to it.  `path_buf` must
+/// outlive the returned slice.
+fn writeShardFixture(
+    tmp: *std.testing.TmpDir,
+    file_name: []const u8,
+    header: []const u8,
+    data: []const u8,
+    allocator: std.mem.Allocator,
+    path_buf: []u8,
+) ![]const u8 {
+    const io = std.testing.io;
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    var hl_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &hl_bytes, header.len, .little);
+    try buf.appendSlice(allocator, &hl_bytes);
+    try buf.appendSlice(allocator, header);
+    try buf.appendSlice(allocator, data);
+
+    const f = try tmp.dir.createFile(io, file_name, .{});
+    defer f.close(io);
+    try f.writePositionalAll(io, buf.items, 0);
+
+    return std.fmt.bufPrint(path_buf, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, file_name });
+}
+
+test "dequantizeQkvFusion: concatenates Q, K, V along dim 0 (F32 source)" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Three F32 tensors with distinct, known values laid out back-to-back.
+    const q_data = [_]f32{ 1, 2, 3, 4 }; // [2,2] -> 16 bytes, data_offsets [0,16)
+    const k_data = [_]f32{ 10, 20 }; //       [2,1] ->  8 bytes, data_offsets [16,24)
+    const v_data = [_]f32{ 100, 200, 300 }; // [3,1] -> 12 bytes, data_offsets [24,36)
+
+    const header =
+        \\{"to_q":{"dtype":"F32","shape":[2,2],"data_offsets":[0,16]},"to_k":{"dtype":"F32","shape":[2,1],"data_offsets":[16,24]},"to_v":{"dtype":"F32","shape":[3,1],"data_offsets":[24,36]}}
+    ;
+
+    var data: [36]u8 = undefined;
+    @memcpy(data[0..16], std.mem.sliceAsBytes(&q_data));
+    @memcpy(data[16..24], std.mem.sliceAsBytes(&k_data));
+    @memcpy(data[24..36], std.mem.sliceAsBytes(&v_data));
+
+    var path_buf: [256]u8 = undefined;
+    const shard_path = try writeShardFixture(&tmp, "shard.safetensors", header, &data, allocator, &path_buf);
+
+    var q_dims = [_]usize{ 2, 2 };
+    var k_dims = [_]usize{ 2, 1 };
+    var v_dims = [_]usize{ 3, 1 };
+    const fusion = QkvFusionCluster{
+        .output_name = "blocks.0.attention.qkv.weight",
+        .q_tensor = .{ .name = "to_q", .type = "F32", .dims = &q_dims, .size = 16, .offset = 0, .source_path = shard_path },
+        .k_tensor = .{ .name = "to_k", .type = "F32", .dims = &k_dims, .size = 8, .offset = 16, .source_path = shard_path },
+        .v_tensor = .{ .name = "to_v", .type = "F32", .dims = &v_dims, .size = 12, .offset = 24, .source_path = shard_path },
+    };
+
+    var pool: thread_pool_mod.ThreadPool = undefined;
+    try pool.init(.{ .allocator = allocator, .n_jobs = 1 });
+    defer pool.deinit();
+
+    const out = try dequantizeQkvFusion(fusion, .{ .io = io }, allocator, &pool);
+    defer allocator.free(out);
+
+    const expected = [_]f32{ 1, 2, 3, 4, 10, 20, 100, 200, 300 };
+    try testing.expectEqualSlices(f32, &expected, out);
+}
+
+test "readShardTensorAsF32: decodes BF16 to F32 (via shared converter)" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // BF16 = top 16 bits of the F32 bit pattern:
+    //  1.0 -> 0x3F80, 2.0 -> 0x4000, -1.5 -> 0xBFC0, 0.5 -> 0x3F00
+    const bf16 = [_]u16{ 0x3F80, 0x4000, 0xBFC0, 0x3F00 };
+    const header =
+        \\{"w":{"dtype":"BF16","shape":[4],"data_offsets":[0,8]}}
+    ;
+
+    var path_buf: [256]u8 = undefined;
+    const shard_path = try writeShardFixture(&tmp, "bf16.safetensors", header, std.mem.sliceAsBytes(&bf16), allocator, &path_buf);
+
+    var dims = [_]usize{4};
+    const t = types.Tensor{ .name = "w", .type = "BF16", .dims = &dims, .size = 8, .offset = 0, .source_path = shard_path };
+
+    var pool: thread_pool_mod.ThreadPool = undefined;
+    try pool.init(.{ .allocator = allocator, .n_jobs = 1 });
+    defer pool.deinit();
+
+    const out = try readShardTensorAsF32(t, io, allocator, &pool);
+    defer allocator.free(out);
+
+    const expected = [_]f32{ 1.0, 2.0, -1.5, 0.5 };
+    try testing.expectEqualSlices(f32, &expected, out);
+}
+
+test "readShardTensorAsF32: decodes F16 to F32 (formerly unsupported)" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // IEEE half: 1.0 -> 0x3C00, 2.0 -> 0x4000, -1.5 -> 0xBE00, 0.5 -> 0x3800
+    const f16_bits = [_]u16{ 0x3C00, 0x4000, 0xBE00, 0x3800 };
+    const header =
+        \\{"w":{"dtype":"F16","shape":[4],"data_offsets":[0,8]}}
+    ;
+
+    var path_buf: [256]u8 = undefined;
+    const shard_path = try writeShardFixture(&tmp, "f16.safetensors", header, std.mem.sliceAsBytes(&f16_bits), allocator, &path_buf);
+
+    var dims = [_]usize{4};
+    const t = types.Tensor{ .name = "w", .type = "F16", .dims = &dims, .size = 8, .offset = 0, .source_path = shard_path };
+
+    var pool: thread_pool_mod.ThreadPool = undefined;
+    try pool.init(.{ .allocator = allocator, .n_jobs = 1 });
+    defer pool.deinit();
+
+    const out = try readShardTensorAsF32(t, io, allocator, &pool);
+    defer allocator.free(out);
+
+    const expected = [_]f32{ 1.0, 2.0, -1.5, 0.5 };
+    try testing.expectEqualSlices(f32, &expected, out);
+}
+
+test "readShardTensorAsF32: rejects unrecognised dtype string" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const header =
+        \\{"w":{"dtype":"WEIRD","shape":[2],"data_offsets":[0,4]}}
+    ;
+    const data = [_]u8{ 0, 0, 0, 0 };
+    var path_buf: [256]u8 = undefined;
+    const shard_path = try writeShardFixture(&tmp, "weird.safetensors", header, &data, allocator, &path_buf);
+
+    var dims = [_]usize{2};
+    const t = types.Tensor{ .name = "w", .type = "WEIRD", .dims = &dims, .size = 4, .offset = 0, .source_path = shard_path };
+
+    var pool: thread_pool_mod.ThreadPool = undefined;
+    try pool.init(.{ .allocator = allocator, .n_jobs = 1 });
+    defer pool.deinit();
+
+    try testing.expectError(error.UnsupportedQkvSourceType, readShardTensorAsF32(t, io, allocator, &pool));
 }

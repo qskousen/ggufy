@@ -68,24 +68,26 @@ pub fn init(path: []const u8, io: std.Io, allocator: std.mem.Allocator, arena_al
     const stat = try std.Io.Dir.cwd().statFile(io, path, .{});
     if (stat.kind == .directory) {
         // Look for index.json (model.safetensors.index.json first, then diffusion_pytorch_model)
+        // These candidate paths are arena-allocated: the selected one becomes entry_path
+        // (used throughout parsing) and the rest are reclaimed when the arena is freed.
         const paths_index = [_][]const u8{ path, "model.safetensors.index.json" };
-        const index_path = try std.fs.path.join(allocator, &paths_index);
+        const index_path = try std.fs.path.join(arena_alloc, &paths_index);
         if (std.Io.Dir.cwd().access(io, index_path, .{})) {
             entry_path = index_path;
         } else |_| {
             // Look for model.safetensors
             const paths_single = [_][]const u8{ path, "model.safetensors" };
-            const single_path = try std.fs.path.join(allocator, &paths_single);
+            const single_path = try std.fs.path.join(arena_alloc, &paths_single);
             if (std.Io.Dir.cwd().access(io, single_path, .{})) {
                 entry_path = single_path;
             } else |_| {
                 // Look for diffusion_pytorch_model.safetensors.index.json
-                const dp_index_path = try std.fs.path.join(allocator, &[_][]const u8{ path, "diffusion_pytorch_model.safetensors.index.json" });
+                const dp_index_path = try std.fs.path.join(arena_alloc, &[_][]const u8{ path, "diffusion_pytorch_model.safetensors.index.json" });
                 if (std.Io.Dir.cwd().access(io, dp_index_path, .{})) {
                     entry_path = dp_index_path;
                 } else |_| {
                     // Look for diffusion_pytorch_model.safetensors
-                    const dp_single_path = try std.fs.path.join(allocator, &[_][]const u8{ path, "diffusion_pytorch_model.safetensors" });
+                    const dp_single_path = try std.fs.path.join(arena_alloc, &[_][]const u8{ path, "diffusion_pytorch_model.safetensors" });
                     if (std.Io.Dir.cwd().access(io, dp_single_path, .{})) {
                         entry_path = dp_single_path;
                     } else |_| {

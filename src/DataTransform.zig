@@ -38,6 +38,23 @@ pub const Quantizer = struct {
         return out_buffer;
     }
 
+    /// Dequantize raw tensor bytes of any supported source type into a freshly
+    /// allocated, owned F32 slice.  Reuses the same conversion paths as
+    /// convertTensorData (F8, FP4, F16, BF16, F32, F64, GGUF block types).
+    /// Caller owns the returned slice.
+    pub fn dequantizeToF32Alloc(
+        allocator: std.mem.Allocator,
+        src_data: []const u8,
+        src_type: types.DataType,
+        element_count: u64,
+        pool: *thread_pool_mod.ThreadPool,
+    ) ![]f32 {
+        const out = try allocator.alloc(f32, @intCast(element_count));
+        errdefer allocator.free(out);
+        try dequantizeToF32(src_data, out, src_type, pool);
+        return out;
+    }
+
     fn dequantizeToF32(
         input_bytes: []const u8,
         output_f32: []f32,
