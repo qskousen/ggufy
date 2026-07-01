@@ -67,3 +67,7 @@ test "qwen" {
 test "ernie" {
     try expectArch(@embedFile("test_fixtures/ernie.json"), "ernie");
 }
+
+test "krea2 (native single-file)" {
+    try expectArch(@embedFile("test_fixtures/krea2.json"), "krea2");
+}

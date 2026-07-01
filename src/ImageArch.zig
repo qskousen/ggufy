@@ -405,6 +405,32 @@ pub const ernie = Arch{
     },
 };
 
+pub const krea2 = Arch{
+    .name = "krea2",
+    // Detected on the native (ComfyUI single-file) naming used by Krea2 checkpoints.
+    // qknorm/txtfusion are unique to Krea2, so two keys are enough to disambiguate.
+    .keys_detect = &.{
+        &.{
+            "blocks.0.attn.qknorm.qnorm.scale",
+            "txtfusion.projector.weight",
+        },
+    },
+    .shape_fix = true,
+    .threshhold = null,
+    // RMSNorm (q/k) and LayerNorm scales are precision-sensitive; keep them fp32.
+    .upcast_from_bf16 = &.{
+        ".qknorm.qnorm.scale",
+        ".qknorm.knorm.scale",
+        ".prenorm.scale",
+        ".postnorm.scale",
+    },
+    // ComfyUI infers in_channels from first.weight.shape[1] (=64); NVFP4 nibble-packing
+    // halves that dimension, so keep it as BF16 to preserve the shape.
+    .keys_nvfp4_passthrough = &.{
+        "first.weight",
+    },
+};
+
 /// List of all known architectures, in detection priority order
 pub const arch_list = [_]*const Arch{
     &flux,
@@ -421,6 +447,7 @@ pub const arch_list = [_]*const Arch{
     &lumina2,
     &qwen,
     &ernie,
+    &krea2,
 };
 
 /// Detect architecture from a list of tensor names
@@ -648,4 +675,39 @@ test "detect ltx2 architecture" {
     try std.testing.expectEqualStrings("ltxv", arch.?.name);
     // But it must resolve to the ltx2 constant, not ltxv, to get the correct hiprec list.
     try std.testing.expectEqual(&ltx2, arch.?);
+}
+
+test "detect krea2 architecture" {
+    const names = [_][]const u8{
+        "blocks.0.attn.qknorm.qnorm.scale",
+        "txtfusion.projector.weight",
+    };
+    const arch = detectArch(&names);
+    try std.testing.expect(arch != null);
+    try std.testing.expectEqualStrings("krea2", arch.?.name);
+    try std.testing.expect(arch.?.shape_fix);
+}
+
+test "detect krea2 architecture with prefix" {
+    const names = [_][]const u8{
+        "model.diffusion_model.blocks.0.attn.qknorm.qnorm.scale",
+        "model.diffusion_model.txtfusion.projector.weight",
+    };
+    const arch = detectArch(&names);
+    try std.testing.expect(arch != null);
+    try std.testing.expectEqualStrings("krea2", arch.?.name);
+}
+
+test "krea2 upcast from bf16 - norm scales" {
+    try std.testing.expect(krea2.shouldUpcast("blocks.0.attn.qknorm.qnorm.scale"));
+    try std.testing.expect(krea2.shouldUpcast("blocks.27.attn.qknorm.knorm.scale"));
+    try std.testing.expect(krea2.shouldUpcast("blocks.0.prenorm.scale"));
+    try std.testing.expect(krea2.shouldUpcast("blocks.0.postnorm.scale"));
+    try std.testing.expect(!krea2.shouldUpcast("blocks.0.attn.wq.weight"));
+}
+
+test "krea2 nvfp4 passthrough - first.weight" {
+    try std.testing.expect(krea2.isNvfp4Passthrough("first.weight"));
+    try std.testing.expect(krea2.isNvfp4Passthrough("model.diffusion_model.first.weight"));
+    try std.testing.expect(!krea2.isNvfp4Passthrough("blocks.0.attn.wq.weight"));
 }

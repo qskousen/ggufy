@@ -182,6 +182,19 @@ pub fn build(b: *std.Build) void {
     });
     ggml.link(b, scaled_quant_test, target, optimize);
     test_step.dependOn(&b.addRunArtifact(scaled_quant_test).step);
+
+    const convert_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/Convert.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ggml.h", .module = ggml_h_module },
+            },
+        }),
+    });
+    ggml.link(b, convert_test, target, optimize);
+    test_step.dependOn(&b.addRunArtifact(convert_test).step);
 }
 
 fn get_git_version(allocator: std.mem.Allocator, io: std.Io) ![]const u8 {

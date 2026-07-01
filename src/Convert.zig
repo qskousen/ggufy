@@ -208,6 +208,13 @@ pub fn convert(
     // --- Filter and normalise tensor list ------------------------------------
     var model_tensors = try filterAndStripTensors(f, arch, opts.filetype, opts.model_only, arena_alloc);
 
+    // --- Undo any prior GGUF shape_fix ----------------------------------------
+    // When the source is a GGUF written by this tool, restore each tensor's
+    // logical shape from its "comfy.gguf.orig_shape.<name>" metadata. This makes
+    // round-trips faithful (gguf -> safetensors) and lets shape_fix re-apply
+    // cleanly for gguf -> gguf. No-op for sources without the metadata.
+    try restoreOrigShapes(&model_tensors, f.getSourceMetadata(), arena_alloc);
+
     // --- Group and collapse NVFP4/FP8 clusters --------------------------------
     var groups = try ScaledQuant.groupClusters(f, arena_alloc, allocator);
     try ScaledQuant.collapseModelTensors(&model_tensors, &groups, arena_alloc);
@@ -266,7 +273,13 @@ pub fn convert(
 // Quantization level helpers
 // ============================================================================
 
-pub const QUANTIZATION_THRESHOLD: u64 = 1024;
+// Tensors with fewer than this many elements are never block-quantized; they
+// are kept in a float type instead. This matches the ComfyUI-GGUF (city96)
+// convention: small tensors (modulation tables, projectors, etc.) are loaded by
+// ComfyUI as raw float parameters, so a block-quantized version fails to load.
+// Together with the "never quantize 1D tensors" rule in assignTensorType, this
+// generalizes what would otherwise be a per-architecture hi-precision list.
+pub const QUANTIZATION_THRESHOLD: u64 = 256 * 256;
 
 /// Quantization type hierarchy from lowest to highest precision.
 pub const QuantizationLevel = enum(u8) {
@@ -645,6 +658,14 @@ fn assignTensorType(
         return;
     }
 
+    // ComfyUI compatibility: never block-quantize 1D tensors (norms, biases,
+    // modulation/scale vectors). ComfyUI loads these as raw float parameters
+    // rather than wrapping them for on-the-fly dequant, so an int-quantized
+    // version fails to load with a shape/dtype mismatch (the packed byte length
+    // is read as the element count). This is a structural rule that generalizes
+    // across architectures, replacing most per-model hi-precision lists.
+    if (opts.filetype == .gguf and t.dims.len <= 1) return nearestCompatibleType(t, opts, num_elements);
+
     // Too small to quantize - use nearest compatible type
     if (num_elements < threshold) return nearestCompatibleType(t, opts, num_elements);
 
@@ -817,6 +838,41 @@ fn applySensitivityQuantization(
 // ============================================================================
 
 const REARRANGE_THRESHOLD = 512;
+
+/// Inverse of applyShapeFix: when the source carries "comfy.gguf.orig_shape.<name>"
+/// metadata (i.e. a GGUF previously written with shape_fix), restore each affected
+/// tensor's dims to the recorded original shape. The rearrange is a pure
+/// reinterpretation of contiguous data, so only the dims metadata changes.
+/// No-op for sources without this metadata (e.g. plain safetensors).
+fn restoreOrigShapes(
+    model_tensors: *std.ArrayList(types.Tensor),
+    src_meta: ?std.json.ObjectMap,
+    arena_alloc: std.mem.Allocator,
+) !void {
+    const meta = src_meta orelse return;
+    for (model_tensors.items) |*t| {
+        const key = try std.fmt.allocPrint(arena_alloc, "comfy.gguf.orig_shape.{s}", .{t.name});
+        const value = meta.get(key) orelse continue;
+        const arr = switch (value) {
+            .array => |a| a,
+            else => continue,
+        };
+        const dims = try arena_alloc.alloc(usize, arr.items.len);
+        var ok = true;
+        for (arr.items, 0..) |item, idx| {
+            switch (item) {
+                .integer => |n| dims[idx] = @intCast(n),
+                else => {
+                    ok = false;
+                    break;
+                },
+            }
+        }
+        if (!ok) continue;
+        t.dims = dims;
+        std.log.info("Restored original shape for {s}", .{t.name});
+    }
+}
 
 /// Reshapes qualifying tensors to (N/256, 256) for ComfyUI compatibility and
 /// records their original shapes under "comfy.gguf.orig_shape.<name>" in
@@ -1240,4 +1296,90 @@ pub fn generateSensitivitiesFromTensors(
 
     var stringifier = std.json.Stringify{ .writer = writer, .options = .{ .whitespace = .indent_2 } };
     try stringifier.write(std.json.Value{ .object = sens_obj });
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+const testing = std.testing;
+
+test "restoreOrigShapes: restores dims from orig_shape metadata, leaves others" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Source metadata as produced by applyShapeFix on a prior GGUF write.
+    var meta: std.json.ObjectMap = .empty;
+    var shape_arr = std.json.Array.init(a);
+    try shape_arr.append(.{ .integer = 6144 });
+    try shape_arr.append(.{ .integer = 64 });
+    try meta.put(a, "comfy.gguf.orig_shape.first.weight", .{ .array = shape_arr });
+
+    var dims_fixed = [_]usize{ 1536, 256 }; // rearranged form stored in the GGUF
+    var dims_plain = [_]usize{ 6144, 6144 }; // no orig_shape entry
+    var model_tensors: std.ArrayList(types.Tensor) = .empty;
+    try model_tensors.append(a, .{ .name = "first.weight", .type = "bf16", .dims = &dims_fixed, .size = 0, .offset = 0 });
+    try model_tensors.append(a, .{ .name = "blocks.0.attn.wq.weight", .type = "bf16", .dims = &dims_plain, .size = 0, .offset = 0 });
+
+    try restoreOrigShapes(&model_tensors, meta, a);
+
+    try testing.expectEqualSlices(usize, &.{ 6144, 64 }, model_tensors.items[0].dims);
+    try testing.expectEqualSlices(usize, &.{ 6144, 6144 }, model_tensors.items[1].dims);
+}
+
+test "restoreOrigShapes: no-op when source has no metadata" {
+    const a = testing.allocator;
+    var dims = [_]usize{ 1536, 256 };
+    var model_tensors: std.ArrayList(types.Tensor) = .empty;
+    defer model_tensors.deinit(a);
+    try model_tensors.append(a, .{ .name = "first.weight", .type = "bf16", .dims = &dims, .size = 0, .offset = 0 });
+
+    try restoreOrigShapes(&model_tensors, null, a);
+
+    try testing.expectEqualSlices(usize, &.{ 1536, 256 }, model_tensors.items[0].dims);
+}
+
+/// Minimal ConvertOptions for exercising assignTensorType in tests.
+fn testOpts(datatype: types.DataType) ConvertOptions {
+    return .{
+        .io = undefined, // unused by assignTensorType
+        .path = "",
+        .filetype = .gguf,
+        .datatype = datatype,
+        .template_path = null,
+        .output_dir = null,
+        .output_name = null,
+        .threads = 1,
+        .skip_sensitivity = true,
+        .quantization_aggressiveness = 0,
+    };
+}
+
+test "assignTensorType: 1D tensors are never block-quantized" {
+    const opts = testOpts(.q8_0);
+    // 1D and larger than the small-tensor threshold: only the 1D rule can keep it float.
+    var dims = [_]usize{200000};
+    var t = types.Tensor{ .name = "blocks.0.mod.lin", .type = "BF16", .dims = &dims, .size = 0, .offset = 0 };
+    try assignTensorType(&t, 200000, &imagearch.generic_arch, QUANTIZATION_THRESHOLD, opts, false, null);
+    // BF16 -> f32 via nearestCompatibleType; crucially NOT q8_0.
+    try testing.expectEqualStrings("f32", t.type);
+}
+
+test "assignTensorType: small 2D tensors are kept float" {
+    const opts = testOpts(.q8_0);
+    // last.modulation.lin [2, 6144] = 12288 elements, below the threshold.
+    var dims = [_]usize{ 2, 6144 };
+    var t = types.Tensor{ .name = "last.modulation.lin", .type = "BF16", .dims = &dims, .size = 0, .offset = 0 };
+    try assignTensorType(&t, 12288, &imagearch.generic_arch, QUANTIZATION_THRESHOLD, opts, false, null);
+    try testing.expectEqualStrings("f32", t.type);
+}
+
+test "assignTensorType: large 2D weights are quantized" {
+    const opts = testOpts(.q8_0);
+    var dims = [_]usize{ 6144, 6144 }; // ~37.7M elements
+    const n: u64 = 6144 * 6144;
+    var t = types.Tensor{ .name = "blocks.0.attn.wq.weight", .type = "BF16", .dims = &dims, .size = 0, .offset = 0 };
+    try assignTensorType(&t, n, &imagearch.generic_arch, QUANTIZATION_THRESHOLD, opts, false, null);
+    try testing.expectEqualStrings("q8_0", t.type);
 }
