@@ -751,6 +751,241 @@ pub const Quantizer = struct {
     }
 
     // -------------------------------------------------------------------------
+    // ConvRot INT8 (ComfyUI "int8_tensorwise" with convrot + per_row).
+    //
+    // Weights are rotated by a normalized *regular* Hadamard matrix (a Kronecker
+    // power of H4) in groups along the input dimension, then per-row INT8 quantized.
+    // The rotation spreads per-channel outliers within each group, tightening the
+    // per-row dynamic range and cutting quantization error. Because the matrix is
+    // symmetric and orthogonal (H @ H = I), the same transform both applies the
+    // rotation (quantize) and undoes it (dequantize).
+    //
+    // A dense group matmul would cost rows*cols*group_size FLOPs. Since the matrix
+    // is H4^{⊗k}, we instead use the fast radix-4 Hadamard transform (O(N·log₄N)),
+    // which computes the identical linear map. `buildHadamard` returns the dense
+    // matrix and exists only as a reference for validating the fast transform.
+    // -------------------------------------------------------------------------
+
+    /// Regular order-4 Hadamard (symmetric, entries ±1), row-major.
+    /// H4 = [[1,1,1,-1],[1,1,-1,1],[1,-1,1,1],[-1,1,1,1]] — matches comfy_kitchen.
+    const h4_raw = [16]f32{ 1, 1, 1, -1, 1, 1, -1, 1, 1, -1, 1, 1, -1, 1, 1, 1 };
+
+    /// True for sizes that are a power of 4 and ≥ 4 (valid regular-Hadamard orders).
+    pub fn isValidHadamardSize(size: usize) bool {
+        return size >= 4 and (size & (size - 1)) == 0 and (@ctz(size) & 1) == 0;
+    }
+
+    /// Build a normalized regular Hadamard matrix of the given power-of-4 `size`,
+    /// row-major [size*size]. Entries are ±1/√size. Reference implementation used to
+    /// validate `hadamardTransformInPlace`; the hot path uses the fast transform.
+    /// Caller owns the returned slice.
+    pub fn buildHadamard(allocator: std.mem.Allocator, size: usize) ![]f32 {
+        if (!isValidHadamardSize(size)) return error.InvalidHadamardSize;
+
+        var cur: usize = 4;
+        var h = try allocator.alloc(f32, 16);
+        @memcpy(h, &h4_raw);
+        errdefer allocator.free(h);
+
+        while (cur < size) {
+            const next = cur * 4;
+            const nh = try allocator.alloc(f32, next * next);
+            // nh = kron(h, H4): nh[(ra*4+rb), (ca*4+cb)] = h[ra,ca] * H4[rb,cb]
+            for (0..cur) |ra| {
+                for (0..cur) |ca| {
+                    const a = h[ra * cur + ca];
+                    for (0..4) |rb| {
+                        for (0..4) |cb| {
+                            nh[(ra * 4 + rb) * next + (ca * 4 + cb)] = a * h4_raw[rb * 4 + cb];
+                        }
+                    }
+                }
+            }
+            allocator.free(h);
+            h = nh;
+            cur = next;
+        }
+
+        const norm = 1.0 / @sqrt(@as(f32, @floatFromInt(size)));
+        for (h) |*v| v.* *= norm;
+        return h;
+    }
+
+    /// Apply the normalized regular Hadamard transform to `v` in place.
+    /// `v.len` must be a power of 4. Radix-4 butterfly (iterative, natural order);
+    /// computes exactly H4^{⊗k} @ v then scales by 1/√len. Its own inverse.
+    pub fn hadamardTransformInPlace(v: []f32) void {
+        const n = v.len;
+        var h: usize = 1;
+        while (h < n) : (h *= 4) {
+            var i: usize = 0;
+            while (i < n) : (i += h * 4) {
+                var j = i;
+                while (j < i + h) : (j += 1) {
+                    const a = v[j];
+                    const b = v[j + h];
+                    const c = v[j + 2 * h];
+                    const d = v[j + 3 * h];
+                    v[j] = a + b + c - d;
+                    v[j + h] = a + b - c + d;
+                    v[j + 2 * h] = a - b + c + d;
+                    v[j + 3 * h] = -a + b + c + d;
+                }
+            }
+        }
+        const norm = 1.0 / @sqrt(@as(f32, @floatFromInt(n)));
+        for (v) |*x| x.* *= norm;
+    }
+
+    fn rotateGroupwiseRows(
+        buf: []f32,
+        cols: usize,
+        group_size: usize,
+        start_row: usize,
+        end_row: usize,
+    ) void {
+        const n_groups = cols / group_size;
+        for (start_row..end_row) |row| {
+            for (0..n_groups) |g| {
+                const base = row * cols + g * group_size;
+                hadamardTransformInPlace(buf[base .. base + group_size]);
+            }
+        }
+    }
+
+    /// Rotate a [rows*cols] matrix in place: apply the Hadamard transform to each
+    /// contiguous group of `group_size` elements along the column (input) dimension.
+    /// Serves both directions (quantize rotate / dequantize un-rotate). Threaded over rows.
+    pub fn rotateGroupwiseInPlace(
+        buf: []f32,
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        pool: *thread_pool_mod.ThreadPool,
+    ) !void {
+        if (!isValidHadamardSize(group_size)) return error.InvalidHadamardSize;
+        if (cols % group_size != 0) return error.ColsNotDivisibleByGroupSize;
+
+        const threads_u64: u64 = @intCast(pool.threads.len);
+        const rows_u64: u64 = @intCast(rows);
+        const rows_per_thread = @divTrunc(rows_u64, threads_u64);
+        const leftover = rows_u64 - (rows_per_thread * threads_u64);
+
+        var wg: thread_pool_mod.WaitGroup = .{};
+        var i: u64 = 0;
+        while (i < threads_u64) : (i += 1) {
+            const start = i * rows_per_thread;
+            var end = start + rows_per_thread;
+            if (i == threads_u64 - 1) end += leftover;
+            if (start == end) continue;
+            pool.spawnWg(&wg, rotateGroupwiseRows, .{ buf, cols, group_size, @as(usize, @intCast(start)), @as(usize, @intCast(end)) });
+        }
+        wg.wait();
+    }
+
+    /// Round half-to-even (banker's rounding), matching torch's `.round()`.
+    fn roundHalfToEven(x: f32) f32 {
+        const fl = @floor(x);
+        const diff = x - fl;
+        if (diff < 0.5) return fl;
+        if (diff > 0.5) return fl + 1.0;
+        return if (@mod(fl, 2.0) == 0.0) fl else fl + 1.0;
+    }
+
+    pub const ConvrotInt8Data = struct {
+        weight: []u8, // int8 bit patterns, [rows*cols]
+        scale: []f32, // per-row scale, [rows]
+    };
+
+    /// Quantize a [rows*cols] F32 matrix to ComfyUI int8_tensorwise (per-row) INT8.
+    /// When `convrot`, first rotate group-wise with the Hadamard transform (cols must be
+    /// divisible by `group_size`, a power of 4). Matches comfy_kitchen's quantize path:
+    ///   scale[r] = max(amax(row[r]) / 127, 1e-30)
+    ///   q[r,c]   = clamp(round_half_even(row[r,c] / scale[r]), -128, 127)
+    /// Caller owns both slices.
+    pub fn quantizeToInt8(
+        allocator: std.mem.Allocator,
+        input: []const f32,
+        rows: usize,
+        cols: usize,
+        convrot: bool,
+        group_size: usize,
+        pool: *thread_pool_mod.ThreadPool,
+    ) !ConvrotInt8Data {
+        if (input.len != rows * cols) return error.InputSizeMismatch;
+
+        // Rotation is in-place, so it needs a mutable copy; plain int8 reads the input directly.
+        var rotated: []f32 = &.{};
+        defer if (convrot) allocator.free(rotated);
+        if (convrot) {
+            rotated = try allocator.alloc(f32, input.len);
+            @memcpy(rotated, input);
+            try rotateGroupwiseInPlace(rotated, rows, cols, group_size, pool);
+        }
+        const work: []const f32 = if (convrot) rotated else input;
+
+        const weight = try allocator.alloc(u8, rows * cols);
+        errdefer allocator.free(weight);
+        const scale = try allocator.alloc(f32, rows);
+        errdefer allocator.free(scale);
+
+        // Rows are independent (each carries its own scale) — quantize them in parallel.
+        const threads_u64: u64 = @intCast(pool.threads.len);
+        const rows_u64: u64 = @intCast(rows);
+        const rows_per_thread = @divTrunc(rows_u64, threads_u64);
+        const leftover = rows_u64 - (rows_per_thread * threads_u64);
+
+        var wg: thread_pool_mod.WaitGroup = .{};
+        var i: u64 = 0;
+        while (i < threads_u64) : (i += 1) {
+            const start = i * rows_per_thread;
+            var end = start + rows_per_thread;
+            if (i == threads_u64 - 1) end += leftover;
+            if (start == end) continue;
+            pool.spawnWg(&wg, quantizeInt8Rows, .{ work, weight, scale, cols, @as(usize, @intCast(start)), @as(usize, @intCast(end)) });
+        }
+        wg.wait();
+
+        return .{ .weight = weight, .scale = scale };
+    }
+
+    fn quantizeInt8Rows(
+        work: []const f32,
+        weight: []u8,
+        scale: []f32,
+        cols: usize,
+        start_row: usize,
+        end_row: usize,
+    ) void {
+        for (start_row..end_row) |r| {
+            const row = work[r * cols .. r * cols + cols];
+            var amax: f32 = 0.0;
+            for (row) |v| {
+                if (!std.math.isNan(v) and !std.math.isInf(v)) amax = @max(amax, @abs(v));
+            }
+            const s: f32 = @max(amax / 127.0, 1e-30);
+            scale[r] = s;
+            for (row, 0..) |v, c| {
+                // True division (not multiply-by-reciprocal) to match torch's x/scale bit-for-bit.
+                const q = std.math.clamp(roundHalfToEven(v / s), -128.0, 127.0);
+                weight[r * cols + c] = @bitCast(@as(i8, @intFromFloat(q)));
+            }
+        }
+    }
+
+    /// Convenience wrapper: ConvRot INT8 (always rotates). See `quantizeToInt8`.
+    pub fn quantizeToConvrotInt8(
+        allocator: std.mem.Allocator,
+        input: []const f32,
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        pool: *thread_pool_mod.ThreadPool,
+    ) !ConvrotInt8Data {
+        return quantizeToInt8(allocator, input, rows, cols, true, group_size, pool);
+    }
+
+    // -------------------------------------------------------------------------
     // ComfyUI MXFP cluster quantization.
     // Produces weight and scale.
     // -------------------------------------------------------------------------
@@ -967,6 +1202,109 @@ fn readFileToOwnedSlice(allocator: std.mem.Allocator, path: []const u8, max_size
     errdefer allocator.free(buf);
     _ = try file.readPositionalAll(io, buf, 0);
     return buf;
+}
+
+test "ConvRot Hadamard: fast transform matches dense matrix, and H@H = I" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xC04710);
+    const rand = prng.random();
+
+    for ([_]usize{ 4, 16, 64, 256 }) |size| {
+        try std.testing.expect(Quantizer.isValidHadamardSize(size));
+        const h = try Quantizer.buildHadamard(allocator, size);
+        defer allocator.free(h);
+
+        // H symmetric and H@H == I (orthogonal + symmetric ⇒ involution).
+        for (0..size) |i| {
+            for (0..size) |j| {
+                try std.testing.expectApproxEqAbs(h[i * size + j], h[j * size + i], 1e-6);
+                var dot: f32 = 0;
+                for (0..size) |k| dot += h[i * size + k] * h[k * size + j];
+                const expected: f32 = if (i == j) 1.0 else 0.0;
+                try std.testing.expectApproxEqAbs(expected, dot, 1e-4);
+            }
+        }
+
+        // Fast transform must equal the dense matrix-vector product H @ v.
+        const v = try allocator.alloc(f32, size);
+        defer allocator.free(v);
+        for (v) |*x| x.* = rand.float(f32) * 2.0 - 1.0;
+
+        const dense = try allocator.alloc(f32, size);
+        defer allocator.free(dense);
+        for (0..size) |i| {
+            var acc: f32 = 0;
+            for (0..size) |j| acc += h[i * size + j] * v[j];
+            dense[i] = acc;
+        }
+
+        const fast = try allocator.dupe(f32, v);
+        defer allocator.free(fast);
+        Quantizer.hadamardTransformInPlace(fast);
+
+        for (dense, fast) |d, f| try std.testing.expectApproxEqAbs(d, f, 1e-4);
+
+        // Involution: applying twice returns the original.
+        Quantizer.hadamardTransformInPlace(fast);
+        for (v, fast) |orig, back| try std.testing.expectApproxEqAbs(orig, back, 1e-4);
+    }
+}
+
+test "ConvRot INT8 quantize→dequantize round-trip beats plain per-row INT8" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5EED);
+    const rand = prng.random();
+
+    const rows: usize = 8;
+    const cols: usize = 256;
+    const gs: usize = 256;
+
+    // Build a weight with per-channel outliers — the case ConvRot is designed for.
+    const w = try allocator.alloc(f32, rows * cols);
+    defer allocator.free(w);
+    for (0..rows) |r| {
+        for (0..cols) |c| {
+            var v = (rand.float(f32) * 2.0 - 1.0) * 0.05;
+            if (c % 64 == 0) v += 1.0; // outlier columns
+            w[r * cols + c] = v;
+        }
+    }
+
+    var pool: thread_pool_mod.ThreadPool = undefined;
+    try pool.init(.{ .allocator = allocator, .n_jobs = 2 });
+    defer pool.deinit();
+
+    // ConvRot path.
+    const enc = try Quantizer.quantizeToConvrotInt8(allocator, w, rows, cols, gs, &pool);
+    defer allocator.free(enc.weight);
+    defer allocator.free(enc.scale);
+
+    const deq = try allocator.alloc(f32, rows * cols);
+    defer allocator.free(deq);
+    for (0..rows) |r| {
+        for (0..cols) |c| {
+            deq[r * cols + c] = @as(f32, @floatFromInt(@as(i8, @bitCast(enc.weight[r * cols + c])))) * enc.scale[r];
+        }
+    }
+    try Quantizer.rotateGroupwiseInPlace(deq, rows, cols, gs, &pool);
+
+    // Plain per-row INT8 (no rotation) for comparison.
+    var convrot_err: f64 = 0;
+    var plain_err: f64 = 0;
+    for (0..rows) |r| {
+        var amax: f32 = 0;
+        for (w[r * cols .. r * cols + cols]) |v| amax = @max(amax, @abs(v));
+        const s: f32 = @max(amax / 127.0, 1e-30);
+        for (0..cols) |c| {
+            const idx = r * cols + c;
+            const q = std.math.clamp(@round(w[idx] / s), -128.0, 127.0);
+            const plain = q * s;
+            plain_err += @abs(plain - w[idx]);
+            convrot_err += @abs(deq[idx] - w[idx]);
+        }
+    }
+    // Rotation should meaningfully reduce error on outlier-heavy weights.
+    try std.testing.expect(convrot_err < plain_err);
 }
 
 test "transform f16 to q8_0" {

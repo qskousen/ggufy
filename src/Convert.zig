@@ -8,13 +8,20 @@ const types = @import("types.zig");
 const gguf = @import("Gguf.zig");
 const imagearch = @import("ImageArch.zig");
 const cb = @import("callbacks.zig");
-const ScaledQuant = @import("ScaledQuant.zig");
+const TensorClusters = @import("TensorClusters.zig");
 const DataTransform = @import("DataTransform.zig");
 
 pub const mxfp4_comfy_json  = "{\"format\":\"mxfp4\"}";
 pub const mxfp8_comfy_json  = "{\"format\":\"mxfp8\"}";
 pub const fp8_comfy_json    = "{\"format\": \"float8_e4m3fn\"}";
 pub const nvfp4_comfy_json  = "{\"format\": \"nvfp4\"}";
+// ConvRot ships under ComfyUI's "int8_tensorwise" layout; convrot + per_row are
+// signalled by booleans. Must match what ComfyUI expects to load these weights.
+pub const int8_convrot_group_size: u64 = 256;
+pub const int8_convrot_comfy_json = "{\"convrot\": true, \"convrot_groupsize\": 256, \"per_row\": true, \"format\": \"int8_tensorwise\"}";
+// Plain per-row INT8 (no rotation): zero inference overhead, works on any int8_tensorwise
+// loader, and — unlike convrot — has no group-size constraint on the input dimension.
+pub const int8_comfy_json = "{\"per_row\": true, \"format\": \"int8_tensorwise\"}";
 
 // ============================================================================
 // Public API
@@ -216,8 +223,8 @@ pub fn convert(
     try restoreOrigShapes(&model_tensors, f.getSourceMetadata(), arena_alloc);
 
     // --- Group and collapse NVFP4/FP8 clusters --------------------------------
-    var groups = try ScaledQuant.groupClusters(f, arena_alloc, allocator);
-    try ScaledQuant.collapseModelTensors(&model_tensors, &groups, arena_alloc);
+    var groups = try TensorClusters.groupClusters(f, arena_alloc, allocator);
+    try TensorClusters.collapseModelTensors(&model_tensors, &groups, arena_alloc);
 
     // --- Assign quantization types (template or auto) -------------------------
     var template_metadata: ?std.json.ObjectMap = null;
@@ -761,6 +768,43 @@ fn assignTensorType(
         return nearestCompatibleType(t, opts, num_elements);
     }
 
+    // Plain per-row INT8 safetensors output: ComfyUI cluster (I8 weight + F32 per-row scale +
+    // comfy_quant), no rotation and no group-size constraint. Weight matrices only; else fall back.
+    if (ttype == .INT8 and opts.filetype == .safetensors and t.dims.len >= 1) {
+        if (std.mem.endsWith(u8, t.name, ".weight") and t.dims.len == 2) {
+            const n_cols: u64 = t.dims[t.dims.len - 1];
+            if (n_cols >= 1) {
+                const n_rows: u64 = num_elements / n_cols;
+                const weight_bytes: u64 = n_rows * n_cols; // 1 byte per I8 element
+                const scale_bytes: u64 = n_rows * 4;        // F32 per-row scale
+                const comfy_bytes: u64 = int8_comfy_json.len;
+                t.type = "INT8";
+                t.size = weight_bytes + scale_bytes + comfy_bytes;
+                return;
+            }
+        }
+        return nearestCompatibleType(t, opts, num_elements);
+    }
+
+    // ConvRot INT8 safetensors output: ComfyUI cluster (I8 weight + F32 per-row scale + comfy_quant).
+    // Weights are Hadamard-rotated in groups along the input dim, so cols must be divisible by
+    // the group size (256). Only weight matrices get cluster treatment; everything else falls back.
+    if (ttype == .INT8_CONVROT and opts.filetype == .safetensors and t.dims.len >= 1) {
+        if (std.mem.endsWith(u8, t.name, ".weight") and t.dims.len == 2) {
+            const n_cols: u64 = t.dims[t.dims.len - 1];
+            if (n_cols % int8_convrot_group_size == 0) {
+                const n_rows: u64 = num_elements / n_cols;
+                const weight_bytes: u64 = n_rows * n_cols;        // 1 byte per I8 element
+                const scale_bytes:  u64 = n_rows * 4;             // F32 per-row scale
+                const comfy_bytes:  u64 = int8_convrot_comfy_json.len;
+                t.type = "INT8_CONVROT";
+                t.size = weight_bytes + scale_bytes + comfy_bytes;
+                return;
+            }
+        }
+        return nearestCompatibleType(t, opts, num_elements);
+    }
+
     if (use_sensitivity) {
         try applySensitivityQuantization(t, num_elements, ttype,opts.quantization_aggressiveness, resolvedFamilies(opts), sensitivities.?);
     } else {
@@ -974,7 +1018,7 @@ fn writeGguf(
     opts: ConvertOptions,
     allocator: std.mem.Allocator,
     arena_alloc: std.mem.Allocator,
-    groups: *const ScaledQuant.GroupResult,
+    groups: *const TensorClusters.GroupResult,
 ) !void {
     // --- Resolve output path -------------------------------------------------
     const dir_path = if (opts.output_dir) |od| od else std.fs.path.dirname(opts.path) orelse ".";
@@ -1051,7 +1095,7 @@ fn writeSafetensors(
     opts: ConvertOptions,
     allocator: std.mem.Allocator,
     arena_alloc: std.mem.Allocator,
-    groups: *const ScaledQuant.GroupResult,
+    groups: *const TensorClusters.GroupResult,
 ) !void {
     // --- Resolve output path -------------------------------------------------
     const dir_path = if (opts.output_dir) |od| od else std.fs.path.dirname(opts.path) orelse ".";

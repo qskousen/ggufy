@@ -4,7 +4,7 @@ const types = @import("types.zig");
 const st = @import("Safetensor.zig");
 const DataTransform = @import("DataTransform.zig");
 const cb = @import("callbacks.zig");
-const ScaledQuant = @import("ScaledQuant.zig");
+const TensorClusters = @import("TensorClusters.zig");
 const thread_pool_mod = @import("ThreadPool.zig");
 
 path: []const u8,
@@ -375,7 +375,7 @@ const GgufMetadata = struct {
     }
 };
 
-pub fn saveWithSTData(self: Gguf, source: anytype, threads: usize, callbacks: cb.ConvertCallbacks, groups: *const ScaledQuant.GroupResult) !void {
+pub fn saveWithSTData(self: Gguf, source: anytype, threads: usize, callbacks: cb.ConvertCallbacks, groups: *const TensorClusters.GroupResult) !void {
     // we need to track bytes written for calculating alignment for the starting tensor
     var bytes_written: u64 = 0;
 
@@ -427,7 +427,7 @@ pub fn saveWithSTData(self: Gguf, source: anytype, threads: usize, callbacks: cb
 
         // Cluster dequantization path: checked first to avoid matching the raw U8 weight
         var matched = false;
-        if (try ScaledQuant.tryDequantCluster(t, source, groups, self.allocator, &pool)) |f32_buf| {
+        if (try TensorClusters.tryDequantCluster(t, source, groups, self.allocator, &pool)) |f32_buf| {
             defer self.allocator.free(f32_buf);
             const target_dtype = try types.DataType.fromString(t.type);
             std.log.info("Writing tensor data for tensor {}/{} {s} - nvfp4/fp8 to {s}, {} elements", .{

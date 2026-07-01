@@ -3,7 +3,7 @@ const types = @import("types.zig");
 const DataTransform = @import("DataTransform.zig");
 const thread_pool_mod = @import("ThreadPool.zig");
 
-pub const ComfyQuantScheme = enum { nvfp4, float8_e4m3fn, mxfp4, mxfp8_e4m3fn, unknown };
+pub const ComfyQuantScheme = enum { nvfp4, float8_e4m3fn, mxfp4, mxfp8_e4m3fn, int8_convrot, unknown };
 
 pub const Fp4Cluster = struct {
     base_name: []const u8,
@@ -46,17 +46,31 @@ pub const Mxfp8Cluster = struct {
     cols: usize,
 };
 
+/// ConvRot INT8 cluster (ComfyUI "int8_tensorwise" with convrot + per_row):
+/// I8 weight rotated by a group-wise Hadamard, F32 per-row scale.
+pub const Int8ConvrotCluster = struct {
+    base_name: []const u8,
+    weight: types.Tensor,        // I8, [rows, cols]
+    weight_scale: types.Tensor,  // F32, [rows, 1]
+    comfy_quant: types.Tensor,
+    rows: usize,
+    cols: usize,
+    convrot: bool,
+    group_size: usize,
+};
+
 pub const GroupResult = struct {
     fp4_clusters: []Fp4Cluster,
     float8_clusters: []Float8Cluster,
     mxfp4_clusters: []Mxfp4Cluster,
     mxfp8_clusters: []Mxfp8Cluster,
+    int8_convrot_clusters: []Int8ConvrotCluster,
 };
 
 /// Parse the JSON payload of a comfy_quant blob to identify the quantization scheme.
 /// Reads the "format" key; returns .unknown on any parse error or unrecognised value.
 pub fn parseComfyQuantScheme(data: []const u8) ComfyQuantScheme {
-    var fba_buf: [2048]u8 = undefined;
+    var fba_buf: [16384]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&fba_buf);
     const parsed = std.json.parseFromSlice(std.json.Value, fba.allocator(), data, .{}) catch return .unknown;
     defer parsed.deinit();
@@ -73,7 +87,42 @@ pub fn parseComfyQuantScheme(data: []const u8) ComfyQuantScheme {
     if (std.mem.eql(u8, fmt_str, "mxfp8_e4m3fn") or std.mem.eql(u8, fmt_str, "mxfp8")) return .mxfp8_e4m3fn;
     if (std.mem.eql(u8, fmt_str, "mxfp4")) return .mxfp4;
     if (std.mem.eql(u8, fmt_str, "float8_e4m3fn")) return .float8_e4m3fn;
+    // ConvRot ships under the "int8_tensorwise" layout, distinguished by a `convrot`
+    // boolean and per-row scaling rather than a dedicated format string.
+    if (std.mem.eql(u8, fmt_str, "int8_tensorwise")) return .int8_convrot;
     return .unknown;
+}
+
+/// Read the boolean `key` from a comfy_quant JSON blob; returns `default` on any miss.
+fn comfyQuantBool(data: []const u8, key: []const u8, default: bool) bool {
+    var fba_buf: [16384]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&fba_buf);
+    const parsed = std.json.parseFromSlice(std.json.Value, fba.allocator(), data, .{}) catch return default;
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return default,
+    };
+    return switch (obj.get(key) orelse return default) {
+        .bool => |b| b,
+        else => default,
+    };
+}
+
+/// Read the integer `key` from a comfy_quant JSON blob; returns `default` on any miss.
+fn comfyQuantInt(data: []const u8, key: []const u8, default: usize) usize {
+    var fba_buf: [16384]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&fba_buf);
+    const parsed = std.json.parseFromSlice(std.json.Value, fba.allocator(), data, .{}) catch return default;
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return default,
+    };
+    return switch (obj.get(key) orelse return default) {
+        .integer => |n| if (n > 0) @intCast(n) else default,
+        else => default,
+    };
 }
 
 /// Returns true if `stripped` matches `full_name` exactly or as a dot-separated suffix.
@@ -99,6 +148,7 @@ pub fn groupClusters(
     var float8_list: std.ArrayList(Float8Cluster) = .empty;
     var mxfp4_list: std.ArrayList(Mxfp4Cluster) = .empty;
     var mxfp8_list: std.ArrayList(Mxfp8Cluster) = .empty;
+    var int8_convrot_list: std.ArrayList(Int8ConvrotCluster) = .empty;
 
     const comfy_suffix = ".comfy_quant";
 
@@ -123,15 +173,15 @@ pub fn groupClusters(
                 defer allocator.free(ws2name);
 
                 const wi = name_map.get(wname) orelse {
-                    std.log.warn("ScaledQuant: missing .weight for cluster {s}", .{base_name});
+                    std.log.warn("TensorClusters: missing .weight for cluster {s}", .{base_name});
                     continue;
                 };
                 const wsi = name_map.get(wsname) orelse {
-                    std.log.warn("ScaledQuant: missing .weight_scale for cluster {s}", .{base_name});
+                    std.log.warn("TensorClusters: missing .weight_scale for cluster {s}", .{base_name});
                     continue;
                 };
                 const ws2i = name_map.get(ws2name) orelse {
-                    std.log.warn("ScaledQuant: missing .weight_scale_2 for cluster {s}", .{base_name});
+                    std.log.warn("TensorClusters: missing .weight_scale_2 for cluster {s}", .{base_name});
                     continue;
                 };
 
@@ -148,7 +198,7 @@ pub fn groupClusters(
                     .rows = weight.dims[0],
                     .cols = weight.dims[1] * 2,
                 });
-                std.log.debug("ScaledQuant: grouped nvfp4 cluster {s} [{}, {}]", .{
+                std.log.debug("TensorClusters: grouped nvfp4 cluster {s} [{}, {}]", .{
                     base_name, weight.dims[0], weight.dims[1] * 2,
                 });
             },
@@ -161,11 +211,11 @@ pub fn groupClusters(
                 defer allocator.free(isname);
 
                 const wi = name_map.get(wname) orelse {
-                    std.log.warn("ScaledQuant: missing .weight for fp8 cluster {s}", .{base_name});
+                    std.log.warn("TensorClusters: missing .weight for fp8 cluster {s}", .{base_name});
                     continue;
                 };
                 const wsi = name_map.get(wsname) orelse {
-                    std.log.warn("ScaledQuant: missing .weight_scale for fp8 cluster {s}", .{base_name});
+                    std.log.warn("TensorClusters: missing .weight_scale for fp8 cluster {s}", .{base_name});
                     continue;
                 };
 
@@ -185,7 +235,7 @@ pub fn groupClusters(
                     .rows = weight.dims[0],
                     .cols = weight.dims[1],
                 });
-                std.log.debug("ScaledQuant: grouped fp8 cluster {s} [{}, {}]", .{
+                std.log.debug("TensorClusters: grouped fp8 cluster {s} [{}, {}]", .{
                     base_name, weight.dims[0], weight.dims[1],
                 });
             },
@@ -196,11 +246,11 @@ pub fn groupClusters(
                 defer allocator.free(wsname);
 
                 const wi = name_map.get(wname) orelse {
-                    std.log.warn("ScaledQuant: missing .weight for mxfp4 cluster {s}", .{base_name});
+                    std.log.warn("TensorClusters: missing .weight for mxfp4 cluster {s}", .{base_name});
                     continue;
                 };
                 const wsi = name_map.get(wsname) orelse {
-                    std.log.warn("ScaledQuant: missing .weight_scale for mxfp4 cluster {s}", .{base_name});
+                    std.log.warn("TensorClusters: missing .weight_scale for mxfp4 cluster {s}", .{base_name});
                     continue;
                 };
 
@@ -215,7 +265,7 @@ pub fn groupClusters(
                     .rows = weight.dims[0],
                     .cols = weight.dims[1] * 2,
                 });
-                std.log.debug("ScaledQuant: grouped mxfp4 cluster {s} [{}, {}]", .{
+                std.log.debug("TensorClusters: grouped mxfp4 cluster {s} [{}, {}]", .{
                     base_name, weight.dims[0], weight.dims[1] * 2,
                 });
             },
@@ -226,11 +276,11 @@ pub fn groupClusters(
                 defer allocator.free(wsname);
 
                 const wi = name_map.get(wname) orelse {
-                    std.log.warn("ScaledQuant: missing .weight for mxfp8 cluster {s}", .{base_name});
+                    std.log.warn("TensorClusters: missing .weight for mxfp8 cluster {s}", .{base_name});
                     continue;
                 };
                 const wsi = name_map.get(wsname) orelse {
-                    std.log.warn("ScaledQuant: missing .weight_scale for mxfp8 cluster {s}", .{base_name});
+                    std.log.warn("TensorClusters: missing .weight_scale for mxfp8 cluster {s}", .{base_name});
                     continue;
                 };
 
@@ -245,16 +295,67 @@ pub fn groupClusters(
                     .rows = weight.dims[0],
                     .cols = weight.dims[1],
                 });
-                std.log.debug("ScaledQuant: grouped mxfp8 cluster {s} [{}, {}]", .{
+                std.log.debug("TensorClusters: grouped mxfp8 cluster {s} [{}, {}]", .{
                     base_name, weight.dims[0], weight.dims[1],
+                });
+            },
+            .int8_convrot => {
+                const wname = try std.fmt.allocPrint(allocator, "{s}.weight", .{base_name});
+                defer allocator.free(wname);
+                const wsname = try std.fmt.allocPrint(allocator, "{s}.weight_scale", .{base_name});
+                defer allocator.free(wsname);
+
+                const wi = name_map.get(wname) orelse {
+                    std.log.warn("TensorClusters: missing .weight for int8_convrot cluster {s}", .{base_name});
+                    continue;
+                };
+                const wsi = name_map.get(wsname) orelse {
+                    std.log.warn("TensorClusters: missing .weight_scale for int8_convrot cluster {s}", .{base_name});
+                    continue;
+                };
+
+                const weight = source.tensors.items[wi];
+                const weight_scale = source.tensors.items[wsi];
+
+                if (weight.dims.len != 2) {
+                    std.log.warn("TensorClusters: int8_convrot cluster {s} weight is not 2-D; skipping", .{base_name});
+                    continue;
+                }
+                const rows = weight.dims[0];
+                const cols = weight.dims[1];
+                // Per-row scaling only: expect one F32 scale per output row.
+                if (weight_scale.size != rows * 4) {
+                    std.log.warn("TensorClusters: int8_convrot cluster {s} has non-per-row scale ({} bytes, expected {}); skipping", .{ base_name, weight_scale.size, rows * 4 });
+                    continue;
+                }
+
+                const convrot = comfyQuantBool(data, "convrot", false);
+                const group_size = comfyQuantInt(data, "convrot_groupsize", 256);
+                if (convrot and (!DataTransform.Quantizer.isValidHadamardSize(group_size) or cols % group_size != 0)) {
+                    std.log.warn("TensorClusters: int8_convrot cluster {s} has incompatible group_size {} for cols {}; skipping", .{ base_name, group_size, cols });
+                    continue;
+                }
+
+                try int8_convrot_list.append(arena_alloc, .{
+                    .base_name = base_name,
+                    .weight = weight,
+                    .weight_scale = weight_scale,
+                    .comfy_quant = t,
+                    .rows = rows,
+                    .cols = cols,
+                    .convrot = convrot,
+                    .group_size = group_size,
+                });
+                std.log.debug("TensorClusters: grouped int8_convrot cluster {s} [{}, {}] convrot={} gs={}", .{
+                    base_name, rows, cols, convrot, group_size,
                 });
             },
             .unknown => {},
         }
     }
 
-    std.log.info("ScaledQuant: found {} nvfp4, {} fp8, {} mxfp4, {} mxfp8 clusters", .{
-        fp4_list.items.len, float8_list.items.len, mxfp4_list.items.len, mxfp8_list.items.len,
+    std.log.info("TensorClusters: found {} nvfp4, {} fp8, {} mxfp4, {} mxfp8, {} int8_convrot clusters", .{
+        fp4_list.items.len, float8_list.items.len, mxfp4_list.items.len, mxfp8_list.items.len, int8_convrot_list.items.len,
     });
 
     return GroupResult{
@@ -262,6 +363,7 @@ pub fn groupClusters(
         .float8_clusters = float8_list.items,
         .mxfp4_clusters = mxfp4_list.items,
         .mxfp8_clusters = mxfp8_list.items,
+        .int8_convrot_clusters = int8_convrot_list.items,
     };
 }
 
@@ -576,6 +678,59 @@ pub fn dequantizeMxfp8Cluster(
     return dequantizeMxfp8Raw(weight_bytes, scale_bytes, cluster.rows, cluster.cols, allocator);
 }
 
+/// Core ConvRot INT8 dequantization over raw byte slices. Caller owns the returned slice.
+/// weight_bytes: I8 values [rows × cols] (row-major). scale_f32: per-row scale [rows].
+/// If `convrot`, un-rotates each row group-wise with the Hadamard transform.
+pub fn dequantizeInt8ConvrotRaw(
+    weight_bytes: []const u8,
+    scale_f32: []const f32,
+    rows: usize,
+    cols: usize,
+    convrot: bool,
+    group_size: usize,
+    allocator: std.mem.Allocator,
+    pool: *thread_pool_mod.ThreadPool,
+) ![]f32 {
+    if (weight_bytes.len != rows * cols) return error.InvalidClusterShape;
+    if (scale_f32.len != rows) return error.InvalidClusterShape;
+
+    const out = try allocator.alloc(f32, rows * cols);
+    errdefer allocator.free(out);
+
+    for (0..rows) |row| {
+        const s = scale_f32[row];
+        for (0..cols) |col| {
+            const q: i8 = @bitCast(weight_bytes[row * cols + col]);
+            out[row * cols + col] = @as(f32, @floatFromInt(q)) * s;
+        }
+    }
+
+    if (convrot) try DataTransform.Quantizer.rotateGroupwiseInPlace(out, rows, cols, group_size, pool);
+
+    return out;
+}
+
+/// Dequantize a ConvRot INT8 cluster to F32. Caller owns the returned slice.
+pub fn dequantizeInt8ConvrotCluster(
+    cluster: Int8ConvrotCluster,
+    source: anytype,
+    allocator: std.mem.Allocator,
+    pool: *thread_pool_mod.ThreadPool,
+) ![]f32 {
+    const w_file = try source.openFileForTensor(cluster.weight.name);
+    const weight_bytes = try allocator.alloc(u8, cluster.weight.size);
+    defer allocator.free(weight_bytes);
+    _ = try w_file.readPositionalAll(source.io, weight_bytes, cluster.weight.offset + source.current_data_begin);
+
+    const ws_file = try source.openFileForTensor(cluster.weight_scale.name);
+    const scale_raw = try allocator.alloc(u8, cluster.weight_scale.size);
+    defer allocator.free(scale_raw);
+    _ = try ws_file.readPositionalAll(source.io, scale_raw, cluster.weight_scale.offset + source.current_data_begin);
+    const scale_f32: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(scale_raw)));
+
+    return dequantizeInt8ConvrotRaw(weight_bytes, scale_f32, cluster.rows, cluster.cols, cluster.convrot, cluster.group_size, allocator, pool);
+}
+
 /// Check whether `dest_tensor` belongs to any cluster in `groups`.
 /// If so, dequantize it and return the F32 buffer. Returns null if not cluster-sourced.
 /// Caller owns the returned slice.
@@ -606,6 +761,11 @@ pub fn tryDequantCluster(
             return try dequantizeMxfp8Cluster(cluster, source, allocator);
         }
     }
+    for (groups.int8_convrot_clusters) |cluster| {
+        if (nameSuffixMatch(cluster.weight.name, dest_tensor.name)) {
+            return try dequantizeInt8ConvrotCluster(cluster, source, allocator, pool);
+        }
+    }
     return null;
 }
 
@@ -617,7 +777,8 @@ pub fn collapseModelTensors(
     arena_alloc: std.mem.Allocator,
 ) !void {
     if (groups.fp4_clusters.len == 0 and groups.float8_clusters.len == 0 and
-        groups.mxfp4_clusters.len == 0 and groups.mxfp8_clusters.len == 0) return;
+        groups.mxfp4_clusters.len == 0 and groups.mxfp8_clusters.len == 0 and
+        groups.int8_convrot_clusters.len == 0) return;
 
     var new_tensors: std.ArrayList(types.Tensor) = .empty;
 
@@ -710,6 +871,26 @@ pub fn collapseModelTensors(
             }
         }
 
+        if (!handled) {
+            for (groups.int8_convrot_clusters) |cluster| {
+                if (nameSuffixMatch(cluster.weight.name, t.name)) {
+                    var new_t = t;
+                    new_t.dims = try arena_alloc.dupe(usize, &[_]usize{ cluster.rows, cluster.cols });
+                    new_t.type = "BF16";
+                    new_t.size = cluster.rows * cluster.cols * 2;
+                    try new_tensors.append(arena_alloc, new_t);
+                    handled = true;
+                    break;
+                }
+                if (nameSuffixMatch(cluster.weight_scale.name, t.name) or
+                    nameSuffixMatch(cluster.comfy_quant.name, t.name))
+                {
+                    handled = true;
+                    break;
+                }
+            }
+        }
+
         if (!handled) try new_tensors.append(arena_alloc,t);
     }
 
@@ -773,6 +954,194 @@ test "parseComfyQuantScheme: ignores non-format keys containing scheme names" {
 test "parseComfyQuantScheme: nvfp4 not confused with mxfp4" {
     try testing.expectEqual(.nvfp4, parseComfyQuantScheme("{\"format\": \"nvfp4\"}"));
     try testing.expectEqual(.mxfp4, parseComfyQuantScheme("{\"format\": \"mxfp4\"}"));
+}
+
+test "parseComfyQuantScheme: int8 convrot and its boolean/int fields" {
+    const blob = "{\"convrot\": true, \"convrot_groupsize\": 256, \"per_row\": true, \"format\": \"int8_tensorwise\"}";
+    try testing.expectEqual(.int8_convrot, parseComfyQuantScheme(blob));
+    try testing.expectEqual(true, comfyQuantBool(blob, "convrot", false));
+    try testing.expectEqual(true, comfyQuantBool(blob, "per_row", false));
+    try testing.expectEqual(false, comfyQuantBool(blob, "missing", false));
+    try testing.expectEqual(@as(usize, 256), comfyQuantInt(blob, "convrot_groupsize", 999));
+    try testing.expectEqual(@as(usize, 64), comfyQuantInt("{\"format\":\"int8_tensorwise\"}", "convrot_groupsize", 64));
+}
+
+test "ConvRot INT8 cluster: quantize → dequantize round-trip (convrot on)" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xB0A710);
+    const rand = prng.random();
+
+    const rows: usize = 6;
+    const cols: usize = 256;
+    const gs: usize = 256;
+
+    const w = try allocator.alloc(f32, rows * cols);
+    defer allocator.free(w);
+    for (w) |*v| v.* = (rand.float(f32) * 2.0 - 1.0) * 0.1;
+
+    var pool: thread_pool_mod.ThreadPool = undefined;
+    try pool.init(.{ .allocator = allocator, .n_jobs = 2 });
+    defer pool.deinit();
+
+    const enc = try DataTransform.Quantizer.quantizeToConvrotInt8(allocator, w, rows, cols, gs, &pool);
+    defer allocator.free(enc.weight);
+    defer allocator.free(enc.scale);
+
+    const got = try dequantizeInt8ConvrotRaw(enc.weight, enc.scale, rows, cols, true, gs, allocator, &pool);
+    defer allocator.free(got);
+
+    // The rotation is orthogonal, so it preserves the L2 norm of the quantization
+    // error but redistributes it across each group; check the aggregate relative
+    // L2 error rather than a per-element bound. INT8 (~7 effective bits) → well under 5%.
+    var err_sq: f64 = 0;
+    var sig_sq: f64 = 0;
+    for (got, w) |g, orig| {
+        const d = g - orig;
+        err_sq += @as(f64, d) * @as(f64, d);
+        sig_sq += @as(f64, orig) * @as(f64, orig);
+    }
+    const rel = @sqrt(err_sq / sig_sq);
+    try testing.expect(rel < 0.05);
+}
+
+test "ConvRot INT8 dequant: fixture from real ComfyUI model matches comfy_kitchen" {
+    // Validates dequantizeInt8ConvrotRaw against convrot_expected.f32 produced by
+    // comfy_kitchen's TensorWiseINT8Layout.dequantize (gen_convrot_fixtures.py).
+    // The fast Hadamard transform reorders the summation vs. comfy's dense matmul,
+    // so results match to f32 rounding rather than bit-for-bit.
+    const allocator = std.testing.allocator;
+
+    const weight_bytes = (try loadFixture(allocator, "convrot_weight.i8")) orelse return error.SkipZigTest;
+    defer allocator.free(weight_bytes);
+    const scale_raw = (try loadFixture(allocator, "convrot_scale.f32")) orelse return error.SkipZigTest;
+    defer allocator.free(scale_raw);
+    const expected_raw = (try loadFixture(allocator, "convrot_expected.f32")) orelse return error.SkipZigTest;
+    defer allocator.free(expected_raw);
+
+    const rows: usize = 16;
+    const cols: usize = 6144;
+    const gs: usize = 256;
+    try testing.expectEqual(rows * cols, weight_bytes.len);
+    try testing.expectEqual(rows, scale_raw.len / 4);
+    const scale: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(scale_raw)));
+    const expected: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(expected_raw)));
+    try testing.expectEqual(rows * cols, expected.len);
+
+    var pool: thread_pool_mod.ThreadPool = undefined;
+    try pool.init(.{ .allocator = allocator, .n_jobs = 4 });
+    defer pool.deinit();
+
+    const got = try dequantizeInt8ConvrotRaw(weight_bytes, scale, rows, cols, true, gs, allocator, &pool);
+    defer allocator.free(got);
+
+    var max_abs_err: f32 = 0;
+    for (got, expected) |g, e| max_abs_err = @max(max_abs_err, @abs(g - e));
+    try testing.expect(max_abs_err < 1e-4);
+}
+
+test "ConvRot INT8 quantize: matches comfy_kitchen re-quantization within rounding" {
+    // Validates quantizeToConvrotInt8 against convrot_requant.i8 — comfy_kitchen's own
+    // re-quantization of the dequantized weights. Fast vs. dense rotation can flip a
+    // rare rounding boundary, so we require the vast majority exact and all within ±1.
+    const allocator = std.testing.allocator;
+
+    const expected_raw = (try loadFixture(allocator, "convrot_expected.f32")) orelse return error.SkipZigTest;
+    defer allocator.free(expected_raw);
+    const requant = (try loadFixture(allocator, "convrot_requant.i8")) orelse return error.SkipZigTest;
+    defer allocator.free(requant);
+
+    const rows: usize = 16;
+    const cols: usize = 6144;
+    const gs: usize = 256;
+    const expected: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(expected_raw)));
+    try testing.expectEqual(rows * cols, expected.len);
+    try testing.expectEqual(rows * cols, requant.len);
+
+    var pool: thread_pool_mod.ThreadPool = undefined;
+    try pool.init(.{ .allocator = allocator, .n_jobs = 4 });
+    defer pool.deinit();
+
+    const enc = try DataTransform.Quantizer.quantizeToConvrotInt8(allocator, expected, rows, cols, gs, &pool);
+    defer allocator.free(enc.weight);
+    defer allocator.free(enc.scale);
+
+    var mismatches: usize = 0;
+    var over_one: usize = 0;
+    for (enc.weight, requant) |ours_u8, theirs_i8| {
+        const ours: i16 = @as(i8, @bitCast(ours_u8));
+        const theirs: i16 = @as(i8, @bitCast(theirs_i8));
+        const d = @abs(ours - theirs);
+        if (d != 0) mismatches += 1;
+        if (d > 1) over_one += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), over_one);            // never off by more than one step
+    try testing.expect(mismatches * 100 < enc.weight.len);        // < 1% differ by ±1
+}
+
+test "plain INT8 quantize: matches comfy_kitchen bit-for-bit (no rotation)" {
+    // With convrot=false there is no fast-vs-dense rotation difference, so our per-row
+    // quantizer must reproduce comfy_kitchen's quantize_int8_rowwise exactly.
+    const allocator = std.testing.allocator;
+
+    const expected_raw = (try loadFixture(allocator, "convrot_expected.f32")) orelse return error.SkipZigTest;
+    defer allocator.free(expected_raw);
+    const plain_q = (try loadFixture(allocator, "int8_plain_weight.i8")) orelse return error.SkipZigTest;
+    defer allocator.free(plain_q);
+    const plain_s_raw = (try loadFixture(allocator, "int8_plain_scale.f32")) orelse return error.SkipZigTest;
+    defer allocator.free(plain_s_raw);
+
+    const rows: usize = 16;
+    const cols: usize = 6144;
+    const expected: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(expected_raw)));
+    const comfy_scale: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(plain_s_raw)));
+    try testing.expectEqual(rows * cols, expected.len);
+    try testing.expectEqual(rows * cols, plain_q.len);
+
+    var pool: thread_pool_mod.ThreadPool = undefined;
+    try pool.init(.{ .allocator = allocator, .n_jobs = 4 });
+    defer pool.deinit();
+
+    const enc = try DataTransform.Quantizer.quantizeToInt8(allocator, expected, rows, cols, false, 0, &pool);
+    defer allocator.free(enc.weight);
+    defer allocator.free(enc.scale);
+
+    for (enc.weight, plain_q) |ours, theirs| try testing.expectEqual(@as(i8, @bitCast(theirs)), @as(i8, @bitCast(ours)));
+    for (enc.scale, comfy_scale) |ours, theirs| try testing.expectApproxEqAbs(theirs, ours, 1e-9);
+}
+
+test "plain INT8 cluster: quantize → dequantize round-trip (convrot off, any shape)" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x1117);
+    const rand = prng.random();
+
+    // Non-power-of-4 columns: plain int8 must work where convrot cannot.
+    const rows: usize = 10;
+    const cols: usize = 200;
+
+    const w = try allocator.alloc(f32, rows * cols);
+    defer allocator.free(w);
+    for (w) |*v| v.* = (rand.float(f32) * 2.0 - 1.0) * 0.1;
+
+    var pool: thread_pool_mod.ThreadPool = undefined;
+    try pool.init(.{ .allocator = allocator, .n_jobs = 2 });
+    defer pool.deinit();
+
+    const enc = try DataTransform.Quantizer.quantizeToInt8(allocator, w, rows, cols, false, 0, &pool);
+    defer allocator.free(enc.weight);
+    defer allocator.free(enc.scale);
+
+    const got = try dequantizeInt8ConvrotRaw(enc.weight, enc.scale, rows, cols, false, 0, allocator, &pool);
+    defer allocator.free(got);
+
+    // No rotation, so error is bounded per element by half the per-row quantization step.
+    for (0..rows) |r| {
+        var amax: f32 = 0;
+        for (w[r * cols .. r * cols + cols]) |v| amax = @max(amax, @abs(v));
+        const step = @max(amax / 127.0, 1e-30);
+        for (0..cols) |c| {
+            try testing.expect(@abs(got[r * cols + c] - w[r * cols + c]) <= step * 0.5 + 1e-6);
+        }
+    }
 }
 
 test "NVFP4 cuBLAS tiled block index: spot-checks" {
