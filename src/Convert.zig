@@ -8,13 +8,10 @@ const types = @import("types.zig");
 const gguf = @import("Gguf.zig");
 const imagearch = @import("ImageArch.zig");
 const cb = @import("callbacks.zig");
-const ScaledQuant = @import("ScaledQuant.zig");
+const TensorClusters = @import("TensorClusters.zig");
 const DataTransform = @import("DataTransform.zig");
 
-pub const mxfp4_comfy_json  = "{\"format\":\"mxfp4\"}";
-pub const mxfp8_comfy_json  = "{\"format\":\"mxfp8\"}";
-pub const fp8_comfy_json    = "{\"format\": \"float8_e4m3fn\"}";
-pub const nvfp4_comfy_json  = "{\"format\": \"nvfp4\"}";
+// Cluster identity blobs + layout now live in TensorClusters (the shared source of truth).
 
 // ============================================================================
 // Public API
@@ -216,8 +213,8 @@ pub fn convert(
     try restoreOrigShapes(&model_tensors, f.getSourceMetadata(), arena_alloc);
 
     // --- Group and collapse NVFP4/FP8 clusters --------------------------------
-    var groups = try ScaledQuant.groupClusters(f, arena_alloc, allocator);
-    try ScaledQuant.collapseModelTensors(&model_tensors, &groups, arena_alloc);
+    var groups = try TensorClusters.groupClusters(f, arena_alloc, allocator);
+    try TensorClusters.collapseModelTensors(&model_tensors, &groups, arena_alloc);
 
     // --- Assign quantization types (template or auto) -------------------------
     var template_metadata: ?std.json.ObjectMap = null;
@@ -594,7 +591,8 @@ fn assignQuantTypes(
             threshold,
             opts,
             use_sensitivity,
-            if (use_sensitivity) &sensitivities else null
+            if (use_sensitivity) &sensitivities else null,
+            arena_alloc,
         );
 
         // f64 is unsupported in ComfyUI GGUF — downcast to f32.
@@ -648,6 +646,7 @@ fn assignTensorType(
     opts: ConvertOptions,
     use_sensitivity: bool,
     sensitivities: ?*const std.json.Parsed(std.json.Value),
+    arena_alloc: std.mem.Allocator,
 ) !void {
     // Architecture-specific overrides first.
     if (arch.shouldUpcast(t.name) and opts.filetype == .gguf) {
@@ -684,79 +683,14 @@ fn assignTensorType(
         }
     }
 
-    // SCALED_F8_E4M3 safetensors output: ComfyUI cluster (F8 weight + F32 scalar + comfy_quant).
-    // Only weight matrices get cluster treatment; biases/norms fall back to their source type.
-    if (ttype == .SCALED_F8_E4M3 and opts.filetype == .safetensors) {
-        if (std.mem.endsWith(u8, t.name, ".weight")) {
-            t.type = "SCALED_F8_E4M3";
-            t.size = num_elements      // F8_E4M3 weight, 1 byte each
-                   + 4                 // F32 scalar scale
-                   + fp8_comfy_json.len;
+    // ComfyUI cluster safetensors outputs. Eligibility (which tensors get clustered vs. fall
+    // back to their source type) is format-specific and lives here; the physical byte layout
+    // is owned by TensorClusters.clusterWriteLayout, shared with the header/data writers.
+    if (opts.filetype == .safetensors and TensorClusters.isClusterType(ttype)) {
+        if (clusterEligible(t, ttype, num_elements, arch)) {
+            t.type = @tagName(ttype);
+            t.size = (try TensorClusters.clusterWriteSize(arena_alloc, ttype, t.dims)).?;
             return;
-        }
-        return nearestCompatibleType(t, opts, num_elements);
-    }
-
-    // MXFP4 safetensors output: ComfyUI cluster (U32 weight + U8 scales + comfy_quant).
-    // Only weight matrices get cluster treatment; biases/norms fall back to their source type.
-    if (ttype == .MXFP4 and opts.filetype == .safetensors and t.dims.len >= 1) {
-        if (std.mem.endsWith(u8, t.name, ".weight")) {
-            const n_cols: u64 = t.dims[t.dims.len - 1];
-            // Require at least one full 32-element block; conv kernels with tiny last dims fall back.
-            if (n_cols >= 32) {
-                const n_rows: u64 = num_elements / n_cols;
-                const weight_bytes: u64 = n_rows * n_cols / 2;
-                const scale_bytes:  u64 = n_rows * ((n_cols + 31) / 32);
-                const comfy_bytes:  u64 = mxfp4_comfy_json.len;
-                t.type = "MXFP4";
-                t.size = weight_bytes + scale_bytes + comfy_bytes;
-                return;
-            }
-        }
-        return nearestCompatibleType(t, opts, num_elements);
-    }
-
-    // MXFP8 safetensors output: ComfyUI cluster (F8_E4M3 weight + U8 scales + comfy_quant).
-    // Only weight matrices get cluster treatment; biases/norms fall back to their source type.
-    if (ttype == .MXFP8_E4M3 and opts.filetype == .safetensors and t.dims.len >= 1) {
-        if (std.mem.endsWith(u8, t.name, ".weight")) {
-            const n_cols: u64 = t.dims[t.dims.len - 1];
-            // Require at least one full 32-element block; conv kernels with tiny last dims fall back.
-            if (n_cols >= 32) {
-                const n_rows: u64 = num_elements / n_cols;
-                const weight_bytes: u64 = n_rows * n_cols;  // 1 byte per F8_E4M3 element
-                // Scales stored in cuBLAS blocked layout: pad to [n_row_blocks*128, n_col_blocks*4]
-                const n_scale_cols: u64 = (n_cols + 31) / 32;
-                const n_row_blocks: u64 = (n_rows + 127) / 128;
-                const n_col_blocks: u64 = (n_scale_cols + 3) / 4;
-                const scale_bytes:  u64 = n_row_blocks * 128 * n_col_blocks * 4;
-                const comfy_bytes:  u64 = mxfp8_comfy_json.len;
-                t.type = "MXFP8_E4M3";
-                t.size = weight_bytes + scale_bytes + comfy_bytes;
-                return;
-            }
-        }
-        return nearestCompatibleType(t, opts, num_elements);
-    }
-
-    // NVFP4 safetensors output: ComfyUI cluster (U8 weight + F8_E4M3 scales + F32 global + comfy_quant).
-    // Requires cols % 64 == 0 and rows % 128 == 0 (cuBLAS tiling constraint).
-    if (ttype == .NVFP4 and opts.filetype == .safetensors and t.dims.len >= 1) {
-        if (arch.isNvfp4Passthrough(t.name)) return nearestCompatibleType(t, opts, num_elements);
-        if (std.mem.endsWith(u8, t.name, ".weight")) {
-            const n_cols: u64 = t.dims[t.dims.len - 1];
-            if (n_cols >= 64 and n_cols % 64 == 0) {
-                const n_rows: u64 = num_elements / n_cols;
-                if (n_rows % 128 == 0) {
-                    const weight_bytes: u64 = n_rows * (n_cols / 2);   // nibble-packed
-                    const scale_bytes:  u64 = n_rows * (n_cols / 16);  // F8_E4M3, cuBLAS tiled
-                    const scale2_bytes: u64 = 4;                        // F32 global scalar
-                    const comfy_bytes:  u64 = nvfp4_comfy_json.len;
-                    t.type = "NVFP4";
-                    t.size = weight_bytes + scale_bytes + scale2_bytes + comfy_bytes;
-                    return;
-                }
-            }
         }
         return nearestCompatibleType(t, opts, num_elements);
     }
@@ -768,6 +702,25 @@ fn assignTensorType(
         t.type = @tagName(ttype);
         t.size = ttype.calcSizeInBytes(num_elements);
     }
+}
+
+/// Decide whether tensor `t` is eligible for cluster quantization to `ttype`, vs. falling
+/// back to its source type. Only weight matrices are clustered, and each format has its own
+/// shape constraints (block/tiling divisibility, per-arch NVFP4 passthrough).
+fn clusterEligible(t: *const types.Tensor, ttype: types.DataType, num_elements: u64, arch: *const imagearch.Arch) bool {
+    if (!std.mem.endsWith(u8, t.name, ".weight")) return false;
+    const n_cols: u64 = if (t.dims.len >= 1) t.dims[t.dims.len - 1] else 0;
+    return switch (ttype) {
+        .SCALED_F8_E4M3 => true,
+        // Require at least one full 32-element block; tiny last dims fall back.
+        .MXFP4, .MXFP8_E4M3 => t.dims.len >= 1 and n_cols >= 32,
+        // cuBLAS tiling: cols % 64 == 0 and rows % 128 == 0, minus per-arch passthrough.
+        .NVFP4 => t.dims.len >= 1 and n_cols >= 64 and n_cols % 64 == 0 and
+            (num_elements / n_cols) % 128 == 0 and !arch.isNvfp4Passthrough(t.name),
+        .INT8 => t.dims.len == 2 and n_cols >= 1,
+        .INT8_CONVROT => t.dims.len == 2 and n_cols % TensorClusters.int8_convrot_group_size == 0,
+        else => false,
+    };
 }
 
 /// nearestCompatibleType converts a tensor type to the nearest type compatible with the output (or leaves it the same, if it's already compatible)
@@ -974,7 +927,7 @@ fn writeGguf(
     opts: ConvertOptions,
     allocator: std.mem.Allocator,
     arena_alloc: std.mem.Allocator,
-    groups: *const ScaledQuant.GroupResult,
+    groups: *const TensorClusters.GroupResult,
 ) !void {
     // --- Resolve output path -------------------------------------------------
     const dir_path = if (opts.output_dir) |od| od else std.fs.path.dirname(opts.path) orelse ".";
@@ -1051,7 +1004,7 @@ fn writeSafetensors(
     opts: ConvertOptions,
     allocator: std.mem.Allocator,
     arena_alloc: std.mem.Allocator,
-    groups: *const ScaledQuant.GroupResult,
+    groups: *const TensorClusters.GroupResult,
 ) !void {
     // --- Resolve output path -------------------------------------------------
     const dir_path = if (opts.output_dir) |od| od else std.fs.path.dirname(opts.path) orelse ".";
@@ -1361,7 +1314,7 @@ test "assignTensorType: 1D tensors are never block-quantized" {
     // 1D and larger than the small-tensor threshold: only the 1D rule can keep it float.
     var dims = [_]usize{200000};
     var t = types.Tensor{ .name = "blocks.0.mod.lin", .type = "BF16", .dims = &dims, .size = 0, .offset = 0 };
-    try assignTensorType(&t, 200000, &imagearch.generic_arch, QUANTIZATION_THRESHOLD, opts, false, null);
+    try assignTensorType(&t, 200000, &imagearch.generic_arch, QUANTIZATION_THRESHOLD, opts, false, null, std.testing.allocator);
     // BF16 -> f32 via nearestCompatibleType; crucially NOT q8_0.
     try testing.expectEqualStrings("f32", t.type);
 }
@@ -1371,7 +1324,7 @@ test "assignTensorType: small 2D tensors are kept float" {
     // last.modulation.lin [2, 6144] = 12288 elements, below the threshold.
     var dims = [_]usize{ 2, 6144 };
     var t = types.Tensor{ .name = "last.modulation.lin", .type = "BF16", .dims = &dims, .size = 0, .offset = 0 };
-    try assignTensorType(&t, 12288, &imagearch.generic_arch, QUANTIZATION_THRESHOLD, opts, false, null);
+    try assignTensorType(&t, 12288, &imagearch.generic_arch, QUANTIZATION_THRESHOLD, opts, false, null, std.testing.allocator);
     try testing.expectEqualStrings("f32", t.type);
 }
 
@@ -1380,6 +1333,6 @@ test "assignTensorType: large 2D weights are quantized" {
     var dims = [_]usize{ 6144, 6144 }; // ~37.7M elements
     const n: u64 = 6144 * 6144;
     var t = types.Tensor{ .name = "blocks.0.attn.wq.weight", .type = "BF16", .dims = &dims, .size = 0, .offset = 0 };
-    try assignTensorType(&t, n, &imagearch.generic_arch, QUANTIZATION_THRESHOLD, opts, false, null);
+    try assignTensorType(&t, n, &imagearch.generic_arch, QUANTIZATION_THRESHOLD, opts, false, null, std.testing.allocator);
     try testing.expectEqualStrings("q8_0", t.type);
 }

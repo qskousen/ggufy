@@ -417,6 +417,14 @@ pub const krea2 = Arch{
     },
     .shape_fix = true,
     .threshhold = null,
+    .keys_hiprec = &.{
+        "txtfusion", // entire text-fusion / conditioning tower
+        "tmlp", // timestep MLP (+ txtmlp text MLP)
+        "tproj", // timestep projection
+        "first.", // input projection (also shape-sensitive: ComfyUI reads in_channels here)
+        "last.", // output projection
+        ".projector",
+    },
     // RMSNorm (q/k) and LayerNorm scales are precision-sensitive; keep them fp32.
     .upcast_from_bf16 = &.{
         ".qknorm.qnorm.scale",
@@ -710,4 +718,31 @@ test "krea2 nvfp4 passthrough - first.weight" {
     try std.testing.expect(krea2.isNvfp4Passthrough("first.weight"));
     try std.testing.expect(krea2.isNvfp4Passthrough("model.diffusion_model.first.weight"));
     try std.testing.expect(!krea2.isNvfp4Passthrough("blocks.0.attn.wq.weight"));
+}
+
+test "krea2 high-precision policy matches ComfyUI reference (backbone-only quant)" {
+    // Protected (kept high precision) — everything outside the main image DiT backbone.
+    const protected = [_][]const u8{
+        "txtfusion.layerwise_blocks.0.attn.wq.weight",
+        "txtfusion.refiner_blocks.1.mlp.down.weight",
+        "txtfusion.projector.weight",
+        "tmlp.0.weight",
+        "txtmlp.1.weight",
+        "tproj.0.weight",
+        "first.weight",
+        "last.linear.weight",
+        "model.diffusion_model.txtfusion.refiner_blocks.0.attn.wo.weight",
+    };
+    for (protected) |k| try std.testing.expect(krea2.isHighPrecision(k));
+
+    // Quantized — the image DiT backbone linears must NOT be protected.
+    const backbone = [_][]const u8{
+        "blocks.0.attn.wq.weight",
+        "blocks.27.attn.wo.weight",
+        "blocks.13.mlp.up.weight",
+        "blocks.5.mlp.down.weight",
+        "blocks.0.attn.gate.weight",
+        "model.diffusion_model.blocks.9.mlp.gate.weight",
+    };
+    for (backbone) |k| try std.testing.expect(!krea2.isHighPrecision(k));
 }

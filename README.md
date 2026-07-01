@@ -6,7 +6,7 @@ ggufy:
 - comes in CLI and GUI flavors
 - is fast and memory efficient
 - supports converting from safetensors to various gguf quantizations
-- supports converting safetensors datatypes (F32, BF16, F16, F8 E4M3/E5M2, Scaled F8 E4M3, MXFP8 E4M3, NVFP4)
+- supports converting safetensors datatypes (F32, BF16, F16, F8 E4M3/E5M2, Scaled F8 E4M3, MXFP8 E4M3, NVFP4, INT8, INT8 CONVROT)
 - supports converting with "[quantization sensitivity](docs/CLI.md#sensitivity-aware-quantization)" files (some architectures built-in)
 - currently targets image diffusion models (SD1.5, SDXL, etc.)
 

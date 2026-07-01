@@ -3,7 +3,7 @@ const types = @import("types.zig");
 const gguf = @import("Gguf.zig");
 const DataTransform = @import("DataTransform.zig");
 const cb = @import("callbacks.zig");
-const ScaledQuant = @import("ScaledQuant.zig");
+const TensorClusters = @import("TensorClusters.zig");
 const Convert = @import("Convert.zig");
 const thread_pool_mod = @import("ThreadPool.zig");
 
@@ -767,7 +767,29 @@ pub fn writeTensorData(
     }
 }
 
-pub fn saveWithSTData(self: Safetensors, source: anytype, threads: usize, callbacks: cb.ConvertCallbacks, groups: *const ScaledQuant.GroupResult) !void {
+/// Emit one safetensors header entry (dtype, shape, data_offsets) into `header_obj`.
+fn putClusterHeaderEntry(
+    arena: std.mem.Allocator,
+    header_obj: *std.json.ObjectMap,
+    name: []const u8,
+    dtype: []const u8,
+    dims: []const usize,
+    off0: u64,
+    off1: u64,
+) !void {
+    var obj = std.json.ObjectMap.empty;
+    try obj.put(arena, "dtype", .{ .string = dtype });
+    var shape = std.json.Array.init(arena);
+    for (dims) |d| try shape.append(.{ .integer = @intCast(d) });
+    try obj.put(arena, "shape", .{ .array = shape });
+    var offsets = std.json.Array.init(arena);
+    try offsets.append(.{ .integer = @intCast(off0) });
+    try offsets.append(.{ .integer = @intCast(off1) });
+    try obj.put(arena, "data_offsets", .{ .array = offsets });
+    try header_obj.put(arena, name, .{ .object = obj });
+}
+
+pub fn saveWithSTData(self: Safetensors, source: anytype, threads: usize, callbacks: cb.ConvertCallbacks, groups: *const TensorClusters.GroupResult) !void {
     // Build the full header JSON object (tensor entries + __metadata__)
     var header_obj = std.json.ObjectMap.empty;
 
@@ -778,287 +800,24 @@ pub fn saveWithSTData(self: Safetensors, source: anytype, threads: usize, callba
 
     // Add each tensor entry
     for (self.tensors.items) |t| {
-        // SCALED_F8_E4M3: expand into a 3-tensor ComfyUI FP8 cluster.
-        // Region layout: [F8 weight bytes][F32 scale 4 bytes][comfy_quant JSON]
-        // The on-disk dtype for weight and sidecar tensors uses "F8_E4M3" (ComfyUI compatibility).
-        if (std.mem.eql(u8, t.type, "SCALED_F8_E4M3")) {
-            var n_elements: u64 = 1;
-            for (t.dims) |d| n_elements *= d;
-            const comfy_json = Convert.fp8_comfy_json;
-
-            const scale_start = t.offset + n_elements;
-            const comfy_start = scale_start + 4;
-
-            const weight_suffix = ".weight";
-            const base = if (std.mem.endsWith(u8, t.name, weight_suffix))
-                t.name[0 .. t.name.len - weight_suffix.len]
-            else
-                t.name;
-
-            // weight: dtype F8_E4M3, original shape
-            {
-                var obj = std.json.ObjectMap.empty;
-                try obj.put(self.arena_alloc,"dtype", .{ .string = "F8_E4M3" });
-                var shape = std.json.Array.init(self.arena_alloc);
-                for (t.dims) |d| try shape.append(.{ .integer = @intCast(d) });
-                try obj.put(self.arena_alloc,"shape", .{ .array = shape });
-                var offsets = std.json.Array.init(self.arena_alloc);
-                try offsets.append(.{ .integer = @intCast(t.offset) });
-                try offsets.append(.{ .integer = @intCast(scale_start) });
-                try obj.put(self.arena_alloc,"data_offsets", .{ .array = offsets });
-                try header_obj.put(self.arena_alloc,t.name, .{ .object = obj });
+        // ComfyUI cluster dest types expand into [weight][scale...][comfy_quant] sub-tensors,
+        // laid out per TensorClusters.clusterWriteLayout (the shared source of truth also used
+        // by the size computation and the data writer below).
+        {
+            const dt = try types.DataType.fromString(t.type);
+            if (try TensorClusters.clusterWriteLayout(self.arena_alloc, dt, t.dims)) |specs| {
+                const base = if (std.mem.endsWith(u8, t.name, ".weight"))
+                    t.name[0 .. t.name.len - ".weight".len]
+                else
+                    t.name;
+                var off = t.offset;
+                for (specs) |s| {
+                    const name = try std.fmt.allocPrint(self.arena_alloc, "{s}{s}", .{ base, s.suffix });
+                    try putClusterHeaderEntry(self.arena_alloc, &header_obj, name, s.dtype, s.dims, off, off + s.bytes);
+                    off += s.bytes;
+                }
+                continue;
             }
-            // weight_scale: dtype F32, shape []
-            {
-                const sname = try std.fmt.allocPrint(self.arena_alloc, "{s}.weight_scale", .{base});
-                var obj = std.json.ObjectMap.empty;
-                try obj.put(self.arena_alloc,"dtype", .{ .string = "F32" });
-                try obj.put(self.arena_alloc,"shape", .{ .array = std.json.Array.init(self.arena_alloc) });
-                var offsets = std.json.Array.init(self.arena_alloc);
-                try offsets.append(.{ .integer = @intCast(scale_start) });
-                try offsets.append(.{ .integer = @intCast(comfy_start) });
-                try obj.put(self.arena_alloc,"data_offsets", .{ .array = offsets });
-                try header_obj.put(self.arena_alloc,sname, .{ .object = obj });
-            }
-            // comfy_quant: dtype U8, shape [27]
-            {
-                const cname = try std.fmt.allocPrint(self.arena_alloc, "{s}.comfy_quant", .{base});
-                var obj = std.json.ObjectMap.empty;
-                try obj.put(self.arena_alloc,"dtype", .{ .string = "U8" });
-                var shape = std.json.Array.init(self.arena_alloc);
-                try shape.append(.{ .integer = @intCast(comfy_json.len) });
-                try obj.put(self.arena_alloc,"shape", .{ .array = shape });
-                var offsets = std.json.Array.init(self.arena_alloc);
-                try offsets.append(.{ .integer = @intCast(comfy_start) });
-                try offsets.append(.{ .integer = @intCast(comfy_start + comfy_json.len) });
-                try obj.put(self.arena_alloc,"data_offsets", .{ .array = offsets });
-                try header_obj.put(self.arena_alloc,cname, .{ .object = obj });
-            }
-            continue;
-        }
-
-        // MXFP4 safetensors: expand into a 3-tensor ComfyUI cluster.
-        // The region [t.offset, t.offset+t.size) is split into:
-        //   [weight nibbles][E8M0 scale bytes][comfy_quant JSON]
-        if (std.mem.eql(u8, t.type, "MXFP4")) {
-            const n_cols: u64 = if (t.dims.len >= 1) t.dims[t.dims.len - 1] else 0;
-            var n_rows: u64 = 1;
-            if (t.dims.len >= 2) {
-                for (t.dims[0 .. t.dims.len - 1]) |d| n_rows *= d;
-            }
-            const weight_bytes: u64 = n_rows * n_cols / 2;
-            const scale_bytes:  u64 = n_rows * ((n_cols + 31) / 32);  // U8 E8M0, 1 byte each
-            const comfy_json = Convert.mxfp4_comfy_json;
-
-            const scale_start = t.offset + weight_bytes;
-            const comfy_start = scale_start + scale_bytes;
-
-            const weight_suffix = ".weight";
-            const base = if (std.mem.endsWith(u8, t.name, weight_suffix))
-                t.name[0 .. t.name.len - weight_suffix.len]
-            else
-                t.name;
-
-            // weight: dtype U32, shape [n_rows, n_cols/8]  (8 nibbles per U32)
-            {
-                var obj = std.json.ObjectMap.empty;
-                try obj.put(self.arena_alloc,"dtype", .{ .string = "U32" });
-                var shape = std.json.Array.init(self.arena_alloc);
-                try shape.append(.{ .integer = @intCast(n_rows) });
-                try shape.append(.{ .integer = @intCast(n_cols / 8) });
-                try obj.put(self.arena_alloc,"shape", .{ .array = shape });
-                var offsets = std.json.Array.init(self.arena_alloc);
-                try offsets.append(.{ .integer = @intCast(t.offset) });
-                try offsets.append(.{ .integer = @intCast(scale_start) });
-                try obj.put(self.arena_alloc,"data_offsets", .{ .array = offsets });
-                try header_obj.put(self.arena_alloc,t.name, .{ .object = obj });
-            }
-            // weight_scale: dtype U8 E8M0, shape [n_rows, n_cols/32]
-            {
-                const sname = try std.fmt.allocPrint(self.arena_alloc, "{s}.weight_scale", .{base});
-                var obj = std.json.ObjectMap.empty;
-                try obj.put(self.arena_alloc,"dtype", .{ .string = "U8" });
-                var shape = std.json.Array.init(self.arena_alloc);
-                try shape.append(.{ .integer = @intCast(n_rows) });
-                try shape.append(.{ .integer = @intCast((n_cols + 31) / 32) });
-                try obj.put(self.arena_alloc,"shape", .{ .array = shape });
-                var offsets = std.json.Array.init(self.arena_alloc);
-                try offsets.append(.{ .integer = @intCast(scale_start) });
-                try offsets.append(.{ .integer = @intCast(comfy_start) });
-                try obj.put(self.arena_alloc,"data_offsets", .{ .array = offsets });
-                try header_obj.put(self.arena_alloc,sname, .{ .object = obj });
-            }
-            // comfy_quant: dtype U8, shape [len(json)]
-            {
-                const cname = try std.fmt.allocPrint(self.arena_alloc, "{s}.comfy_quant", .{base});
-                var obj = std.json.ObjectMap.empty;
-                try obj.put(self.arena_alloc,"dtype", .{ .string = "U8" });
-                var shape = std.json.Array.init(self.arena_alloc);
-                try shape.append(.{ .integer = @intCast(comfy_json.len) });
-                try obj.put(self.arena_alloc,"shape", .{ .array = shape });
-                var offsets = std.json.Array.init(self.arena_alloc);
-                try offsets.append(.{ .integer = @intCast(comfy_start) });
-                try offsets.append(.{ .integer = @intCast(comfy_start + comfy_json.len) });
-                try obj.put(self.arena_alloc,"data_offsets", .{ .array = offsets });
-                try header_obj.put(self.arena_alloc,cname, .{ .object = obj });
-            }
-            continue;
-        }
-
-        // MXFP8_E4M3 safetensors: expand into a 3-tensor ComfyUI cluster.
-            // The region [t.offset, t.offset+t.size) is split into:
-            //   [F8_E4M3 weight bytes][E8M0 scale bytes][comfy_quant JSON]
-            if (std.mem.eql(u8, t.type, "MXFP8_E4M3")) {
-            const n_cols: u64 = if (t.dims.len >= 1) t.dims[t.dims.len - 1] else 0;
-            var n_rows: u64 = 1;
-            if (t.dims.len >= 2) {
-                for (t.dims[0 .. t.dims.len - 1]) |d| n_rows *= d;
-            }
-            const weight_bytes: u64 = n_rows * n_cols;  // 1 byte per F8_E4M3 element
-                // cuBLAS blocked scale: padded to [n_row_blocks*128, n_col_blocks*4]
-                const n_scale_cols_hdr: u64 = (n_cols + 31) / 32;
-                const n_row_blocks_hdr: u64 = (n_rows + 127) / 128;
-                const n_col_blocks_hdr: u64 = (n_scale_cols_hdr + 3) / 4;
-                const scale_bytes:  u64 = n_row_blocks_hdr * 128 * n_col_blocks_hdr * 4;
-                const comfy_json = Convert.mxfp8_comfy_json;
-
-            const scale_start = t.offset + weight_bytes;
-            const comfy_start = scale_start + scale_bytes;
-
-            const weight_suffix = ".weight";
-            const base = if (std.mem.endsWith(u8, t.name, weight_suffix))
-                t.name[0 .. t.name.len - weight_suffix.len]
-            else
-                t.name;
-
-            // weight: dtype F8_E4M3, original shape
-                {
-                var obj = std.json.ObjectMap.empty;
-                try obj.put(self.arena_alloc,"dtype", .{ .string = "F8_E4M3" });
-                var shape = std.json.Array.init(self.arena_alloc);
-                for (t.dims) |d| try shape.append(.{ .integer = @intCast(d) });
-                try obj.put(self.arena_alloc,"shape", .{ .array = shape });
-                var offsets = std.json.Array.init(self.arena_alloc);
-                try offsets.append(.{ .integer = @intCast(t.offset) });
-                try offsets.append(.{ .integer = @intCast(scale_start) });
-                try obj.put(self.arena_alloc,"data_offsets", .{ .array = offsets });
-                try header_obj.put(self.arena_alloc,t.name, .{ .object = obj });
-            }
-            // weight_scale: dtype U8 E8M0, cuBLAS blocked shape [n_row_blocks*128, n_col_blocks*4]
-                {
-                const sname = try std.fmt.allocPrint(self.arena_alloc, "{s}.weight_scale", .{base});
-                const n_scale_cols: u64 = (n_cols + 31) / 32;
-                const n_row_blocks: u64 = (n_rows + 127) / 128;
-                const n_col_blocks: u64 = (n_scale_cols + 3) / 4;
-                var obj = std.json.ObjectMap.empty;
-                try obj.put(self.arena_alloc,"dtype", .{ .string = "U8" });
-                var shape = std.json.Array.init(self.arena_alloc);
-                try shape.append(.{ .integer = @intCast(n_row_blocks * 128) });
-                try shape.append(.{ .integer = @intCast(n_col_blocks * 4) });
-                try obj.put(self.arena_alloc,"shape", .{ .array = shape });
-                var offsets = std.json.Array.init(self.arena_alloc);
-                try offsets.append(.{ .integer = @intCast(scale_start) });
-                try offsets.append(.{ .integer = @intCast(comfy_start) });
-                try obj.put(self.arena_alloc,"data_offsets", .{ .array = offsets });
-                try header_obj.put(self.arena_alloc,sname, .{ .object = obj });
-            }
-            // comfy_quant: dtype U8, shape [len(json)]
-                {
-                const cname = try std.fmt.allocPrint(self.arena_alloc, "{s}.comfy_quant", .{base});
-                var obj = std.json.ObjectMap.empty;
-                try obj.put(self.arena_alloc,"dtype", .{ .string = "U8" });
-                var shape = std.json.Array.init(self.arena_alloc);
-                try shape.append(.{ .integer = @intCast(comfy_json.len) });
-                try obj.put(self.arena_alloc,"shape", .{ .array = shape });
-                var offsets = std.json.Array.init(self.arena_alloc);
-                try offsets.append(.{ .integer = @intCast(comfy_start) });
-                try offsets.append(.{ .integer = @intCast(comfy_start + comfy_json.len) });
-                try obj.put(self.arena_alloc,"data_offsets", .{ .array = offsets });
-                try header_obj.put(self.arena_alloc,cname, .{ .object = obj });
-            }
-            continue;
-        }
-
-        // NVFP4 safetensors: expand into a 4-tensor ComfyUI cluster.
-        // The region [t.offset, t.offset+t.size) is split into:
-        //   [weight nibbles][F8_E4M3 scale cuBLAS-tiled][F32 global scale][comfy_quant JSON]
-        if (std.mem.eql(u8, t.type, "NVFP4")) {
-            const n_cols: u64 = if (t.dims.len >= 1) t.dims[t.dims.len - 1] else 0;
-            var n_rows: u64 = 1;
-            if (t.dims.len >= 2) {
-                for (t.dims[0 .. t.dims.len - 1]) |d| n_rows *= d;
-            }
-            const weight_bytes: u64 = n_rows * (n_cols / 2);
-            const scale_bytes:  u64 = n_rows * (n_cols / 16);  // F8_E4M3, cuBLAS-tiled
-            const gs_bytes:     u64 = 4;  // F32 global scalar
-            const comfy_json = Convert.nvfp4_comfy_json;
-
-            const scale_start  = t.offset + weight_bytes;
-            const gs_start     = scale_start + scale_bytes;
-            const comfy_start  = gs_start + gs_bytes;
-
-            const weight_suffix = ".weight";
-            const base = if (std.mem.endsWith(u8, t.name, weight_suffix))
-                t.name[0 .. t.name.len - weight_suffix.len]
-            else
-                t.name;
-
-            // weight: dtype U8, shape [n_rows, n_cols/2]  (packed nibbles)
-            {
-                var obj = std.json.ObjectMap.empty;
-                try obj.put(self.arena_alloc,"dtype", .{ .string = "U8" });
-                var shape = std.json.Array.init(self.arena_alloc);
-                try shape.append(.{ .integer = @intCast(n_rows) });
-                try shape.append(.{ .integer = @intCast(n_cols / 2) });
-                try obj.put(self.arena_alloc,"shape", .{ .array = shape });
-                var offsets = std.json.Array.init(self.arena_alloc);
-                try offsets.append(.{ .integer = @intCast(t.offset) });
-                try offsets.append(.{ .integer = @intCast(scale_start) });
-                try obj.put(self.arena_alloc,"data_offsets", .{ .array = offsets });
-                try header_obj.put(self.arena_alloc,t.name, .{ .object = obj });
-            }
-            // weight_scale: dtype F8_E4M3, shape [n_rows, n_cols/16]  (cuBLAS-tiled)
-            {
-                const sname = try std.fmt.allocPrint(self.arena_alloc, "{s}.weight_scale", .{base});
-                var obj = std.json.ObjectMap.empty;
-                try obj.put(self.arena_alloc,"dtype", .{ .string = "F8_E4M3" });
-                var shape = std.json.Array.init(self.arena_alloc);
-                try shape.append(.{ .integer = @intCast(n_rows) });
-                try shape.append(.{ .integer = @intCast(n_cols / 16) });
-                try obj.put(self.arena_alloc,"shape", .{ .array = shape });
-                var offsets = std.json.Array.init(self.arena_alloc);
-                try offsets.append(.{ .integer = @intCast(scale_start) });
-                try offsets.append(.{ .integer = @intCast(gs_start) });
-                try obj.put(self.arena_alloc,"data_offsets", .{ .array = offsets });
-                try header_obj.put(self.arena_alloc,sname, .{ .object = obj });
-            }
-            // weight_scale_2: dtype F32, shape []  (global scalar)
-            {
-                const s2name = try std.fmt.allocPrint(self.arena_alloc, "{s}.weight_scale_2", .{base});
-                var obj = std.json.ObjectMap.empty;
-                try obj.put(self.arena_alloc,"dtype", .{ .string = "F32" });
-                try obj.put(self.arena_alloc,"shape", .{ .array = std.json.Array.init(self.arena_alloc) });
-                var offsets = std.json.Array.init(self.arena_alloc);
-                try offsets.append(.{ .integer = @intCast(gs_start) });
-                try offsets.append(.{ .integer = @intCast(comfy_start) });
-                try obj.put(self.arena_alloc,"data_offsets", .{ .array = offsets });
-                try header_obj.put(self.arena_alloc,s2name, .{ .object = obj });
-            }
-            // comfy_quant: dtype U8, shape [len(json)]
-            {
-                const cname = try std.fmt.allocPrint(self.arena_alloc, "{s}.comfy_quant", .{base});
-                var obj = std.json.ObjectMap.empty;
-                try obj.put(self.arena_alloc,"dtype", .{ .string = "U8" });
-                var shape = std.json.Array.init(self.arena_alloc);
-                try shape.append(.{ .integer = @intCast(comfy_json.len) });
-                try obj.put(self.arena_alloc,"shape", .{ .array = shape });
-                var offsets = std.json.Array.init(self.arena_alloc);
-                try offsets.append(.{ .integer = @intCast(comfy_start) });
-                try offsets.append(.{ .integer = @intCast(comfy_start + comfy_json.len) });
-                try obj.put(self.arena_alloc,"data_offsets", .{ .array = offsets });
-                try header_obj.put(self.arena_alloc,cname, .{ .object = obj });
-            }
-            continue;
         }
 
         var tensor_obj = std.json.ObjectMap.empty;
@@ -1118,251 +877,25 @@ pub fn saveWithSTData(self: Safetensors, source: anytype, threads: usize, callba
 
         var matched = false;
 
-        // SCALED_F8_E4M3 cluster output: quantize source data and write weight+scale+comfy_quant
-        if (!matched and std.mem.eql(u8, t.type, "SCALED_F8_E4M3")) {
-            var n_elements: u64 = 1;
-            for (t.dims) |d| n_elements *= d;
-            for (source.tensors.items) |source_tensor| {
-                const is_match = std.mem.eql(u8, source_tensor.name, t.name) or
-                    (source_tensor.name.len > t.name.len and
-                     source_tensor.name[source_tensor.name.len - t.name.len - 1] == '.' and
-                     std.mem.endsWith(u8, source_tensor.name, t.name));
-                if (!is_match) continue;
-                matched = true;
-
-                const source_dtype = try types.DataType.fromString(source_tensor.type);
-                const source_size: usize = switch (source_dtype.formatType()) {
-                    .safetensors => blk: {
-                        const stype = try Safetensors.DType.fromString(@tagName(source_dtype));
-                        break :blk stype.calcSizeInBytes(n_elements);
-                    },
-                    .gguf => blk: {
-                        const stype = try gguf.GgmlType.fromString(@tagName(source_dtype));
-                        break :blk stype.calcSizeInBytes(n_elements);
-                    },
-                };
-                const source_file = try source.openFileForTensor(source_tensor.name);
-                const src_bytes = try self.allocator.alloc(u8, source_size);
-                defer self.allocator.free(src_bytes);
-                _ = try source_file.readPositionalAll(source.io, src_bytes, source_tensor.offset + source.current_data_begin);
-
-                const f32_bytes = try DataTransform.Quantizer.convertTensorData(
-                    self.allocator, src_bytes, source_dtype, .F32, n_elements, &pool,
-                );
-                defer self.allocator.free(f32_bytes);
-                const f32_slice: []const f32 = @ptrCast(@alignCast(std.mem.bytesAsSlice(f32, f32_bytes)));
-
-                const cluster = try DataTransform.Quantizer.quantizeToComfyFp8(
-                    self.allocator, f32_slice, &pool,
-                );
-                defer self.allocator.free(cluster.weight);
-
-                var scale_bytes_buf: [4]u8 = undefined;
-                std.mem.writeInt(u32, &scale_bytes_buf, @bitCast(cluster.scale), .little);
-
-                std.log.info("Writing FP8 cluster {s} from {s}, scale={d:.6}", .{
-                    t.name, source_tensor.type, cluster.scale,
-                });
-                try (&writer.interface).writeAll(cluster.weight);
-                try (&writer.interface).writeAll(&scale_bytes_buf);
-                try (&writer.interface).writeAll(Convert.fp8_comfy_json);
-                callbacks.reportProgress(count, total_tensors, t.name, source_tensor.type, "F8_E4M3", @intCast(n_elements));
-                count += 1;
-                break;
-            }
-        }
-
-        // MXFP4 cluster output: quantize source data and write weight+scale+comfy_quant
-        if (!matched and std.mem.eql(u8, t.type, "MXFP4")) {
-            const n_cols: u64 = if (t.dims.len >= 1) t.dims[t.dims.len - 1] else 0;
-            var n_rows: u64 = 1;
-            if (t.dims.len >= 2) {
-                for (t.dims[0 .. t.dims.len - 1]) |d| n_rows *= d;
-            }
-            for (source.tensors.items) |source_tensor| {
-                const is_match = std.mem.eql(u8, source_tensor.name, t.name) or
-                    (source_tensor.name.len > t.name.len and
-                     source_tensor.name[source_tensor.name.len - t.name.len - 1] == '.' and
-                     std.mem.endsWith(u8, source_tensor.name, t.name));
-                if (!is_match) continue;
-                matched = true;
-
-                // Read source bytes
-                const source_dtype = try types.DataType.fromString(source_tensor.type);
-                const n_elements: u64 = n_rows * n_cols;
-                const source_size: usize = switch (source_dtype.formatType()) {
-                    .safetensors => blk: {
-                        const stype = try Safetensors.DType.fromString(@tagName(source_dtype));
-                        break :blk stype.calcSizeInBytes(n_elements);
-                    },
-                    .gguf => blk: {
-                        const stype = try gguf.GgmlType.fromString(@tagName(source_dtype));
-                        break :blk stype.calcSizeInBytes(n_elements);
-                    },
-                };
-                const source_file = try source.openFileForTensor(source_tensor.name);
-                const src_bytes = try self.allocator.alloc(u8, source_size);
-                defer self.allocator.free(src_bytes);
-                _ = try source_file.readPositionalAll(source.io, src_bytes, source_tensor.offset + source.current_data_begin);
-
-                // Convert to F32
-                const f32_bytes = try DataTransform.Quantizer.convertTensorData(
-                    self.allocator, src_bytes, source_dtype, .F32, n_elements, &pool,
-                );
-                defer self.allocator.free(f32_bytes);
-                const f32_slice: []const f32 = @ptrCast(@alignCast(std.mem.bytesAsSlice(f32, f32_bytes)));
-
-                // Quantize to ComfyUI MXFP4
-                const cluster = try DataTransform.Quantizer.quantizeToComfyMxfp4(
-                    self.allocator, f32_slice, &pool,
-                );
-                defer self.allocator.free(cluster.weight);
-                defer self.allocator.free(cluster.scale);
-
-                std.log.info("Writing MXFP4 cluster {s} [{}, {}] from {s}", .{
-                    t.name, n_rows, n_cols, source_tensor.type,
-                });
-                try (&writer.interface).writeAll(cluster.weight);
-                try (&writer.interface).writeAll(cluster.scale);
-                try (&writer.interface).writeAll(Convert.mxfp4_comfy_json);
-                callbacks.reportProgress(count, total_tensors, t.name, source_tensor.type, "MXFP4", @intCast(n_elements));
-                count += 1;
-                break;
-            }
-        }
-
-        // MXFP8 cluster output: quantize source data and write weight+scale+comfy_quant
-        if (!matched and std.mem.eql(u8, t.type, "MXFP8_E4M3")) {
-            const n_cols: u64 = if (t.dims.len >= 1) t.dims[t.dims.len - 1] else 0;
-            var n_rows: u64 = 1;
-            if (t.dims.len >= 2) {
-                for (t.dims[0 .. t.dims.len - 1]) |d| n_rows *= d;
-            }
-            for (source.tensors.items) |source_tensor| {
-                const is_match = std.mem.eql(u8, source_tensor.name, t.name) or
-                    (source_tensor.name.len > t.name.len and
-                        source_tensor.name[source_tensor.name.len - t.name.len - 1] == '.' and
-                        std.mem.endsWith(u8, source_tensor.name, t.name));
-                if (!is_match) continue;
-                matched = true;
-
-                // Read source bytes
-                const source_dtype = try types.DataType.fromString(source_tensor.type);
-                const n_elements: u64 = n_rows * n_cols;
-                const source_size: usize = switch (source_dtype.formatType()) {
-                    .safetensors => blk: {
-                        const stype = try Safetensors.DType.fromString(@tagName(source_dtype));
-                        break :blk stype.calcSizeInBytes(n_elements);
-                    },
-                    .gguf => blk: {
-                        const stype = try gguf.GgmlType.fromString(@tagName(source_dtype));
-                        break :blk stype.calcSizeInBytes(n_elements);
-                    },
-                };
-                const source_file = try source.openFileForTensor(source_tensor.name);
-                const src_bytes = try self.allocator.alloc(u8, source_size);
-                defer self.allocator.free(src_bytes);
-                _ = try source_file.readPositionalAll(source.io, src_bytes, source_tensor.offset + source.current_data_begin);
-
-                // Convert to F32
-                const f32_bytes = try DataTransform.Quantizer.convertTensorData(
-                    self.allocator, src_bytes, source_dtype, .F32, n_elements, &pool,
-                );
-                defer self.allocator.free(f32_bytes);
-                const f32_slice: []const f32 = @ptrCast(@alignCast(std.mem.bytesAsSlice(f32, f32_bytes)));
-
-                // Quantize to ComfyUI MXFP8
-                const cluster = try DataTransform.Quantizer.quantizeToComfyMxfp8(
-                    self.allocator, f32_slice, &pool,
-                );
-                defer self.allocator.free(cluster.weight);
-                defer self.allocator.free(cluster.scale);
-
-                // Apply cuBLAS blocking to scales before writing
-                const n_scale_cols: usize = @intCast((n_cols + 31) / 32);
-                const blocked_scale = try DataTransform.Quantizer.toBlockedMxfp8(
-                    self.allocator, cluster.scale, @intCast(n_rows), n_scale_cols,
-                );
-                defer self.allocator.free(blocked_scale);
-
-                std.log.info("Writing MXFP8 cluster {s} [{}, {}] from {s}", .{
-                    t.name, n_rows, n_cols, source_tensor.type,
-                });
-                try (&writer.interface).writeAll(cluster.weight);
-                try (&writer.interface).writeAll(blocked_scale);
-                try (&writer.interface).writeAll(Convert.mxfp8_comfy_json);
-                callbacks.reportProgress(count, total_tensors, t.name, source_tensor.type, "MXFP8_E4M3", @intCast(n_elements));
-                count += 1;
-                break;
-            }
-        }
-
-        // NVFP4 cluster output: quantize source data and write weight+scale+global_scale+comfy_quant
-        if (!matched and std.mem.eql(u8, t.type, "NVFP4")) {
-            const n_cols: u64 = if (t.dims.len >= 1) t.dims[t.dims.len - 1] else 0;
-            var n_rows: u64 = 1;
-            if (t.dims.len >= 2) {
-                for (t.dims[0 .. t.dims.len - 1]) |d| n_rows *= d;
-            }
-            for (source.tensors.items) |source_tensor| {
-                const is_match = std.mem.eql(u8, source_tensor.name, t.name) or
-                    (source_tensor.name.len > t.name.len and
-                     source_tensor.name[source_tensor.name.len - t.name.len - 1] == '.' and
-                     std.mem.endsWith(u8, source_tensor.name, t.name));
-                if (!is_match) continue;
-                matched = true;
-
-                // Read source bytes
-                const source_dtype = try types.DataType.fromString(source_tensor.type);
-                const n_elements: u64 = n_rows * n_cols;
-                const source_size: usize = switch (source_dtype.formatType()) {
-                    .safetensors => blk: {
-                        const stype = try Safetensors.DType.fromString(@tagName(source_dtype));
-                        break :blk stype.calcSizeInBytes(n_elements);
-                    },
-                    .gguf => blk: {
-                        const stype = try gguf.GgmlType.fromString(@tagName(source_dtype));
-                        break :blk stype.calcSizeInBytes(n_elements);
-                    },
-                };
-                const source_file = try source.openFileForTensor(source_tensor.name);
-                const src_bytes = try self.allocator.alloc(u8, source_size);
-                defer self.allocator.free(src_bytes);
-                _ = try source_file.readPositionalAll(source.io, src_bytes, source_tensor.offset + source.current_data_begin);
-
-                // Convert to F32
-                const f32_bytes = try DataTransform.Quantizer.convertTensorData(
-                    self.allocator, src_bytes, source_dtype, .F32, n_elements, &pool,
-                );
-                defer self.allocator.free(f32_bytes);
-                const f32_slice: []const f32 = @ptrCast(@alignCast(std.mem.bytesAsSlice(f32, f32_bytes)));
-
-                // Quantize to NVFP4 cluster
-                const cluster = try ScaledQuant.quantizeToNvFp4Raw(
-                    f32_slice, n_rows, n_cols, self.allocator, &pool,
-                );
-                defer self.allocator.free(cluster.weight);
-                defer self.allocator.free(cluster.scale);
-
-                var gs_buf: [4]u8 = undefined;
-                std.mem.writeInt(u32, &gs_buf, @bitCast(cluster.global_scale), .little);
-
-                std.log.info("Writing NVFP4 cluster {s} [{}, {}] from {s}", .{
-                    t.name, n_rows, n_cols, source_tensor.type,
-                });
-                try (&writer.interface).writeAll(cluster.weight);
-                try (&writer.interface).writeAll(cluster.scale);
-                try (&writer.interface).writeAll(&gs_buf);
-                try (&writer.interface).writeAll(Convert.nvfp4_comfy_json);
-                callbacks.reportProgress(count, total_tensors, t.name, source_tensor.type, "NVFP4", @intCast(n_elements));
-                count += 1;
-                break;
+        // ComfyUI cluster dest: load the matching source as F32, then quantize + write its
+        // physical sub-tensors via the shared cluster layout (weight + scale(s) + comfy_quant).
+        {
+            const dt = try types.DataType.fromString(t.type);
+            if (TensorClusters.isClusterType(dt)) {
+                if (try TensorClusters.loadMatchingSourceAsF32(source, self.allocator, t.name, @intCast(elements), &pool)) |loaded| {
+                    defer self.allocator.free(loaded.data);
+                    try TensorClusters.writeClusterData(&writer.interface, self.allocator, dt, loaded.data, t.dims, &pool);
+                    std.log.info("Writing {s} cluster {s} from {s}", .{ t.type, t.name, loaded.source_type });
+                    callbacks.reportProgress(count, total_tensors, t.name, loaded.source_type, t.type, @intCast(elements));
+                    count += 1;
+                    matched = true;
+                }
             }
         }
 
         // Cluster dequantization path: source is an NVFP4/FP8/MX* cluster → dequant to F32
         if (!matched) {
-            if (try ScaledQuant.tryDequantCluster(t, source, groups, self.allocator, &pool)) |f32_buf| {
+            if (try TensorClusters.tryDequantCluster(t, source, groups, self.allocator, &pool)) |f32_buf| {
                 defer self.allocator.free(f32_buf);
                 const target_dtype = try types.DataType.fromString(t.type);
                 std.log.info("Writing tensor data for tensor {}/{} {s} - nvfp4/fp8 to {s}, {} elements", .{

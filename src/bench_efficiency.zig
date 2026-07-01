@@ -1,6 +1,6 @@
 const std = @import("std");
 const DataTransform = @import("DataTransform.zig");
-const ScaledQuant = @import("ScaledQuant.zig");
+const TensorClusters = @import("TensorClusters.zig");
 const types = @import("types.zig");
 const ThreadPool = @import("ThreadPool.zig");
 
@@ -200,11 +200,11 @@ pub fn main(init: std.process.Init) !void {
     // Shape constraint: rows must be a multiple of 128, cols a multiple of 64.
     // -------------------------------------------------------------------------
     {
-        const enc = try ScaledQuant.quantizeToNvFp4Raw(original, ROWS, COLS, allocator, &pool);
+        const enc = try TensorClusters.quantizeToNvFp4Raw(original, ROWS, COLS, allocator, &pool);
         defer allocator.free(enc.weight);
         defer allocator.free(enc.scale);
 
-        const decoded = try ScaledQuant.dequantizeFp4Raw(
+        const decoded = try TensorClusters.dequantizeFp4Raw(
             enc.weight, enc.scale, enc.global_scale, ROWS, COLS, allocator, &pool,
         );
         defer allocator.free(decoded);
