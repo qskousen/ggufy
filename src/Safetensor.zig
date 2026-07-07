@@ -877,41 +877,33 @@ pub fn saveWithSTData(self: Safetensors, source: anytype, threads: usize, callba
 
         var matched = false;
 
-        // ComfyUI cluster dest: load the matching source as F32, then quantize + write its
-        // physical sub-tensors via the shared cluster layout (weight + scale(s) + comfy_quant).
+        // Any cluster on either side must round-trip through F32. `dequantSourceToF32` is the single
+        // dequant entry point: it reconstructs cluster sources (int8_convrot/nvfp4/fp8/mx*) via the
+        // per-cluster dequantizers and plain sources via a generic name-matched dequant. For a
+        // cluster dest we always take this path (source may be cluster or plain); for a plain dest
+        // we only take it when the source is a cluster — plain→plain falls through to the direct
+        // single-tensor path below.
         {
             const dt = try types.DataType.fromString(t.type);
-            if (TensorClusters.isClusterType(dt)) {
-                if (try TensorClusters.loadMatchingSourceAsF32(source, self.allocator, t.name, @intCast(elements), &pool)) |loaded| {
-                    defer self.allocator.free(loaded.data);
-                    try TensorClusters.writeClusterData(&writer.interface, self.allocator, dt, loaded.data, t.dims, &pool);
-                    std.log.info("Writing {s} cluster {s} from {s}", .{ t.type, t.name, loaded.source_type });
-                    callbacks.reportProgress(count, total_tensors, t.name, loaded.source_type, t.type, @intCast(elements));
-                    count += 1;
-                    matched = true;
-                }
-            }
-        }
+            const dest_is_cluster = TensorClusters.isClusterType(dt);
+            const src_f32 = if (dest_is_cluster)
+                try TensorClusters.dequantSourceToF32(t, source, groups, self.allocator, &pool)
+            else
+                try TensorClusters.tryDequantCluster(t, source, groups, self.allocator, &pool);
 
-        // Cluster dequantization path: source is an NVFP4/FP8/MX* cluster → dequant to F32
-        if (!matched) {
-            if (try TensorClusters.tryDequantCluster(t, source, groups, self.allocator, &pool)) |f32_buf| {
-                defer self.allocator.free(f32_buf);
-                const target_dtype = try types.DataType.fromString(t.type);
-                std.log.info("Writing tensor data for tensor {}/{} {s} - nvfp4/fp8 to {s}, {} elements", .{
-                    count, total_tensors, t.name, t.type, elements,
-                });
-                const out = try DataTransform.Quantizer.convertTensorData(
-                    self.allocator,
-                    std.mem.sliceAsBytes(f32_buf),
-                    .F32,
-                    target_dtype,
-                    f32_buf.len,
-                    &pool,
-                );
-                defer self.allocator.free(out);
-                try (&writer.interface).writeAll(out);
-                callbacks.reportProgress(count, total_tensors, t.name, "nvfp4", t.type, @intCast(elements));
+            if (src_f32) |data| {
+                defer self.allocator.free(data);
+                if (dest_is_cluster) {
+                    try TensorClusters.writeClusterData(&writer.interface, self.allocator, dt, data, t.dims, &pool);
+                } else {
+                    const out = try DataTransform.Quantizer.convertTensorData(
+                        self.allocator, std.mem.sliceAsBytes(data), .F32, dt, data.len, &pool,
+                    );
+                    defer self.allocator.free(out);
+                    try (&writer.interface).writeAll(out);
+                }
+                std.log.info("Writing tensor {}/{} {s} to {s} ({} elements, cluster-aware)", .{ count, total_tensors, t.name, t.type, elements });
+                callbacks.reportProgress(count, total_tensors, t.name, "cluster", t.type, @intCast(elements));
                 count += 1;
                 matched = true;
             }

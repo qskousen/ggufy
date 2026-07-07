@@ -10,6 +10,7 @@ const imagearch = @import("ImageArch.zig");
 const cb = @import("callbacks.zig");
 const TensorClusters = @import("TensorClusters.zig");
 const DataTransform = @import("DataTransform.zig");
+const build_options = @import("build_options");
 
 // Cluster identity blobs + layout now live in TensorClusters (the shared source of truth).
 
@@ -918,6 +919,29 @@ fn ggufFileType(datatype: ?types.DataType) i64 {
     };
 }
 
+/// File-level metadata key (comfy-kitchen layout) mapping each layer to its source
+/// quantization identity. Conversion dequantizes/re-encodes those layers, so this header
+/// no longer describes the output — copying it verbatim makes ComfyUI try to load the
+/// converted file as INT8 ConvRot and fail. It is stripped from every output.
+const source_quant_metadata_key = "_quantization_metadata";
+
+const ggufy_repo_url = "https://github.com/qskousen/ggufy";
+
+/// Rewrite converter-provenance metadata keys that a prior tool (e.g. comfy-kitchen's INT8
+/// ConvRot converter) may have stamped on the source. After conversion those values
+/// misdescribe the file's origin, so overwrite them with ggufy's identity. Only keys the
+/// source already carried are touched — plain conversions gain no new provenance keys.
+fn stampConverterProvenance(metadata: *std.json.ObjectMap) void {
+    const updates = [_]struct { key: []const u8, value: []const u8 }{
+        .{ .key = "converted_by", .value = "ggufy " ++ build_options.version },
+        .{ .key = "converter_url", .value = ggufy_repo_url },
+        .{ .key = "converter_note", .value = "Converted with ggufy" },
+    };
+    for (updates) |u| {
+        if (metadata.getPtr(u.key)) |v| v.* = .{ .string = u.value };
+    }
+}
+
 fn writeGguf(
     f: anytype,
     model_tensors: std.ArrayList(types.Tensor),
@@ -978,6 +1002,11 @@ fn writeGguf(
         if (!out_gguf.metadata.contains(entry.key_ptr.*))
             try out_gguf.metadata.put(arena_alloc,try arena_alloc.dupe(u8, entry.key_ptr.*), entry.value_ptr.*);
     }
+
+    // Drop the source quantization header — it describes the pre-conversion layout —
+    // and correct any converter-provenance keys carried over from the source tool.
+    _ = out_gguf.metadata.swapRemove(source_quant_metadata_key);
+    stampConverterProvenance(&out_gguf.metadata);
 
     // Merge arch base config (vae/audio_vae/vocoder etc.) into the `config` KV.
     // Fine-tuned source files often omit these sections; they are architectural
@@ -1052,6 +1081,14 @@ fn writeSafetensors(
     while (extra_it.next()) |entry| {
         if (!out_st.metadata.?.contains(entry.key_ptr.*))
             try out_st.metadata.?.put(arena_alloc, try arena_alloc.dupe(u8, entry.key_ptr.*), entry.value_ptr.*);
+    }
+
+    // Drop the source quantization header. It describes the pre-conversion layout, so
+    // leaving it would make ComfyUI load the dequantized output as a different format and fail.
+    // Also correct any converter-provenance keys present.
+    if (out_st.metadata) |*m| {
+        _ = m.swapRemove(source_quant_metadata_key);
+        stampConverterProvenance(m);
     }
 
     out_st.saveWithSTData(f, opts.threads, opts.callbacks, groups) catch |err| {

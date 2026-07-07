@@ -7,6 +7,9 @@ pub fn build(b: *std.Build) void {
 
     const options = b.addOptions();
     options.addOption([]const u8, "version", git_version);
+    // One shared module instance for the generated options file; adding it via multiple
+    // addOptions() calls would root the same file in several modules and fail to compile.
+    const options_mod = options.createModule();
 
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -25,6 +28,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .imports = &.{
             .{ .name = "ggml.h", .module = ggml_h_module },
+            .{ .name = "build_options", .module = options_mod },
         },
     });
 
@@ -48,7 +52,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     cli.root_module.addImport("clap", clap.module("clap"));
-    cli.root_module.addOptions("build_options", options);
+    cli.root_module.addImport("build_options", options_mod);
 
     ggml.link(b, cli, target, optimize);
 
@@ -81,7 +85,7 @@ pub fn build(b: *std.Build) void {
     const dvui_dep = b.dependency("dvui", .{ .target = target, .optimize = optimize, .backend = .sdl3, .@"tree-sitter" = false });
     gui.root_module.addImport("dvui", dvui_dep.module("dvui_sdl3"));
     gui.root_module.addImport("backend", dvui_dep.module("sdl3"));
-    gui.root_module.addOptions("build_options", options);
+    gui.root_module.addImport("build_options", options_mod);
 
     // When cross-compiling for macOS with an explicit sysroot (e.g. CI),
     // Zig does not automatically add the SDK's framework search path, so we must wire it up ourselves.
@@ -190,6 +194,10 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "ggml.h", .module = ggml_h_module },
+                // Convert.zig imports build_options (stampConverterProvenance uses the version
+                // string); the standalone test module must provide it too, or a test that
+                // exercises the write path fails to compile with "no module named build_options".
+                .{ .name = "build_options", .module = options_mod },
             },
         }),
     });

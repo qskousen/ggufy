@@ -10,7 +10,9 @@ pub const Fp4Cluster = struct {
     weight: types.Tensor,
     weight_scale: types.Tensor,
     weight_scale_2: types.Tensor,
-    comfy_quant: types.Tensor,
+    // Per-tensor `.comfy_quant` marker, or null when the identity came from the file-level
+    // `_quantization_metadata` header (comfy-kitchen layout, no per-tensor markers).
+    comfy_quant: ?types.Tensor,
     rows: usize,
     cols: usize,
 };
@@ -20,7 +22,8 @@ pub const Float8Cluster = struct {
     weight: types.Tensor,
     weight_scale: types.Tensor,
     input_scale: ?types.Tensor,  // optional activation scale (scalar, dropped on conversion)
-    comfy_quant: types.Tensor,
+    // Per-tensor `.comfy_quant` marker, or null when sourced from the `_quantization_metadata` header.
+    comfy_quant: ?types.Tensor,
     rows: usize,
     cols: usize,
 };
@@ -31,7 +34,8 @@ pub const Mxfp4Cluster = struct {
     base_name: []const u8,
     weight: types.Tensor,        // U8 packed nibbles, [rows, cols/2]
     weight_scale: types.Tensor,  // U8 E8M0, [rows, cols/32]
-    comfy_quant: types.Tensor,
+    // Per-tensor `.comfy_quant` marker, or null when sourced from the `_quantization_metadata` header.
+    comfy_quant: ?types.Tensor,
     rows: usize,
     cols: usize,
 };
@@ -41,7 +45,8 @@ pub const Mxfp8Cluster = struct {
     base_name: []const u8,
     weight: types.Tensor,        // F8_E4M3, [rows, cols]
     weight_scale: types.Tensor,  // U8 E8M0, [rows, cols/32]
-    comfy_quant: types.Tensor,
+    // Per-tensor `.comfy_quant` marker, or null when sourced from the `_quantization_metadata` header.
+    comfy_quant: ?types.Tensor,
     rows: usize,
     cols: usize,
 };
@@ -52,7 +57,9 @@ pub const Int8ConvrotCluster = struct {
     base_name: []const u8,
     weight: types.Tensor,        // I8, [rows, cols]
     weight_scale: types.Tensor,  // F32, [rows, 1]
-    comfy_quant: types.Tensor,
+    // The per-tensor `.comfy_quant` marker, or null when the quant identity was sourced
+    // from the file-level `_quantization_metadata` header (comfy-kitchen layout).
+    comfy_quant: ?types.Tensor,
     rows: usize,
     cols: usize,
     convrot: bool,
@@ -142,8 +149,387 @@ fn readTensorBytes(source: anytype, tensor: types.Tensor, allocator: std.mem.All
     return buf;
 }
 
-/// Scan source tensors and group them into NVFP4 and FP8 clusters via comfy_quant markers.
-/// Result slices are arena-allocated; `allocator` is used for temporary work only.
+/// Build an int8_convrot cluster from a layer `base_name` and its (already-parsed) quant
+/// identity, appending to `list`. `comfy_quant` is the per-tensor marker tensor when the
+/// identity came from a `.comfy_quant` blob, or null when it came from the file-level
+/// `_quantization_metadata` header. Returns `false` without appending (logging a warning)
+/// on any structural mismatch, `true` when a cluster was appended. `base_name` must
+/// outlive the cluster (arena- or source-owned).
+fn appendInt8ConvrotCluster(
+    source: anytype,
+    name_map: *std.StringHashMap(usize),
+    base_name: []const u8,
+    convrot: bool,
+    group_size: usize,
+    comfy_quant: ?types.Tensor,
+    list: *std.ArrayList(Int8ConvrotCluster),
+    arena_alloc: std.mem.Allocator,
+    allocator: std.mem.Allocator,
+) !bool {
+    const wname = try std.fmt.allocPrint(allocator, "{s}.weight", .{base_name});
+    defer allocator.free(wname);
+    const wsname = try std.fmt.allocPrint(allocator, "{s}.weight_scale", .{base_name});
+    defer allocator.free(wsname);
+
+    const wi = name_map.get(wname) orelse {
+        std.log.warn("TensorClusters: missing .weight for int8_convrot cluster {s}", .{base_name});
+        return false;
+    };
+    const wsi = name_map.get(wsname) orelse {
+        std.log.warn("TensorClusters: missing .weight_scale for int8_convrot cluster {s}", .{base_name});
+        return false;
+    };
+
+    const weight = source.tensors.items[wi];
+    const weight_scale = source.tensors.items[wsi];
+
+    if (weight.dims.len != 2) {
+        std.log.warn("TensorClusters: int8_convrot cluster {s} weight is not 2-D; skipping", .{base_name});
+        return false;
+    }
+    const rows = weight.dims[0];
+    const cols = weight.dims[1];
+    // Per-row (a.k.a. per-channel) scaling only: expect one F32 scale per output row.
+    if (weight_scale.size != rows * 4) {
+        std.log.warn("TensorClusters: int8_convrot cluster {s} has non-per-row scale ({} bytes, expected {}); skipping", .{ base_name, weight_scale.size, rows * 4 });
+        return false;
+    }
+
+    if (convrot and (!DataTransform.Quantizer.isValidHadamardSize(group_size) or cols % group_size != 0)) {
+        std.log.warn("TensorClusters: int8_convrot cluster {s} has incompatible group_size {} for cols {}; skipping", .{ base_name, group_size, cols });
+        return false;
+    }
+
+    try list.append(arena_alloc, .{
+        .base_name = base_name,
+        .weight = weight,
+        .weight_scale = weight_scale,
+        .comfy_quant = comfy_quant,
+        .rows = rows,
+        .cols = cols,
+        .convrot = convrot,
+        .group_size = group_size,
+    });
+    std.log.debug("TensorClusters: grouped int8_convrot cluster {s} [{}, {}] convrot={} gs={}", .{
+        base_name, rows, cols, convrot, group_size,
+    });
+    return true;
+}
+
+/// Build an NVFP4 cluster (E2M1 packed nibbles + FP8 block scale + FP32 global scale) from a
+/// layer `base_name` and append to `list`. The `.weight`, `.weight_scale` and `.weight_scale_2`
+/// companions are resolved by name; a missing one is warned and skipped. `comfy_quant` is the
+/// per-tensor marker, or null when the identity came from the `_quantization_metadata` header.
+/// Returns true if a cluster was appended, false on any structural miss. `base_name` must outlive
+/// the cluster (arena- or source-owned).
+fn appendNvfp4Cluster(
+    source: anytype,
+    name_map: *std.StringHashMap(usize),
+    base_name: []const u8,
+    comfy_quant: ?types.Tensor,
+    list: *std.ArrayList(Fp4Cluster),
+    arena_alloc: std.mem.Allocator,
+    allocator: std.mem.Allocator,
+) !bool {
+    const wname = try std.fmt.allocPrint(allocator, "{s}.weight", .{base_name});
+    defer allocator.free(wname);
+    const wsname = try std.fmt.allocPrint(allocator, "{s}.weight_scale", .{base_name});
+    defer allocator.free(wsname);
+    const ws2name = try std.fmt.allocPrint(allocator, "{s}.weight_scale_2", .{base_name});
+    defer allocator.free(ws2name);
+
+    const wi = name_map.get(wname) orelse {
+        std.log.warn("TensorClusters: missing .weight for cluster {s}", .{base_name});
+        return false;
+    };
+    const wsi = name_map.get(wsname) orelse {
+        std.log.warn("TensorClusters: missing .weight_scale for cluster {s}", .{base_name});
+        return false;
+    };
+    const ws2i = name_map.get(ws2name) orelse {
+        std.log.warn("TensorClusters: missing .weight_scale_2 for cluster {s}", .{base_name});
+        return false;
+    };
+
+    const weight = source.tensors.items[wi];
+    const weight_scale = source.tensors.items[wsi];
+    const weight_scale_2 = source.tensors.items[ws2i];
+
+    try list.append(arena_alloc, .{
+        .base_name = base_name,
+        .weight = weight,
+        .weight_scale = weight_scale,
+        .weight_scale_2 = weight_scale_2,
+        .comfy_quant = comfy_quant,
+        .rows = weight.dims[0],
+        .cols = weight.dims[1] * 2,
+    });
+    std.log.debug("TensorClusters: grouped nvfp4 cluster {s} [{}, {}]", .{
+        base_name, weight.dims[0], weight.dims[1] * 2,
+    });
+    return true;
+}
+
+/// Build an FP8 (float8_e4m3fn) cluster from a layer `base_name` and append to `list`. The
+/// `.weight` and `.weight_scale` companions are required; `.input_scale` (an activation scale)
+/// is optional and dropped on conversion. A missing required companion is warned and skipped.
+/// `comfy_quant` is the per-tensor marker, or null when sourced from the header. Returns true
+/// if a cluster was appended.
+fn appendFloat8Cluster(
+    source: anytype,
+    name_map: *std.StringHashMap(usize),
+    base_name: []const u8,
+    comfy_quant: ?types.Tensor,
+    list: *std.ArrayList(Float8Cluster),
+    arena_alloc: std.mem.Allocator,
+    allocator: std.mem.Allocator,
+) !bool {
+    const wname = try std.fmt.allocPrint(allocator, "{s}.weight", .{base_name});
+    defer allocator.free(wname);
+    const wsname = try std.fmt.allocPrint(allocator, "{s}.weight_scale", .{base_name});
+    defer allocator.free(wsname);
+    const isname = try std.fmt.allocPrint(allocator, "{s}.input_scale", .{base_name});
+    defer allocator.free(isname);
+
+    const wi = name_map.get(wname) orelse {
+        std.log.warn("TensorClusters: missing .weight for fp8 cluster {s}", .{base_name});
+        return false;
+    };
+    const wsi = name_map.get(wsname) orelse {
+        std.log.warn("TensorClusters: missing .weight_scale for fp8 cluster {s}", .{base_name});
+        return false;
+    };
+
+    const weight = source.tensors.items[wi];
+    const weight_scale = source.tensors.items[wsi];
+    const input_scale: ?types.Tensor = if (name_map.get(isname)) |isi|
+        source.tensors.items[isi]
+    else
+        null;
+
+    try list.append(arena_alloc, .{
+        .base_name = base_name,
+        .weight = weight,
+        .weight_scale = weight_scale,
+        .input_scale = input_scale,
+        .comfy_quant = comfy_quant,
+        .rows = weight.dims[0],
+        .cols = weight.dims[1],
+    });
+    std.log.debug("TensorClusters: grouped fp8 cluster {s} [{}, {}]", .{
+        base_name, weight.dims[0], weight.dims[1],
+    });
+    return true;
+}
+
+/// Build an MXFP4 cluster (E2M1 packed nibbles + E8M0 per-block scale) from a layer `base_name`
+/// and append to `list`. The `.weight` and `.weight_scale` companions are resolved by name; a
+/// missing one is warned and skipped. `comfy_quant` is the per-tensor marker, or null when sourced
+/// from the header. Returns true if a cluster was appended.
+fn appendMxfp4Cluster(
+    source: anytype,
+    name_map: *std.StringHashMap(usize),
+    base_name: []const u8,
+    comfy_quant: ?types.Tensor,
+    list: *std.ArrayList(Mxfp4Cluster),
+    arena_alloc: std.mem.Allocator,
+    allocator: std.mem.Allocator,
+) !bool {
+    const wname = try std.fmt.allocPrint(allocator, "{s}.weight", .{base_name});
+    defer allocator.free(wname);
+    const wsname = try std.fmt.allocPrint(allocator, "{s}.weight_scale", .{base_name});
+    defer allocator.free(wsname);
+
+    const wi = name_map.get(wname) orelse {
+        std.log.warn("TensorClusters: missing .weight for mxfp4 cluster {s}", .{base_name});
+        return false;
+    };
+    const wsi = name_map.get(wsname) orelse {
+        std.log.warn("TensorClusters: missing .weight_scale for mxfp4 cluster {s}", .{base_name});
+        return false;
+    };
+
+    const weight = source.tensors.items[wi];
+    const weight_scale = source.tensors.items[wsi];
+
+    try list.append(arena_alloc, .{
+        .base_name = base_name,
+        .weight = weight,
+        .weight_scale = weight_scale,
+        .comfy_quant = comfy_quant,
+        .rows = weight.dims[0],
+        .cols = weight.dims[1] * 2,
+    });
+    std.log.debug("TensorClusters: grouped mxfp4 cluster {s} [{}, {}]", .{
+        base_name, weight.dims[0], weight.dims[1] * 2,
+    });
+    return true;
+}
+
+/// Build an MXFP8 cluster (E4M3 elements + E8M0 per-block scale) from a layer `base_name` and
+/// append to `list`. The `.weight` and `.weight_scale` companions are resolved by name; a missing
+/// one is warned and skipped. `comfy_quant` is the per-tensor marker, or null when sourced from the
+/// header. Returns true if a cluster was appended.
+fn appendMxfp8Cluster(
+    source: anytype,
+    name_map: *std.StringHashMap(usize),
+    base_name: []const u8,
+    comfy_quant: ?types.Tensor,
+    list: *std.ArrayList(Mxfp8Cluster),
+    arena_alloc: std.mem.Allocator,
+    allocator: std.mem.Allocator,
+) !bool {
+    const wname = try std.fmt.allocPrint(allocator, "{s}.weight", .{base_name});
+    defer allocator.free(wname);
+    const wsname = try std.fmt.allocPrint(allocator, "{s}.weight_scale", .{base_name});
+    defer allocator.free(wsname);
+
+    const wi = name_map.get(wname) orelse {
+        std.log.warn("TensorClusters: missing .weight for mxfp8 cluster {s}", .{base_name});
+        return false;
+    };
+    const wsi = name_map.get(wsname) orelse {
+        std.log.warn("TensorClusters: missing .weight_scale for mxfp8 cluster {s}", .{base_name});
+        return false;
+    };
+
+    const weight = source.tensors.items[wi];
+    const weight_scale = source.tensors.items[wsi];
+
+    try list.append(arena_alloc, .{
+        .base_name = base_name,
+        .weight = weight,
+        .weight_scale = weight_scale,
+        .comfy_quant = comfy_quant,
+        .rows = weight.dims[0],
+        .cols = weight.dims[1],
+    });
+    std.log.debug("TensorClusters: grouped mxfp8 cluster {s} [{}, {}]", .{
+        base_name, weight.dims[0], weight.dims[1],
+    });
+    return true;
+}
+
+/// Resolve a `_quantization_metadata` layer key to the base name of its `.weight` tensor in
+/// the source. comfy-kitchen stores logical layer names that may omit the tensor-name prefix
+/// (e.g. "model.diffusion_model."), so a fully-qualified key hits `name_map` directly (O(1))
+/// and a prefix-less key falls back to a dot-separated suffix scan — the same way layer keys
+/// are matched elsewhere. The suffix scan requires a *unique* match: a key that suffix-matches
+/// more than one `.weight` tensor is ambiguous and resolves to null (warned) rather than being
+/// silently bound to whichever tensor happens to come first. Returns a slice into a source
+/// tensor name (stable for the whole conversion), or null if no unambiguous `<key>.weight` exists.
+fn resolveClusterBase(
+    source: anytype,
+    name_map: *std.StringHashMap(usize),
+    layer_key: []const u8,
+    allocator: std.mem.Allocator,
+) !?[]const u8 {
+    const wsuffix = try std.fmt.allocPrint(allocator, "{s}.weight", .{layer_key});
+    defer allocator.free(wsuffix);
+
+    // Fast path: fully-qualified keys are already exact tensor names. Return the
+    // source-owned slice, not the parsed-JSON key (which does not outlive the conversion).
+    if (name_map.get(wsuffix)) |wi| {
+        const name = source.tensors.items[wi].name;
+        return name[0 .. name.len - ".weight".len];
+    }
+
+    // Slow path (prefix-less keys only): match by dot-separated suffix, requiring uniqueness.
+    var match: ?[]const u8 = null;
+    for (source.tensors.items) |t| {
+        if (nameSuffixMatch(t.name, wsuffix)) {
+            if (match != null) {
+                std.log.warn("TensorClusters: _quantization_metadata layer {s} suffix-matches multiple .weight tensors; skipping (ambiguous)", .{layer_key});
+                return null;
+            }
+            match = t.name[0 .. t.name.len - ".weight".len];
+        }
+    }
+    return match;
+}
+
+/// Group clusters from a file-level `_quantization_metadata` JSON header — the marker-less layout
+/// ComfyUI ingests via `convert_old_quants` (comfy/utils.py). The header maps each layer base name
+/// to its quant identity `{format, ...}`; ComfyUI expands each entry verbatim into a per-tensor
+/// `.comfy_quant` blob, so we route every entry through the *same* per-scheme dispatch and helpers
+/// used for markers, with a null `comfy_quant` (there is no marker tensor to drop). Bases already
+/// grouped via markers are skipped. Unknown/unsupported schemes are warned and left ungrouped.
+fn groupFromQuantMetadata(
+    source: anytype,
+    name_map: *std.StringHashMap(usize),
+    qm_json: []const u8,
+    fp4_list: *std.ArrayList(Fp4Cluster),
+    float8_list: *std.ArrayList(Float8Cluster),
+    mxfp4_list: *std.ArrayList(Mxfp4Cluster),
+    mxfp8_list: *std.ArrayList(Mxfp8Cluster),
+    int8_convrot_list: *std.ArrayList(Int8ConvrotCluster),
+    seen: *std.StringHashMap(void),
+    arena_alloc: std.mem.Allocator,
+    allocator: std.mem.Allocator,
+) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, qm_json, .{}) catch |err| {
+        std.log.warn("TensorClusters: failed to parse _quantization_metadata: {}", .{err});
+        return;
+    };
+    defer parsed.deinit();
+
+    const root = switch (parsed.value) {
+        .object => |o| o,
+        else => return,
+    };
+    const layers = switch (root.get("layers") orelse return) {
+        .object => |o| o,
+        else => return,
+    };
+
+    var it = layers.iterator();
+    while (it.next()) |entry| {
+        const layer_key = entry.key_ptr.*;
+        if (entry.value_ptr.* != .object) continue;
+
+        // Re-serialize the per-layer identity to JSON so we can route it through the
+        // same byte-level scheme/field parsers used for `.comfy_quant` marker blobs — this is
+        // exactly the payload ComfyUI writes into the expanded `.comfy_quant` tensor.
+        const layer_json = try std.json.Stringify.valueAlloc(allocator, entry.value_ptr.*, .{});
+        defer allocator.free(layer_json);
+
+        const scheme = parseComfyQuantScheme(layer_json);
+        if (scheme == .unknown) {
+            std.log.warn("TensorClusters: _quantization_metadata layer {s} has an unsupported scheme; skipping", .{layer_key});
+            continue;
+        }
+
+        // Resolve the (possibly prefix-less) layer key against the real tensor namespace;
+        // `base_name` is a source-owned slice that outlives the conversion.
+        const base_name = (try resolveClusterBase(source, name_map, layer_key, allocator)) orelse {
+            std.log.warn("TensorClusters: _quantization_metadata layer {s} has no matching .weight tensor; skipping", .{layer_key});
+            continue;
+        };
+        // Skip bases already grouped via a per-tensor marker (compared on the resolved full
+        // name, since `seen` is keyed by full tensor base names). Header-sourced clusters carry
+        // a null `comfy_quant` — there is no per-tensor marker tensor in this layout.
+        if (seen.contains(base_name)) continue;
+
+        _ = switch (scheme) {
+            .nvfp4 => try appendNvfp4Cluster(source, name_map, base_name, null, fp4_list, arena_alloc, allocator),
+            .float8_e4m3fn => try appendFloat8Cluster(source, name_map, base_name, null, float8_list, arena_alloc, allocator),
+            .mxfp4 => try appendMxfp4Cluster(source, name_map, base_name, null, mxfp4_list, arena_alloc, allocator),
+            .mxfp8_e4m3fn => try appendMxfp8Cluster(source, name_map, base_name, null, mxfp8_list, arena_alloc, allocator),
+            .int8_convrot => blk: {
+                const convrot = comfyQuantBool(layer_json, "convrot", false);
+                const group_size = comfyQuantInt(layer_json, "convrot_groupsize", 256);
+                break :blk try appendInt8ConvrotCluster(source, name_map, base_name, convrot, group_size, null, int8_convrot_list, arena_alloc, allocator);
+            },
+            .unknown => unreachable, // handled above
+        };
+    }
+}
+
+/// Scan source tensors and group them into NVFP4/FP8/MXFP4/MXFP8/INT8-ConvRot clusters. Two
+/// encodings are supported and treated equivalently (as ComfyUI's convert_old_quants does): per-
+/// tensor `.comfy_quant` marker blobs, and a single file-level `_quantization_metadata` header that
+/// maps each layer to the same identity. Result slices are arena-allocated; `allocator` is used for
+/// temporary work only.
 pub fn groupClusters(
     source: anytype,
     arena_alloc: std.mem.Allocator,
@@ -159,6 +545,11 @@ pub fn groupClusters(
     var mxfp8_list: std.ArrayList(Mxfp8Cluster) = .empty;
     var int8_convrot_list: std.ArrayList(Int8ConvrotCluster) = .empty;
 
+    // Track bases grouped via per-tensor markers so the file-level `_quantization_metadata`
+    // fallback below does not double-group them. Keyed by full tensor base name, across all schemes.
+    var seen_bases = std.StringHashMap(void).init(allocator);
+    defer seen_bases.deinit();
+
     const comfy_suffix = ".comfy_quant";
 
     for (source.tensors.items) |t| {
@@ -172,194 +563,32 @@ pub fn groupClusters(
         const scheme = parseComfyQuantScheme(data);
         const base_name = t.name[0 .. t.name.len - comfy_suffix.len];
 
-        switch (scheme) {
-            .nvfp4 => {
-                const wname = try std.fmt.allocPrint(allocator, "{s}.weight", .{base_name});
-                defer allocator.free(wname);
-                const wsname = try std.fmt.allocPrint(allocator, "{s}.weight_scale", .{base_name});
-                defer allocator.free(wsname);
-                const ws2name = try std.fmt.allocPrint(allocator, "{s}.weight_scale_2", .{base_name});
-                defer allocator.free(ws2name);
-
-                const wi = name_map.get(wname) orelse {
-                    std.log.warn("TensorClusters: missing .weight for cluster {s}", .{base_name});
-                    continue;
-                };
-                const wsi = name_map.get(wsname) orelse {
-                    std.log.warn("TensorClusters: missing .weight_scale for cluster {s}", .{base_name});
-                    continue;
-                };
-                const ws2i = name_map.get(ws2name) orelse {
-                    std.log.warn("TensorClusters: missing .weight_scale_2 for cluster {s}", .{base_name});
-                    continue;
-                };
-
-                const weight = source.tensors.items[wi];
-                const weight_scale = source.tensors.items[wsi];
-                const weight_scale_2 = source.tensors.items[ws2i];
-
-                try fp4_list.append(arena_alloc, .{
-                    .base_name = base_name,
-                    .weight = weight,
-                    .weight_scale = weight_scale,
-                    .weight_scale_2 = weight_scale_2,
-                    .comfy_quant = t,
-                    .rows = weight.dims[0],
-                    .cols = weight.dims[1] * 2,
-                });
-                std.log.debug("TensorClusters: grouped nvfp4 cluster {s} [{}, {}]", .{
-                    base_name, weight.dims[0], weight.dims[1] * 2,
-                });
-            },
-            .float8_e4m3fn => {
-                const wname = try std.fmt.allocPrint(allocator, "{s}.weight", .{base_name});
-                defer allocator.free(wname);
-                const wsname = try std.fmt.allocPrint(allocator, "{s}.weight_scale", .{base_name});
-                defer allocator.free(wsname);
-                const isname = try std.fmt.allocPrint(allocator, "{s}.input_scale", .{base_name});
-                defer allocator.free(isname);
-
-                const wi = name_map.get(wname) orelse {
-                    std.log.warn("TensorClusters: missing .weight for fp8 cluster {s}", .{base_name});
-                    continue;
-                };
-                const wsi = name_map.get(wsname) orelse {
-                    std.log.warn("TensorClusters: missing .weight_scale for fp8 cluster {s}", .{base_name});
-                    continue;
-                };
-
-                const weight = source.tensors.items[wi];
-                const weight_scale = source.tensors.items[wsi];
-                const input_scale: ?types.Tensor = if (name_map.get(isname)) |isi|
-                    source.tensors.items[isi]
-                else
-                    null;
-
-                try float8_list.append(arena_alloc, .{
-                    .base_name = base_name,
-                    .weight = weight,
-                    .weight_scale = weight_scale,
-                    .input_scale = input_scale,
-                    .comfy_quant = t,
-                    .rows = weight.dims[0],
-                    .cols = weight.dims[1],
-                });
-                std.log.debug("TensorClusters: grouped fp8 cluster {s} [{}, {}]", .{
-                    base_name, weight.dims[0], weight.dims[1],
-                });
-            },
-            .mxfp4 => {
-                const wname = try std.fmt.allocPrint(allocator, "{s}.weight", .{base_name});
-                defer allocator.free(wname);
-                const wsname = try std.fmt.allocPrint(allocator, "{s}.weight_scale", .{base_name});
-                defer allocator.free(wsname);
-
-                const wi = name_map.get(wname) orelse {
-                    std.log.warn("TensorClusters: missing .weight for mxfp4 cluster {s}", .{base_name});
-                    continue;
-                };
-                const wsi = name_map.get(wsname) orelse {
-                    std.log.warn("TensorClusters: missing .weight_scale for mxfp4 cluster {s}", .{base_name});
-                    continue;
-                };
-
-                const weight = source.tensors.items[wi];
-                const weight_scale = source.tensors.items[wsi];
-
-                try mxfp4_list.append(arena_alloc, .{
-                    .base_name = base_name,
-                    .weight = weight,
-                    .weight_scale = weight_scale,
-                    .comfy_quant = t,
-                    .rows = weight.dims[0],
-                    .cols = weight.dims[1] * 2,
-                });
-                std.log.debug("TensorClusters: grouped mxfp4 cluster {s} [{}, {}]", .{
-                    base_name, weight.dims[0], weight.dims[1] * 2,
-                });
-            },
-            .mxfp8_e4m3fn => {
-                const wname = try std.fmt.allocPrint(allocator, "{s}.weight", .{base_name});
-                defer allocator.free(wname);
-                const wsname = try std.fmt.allocPrint(allocator, "{s}.weight_scale", .{base_name});
-                defer allocator.free(wsname);
-
-                const wi = name_map.get(wname) orelse {
-                    std.log.warn("TensorClusters: missing .weight for mxfp8 cluster {s}", .{base_name});
-                    continue;
-                };
-                const wsi = name_map.get(wsname) orelse {
-                    std.log.warn("TensorClusters: missing .weight_scale for mxfp8 cluster {s}", .{base_name});
-                    continue;
-                };
-
-                const weight = source.tensors.items[wi];
-                const weight_scale = source.tensors.items[wsi];
-
-                try mxfp8_list.append(arena_alloc, .{
-                    .base_name = base_name,
-                    .weight = weight,
-                    .weight_scale = weight_scale,
-                    .comfy_quant = t,
-                    .rows = weight.dims[0],
-                    .cols = weight.dims[1],
-                });
-                std.log.debug("TensorClusters: grouped mxfp8 cluster {s} [{}, {}]", .{
-                    base_name, weight.dims[0], weight.dims[1],
-                });
-            },
-            .int8_convrot => {
-                const wname = try std.fmt.allocPrint(allocator, "{s}.weight", .{base_name});
-                defer allocator.free(wname);
-                const wsname = try std.fmt.allocPrint(allocator, "{s}.weight_scale", .{base_name});
-                defer allocator.free(wsname);
-
-                const wi = name_map.get(wname) orelse {
-                    std.log.warn("TensorClusters: missing .weight for int8_convrot cluster {s}", .{base_name});
-                    continue;
-                };
-                const wsi = name_map.get(wsname) orelse {
-                    std.log.warn("TensorClusters: missing .weight_scale for int8_convrot cluster {s}", .{base_name});
-                    continue;
-                };
-
-                const weight = source.tensors.items[wi];
-                const weight_scale = source.tensors.items[wsi];
-
-                if (weight.dims.len != 2) {
-                    std.log.warn("TensorClusters: int8_convrot cluster {s} weight is not 2-D; skipping", .{base_name});
-                    continue;
-                }
-                const rows = weight.dims[0];
-                const cols = weight.dims[1];
-                // Per-row scaling only: expect one F32 scale per output row.
-                if (weight_scale.size != rows * 4) {
-                    std.log.warn("TensorClusters: int8_convrot cluster {s} has non-per-row scale ({} bytes, expected {}); skipping", .{ base_name, weight_scale.size, rows * 4 });
-                    continue;
-                }
-
+        // Only mark the base "seen" when it was actually grouped, so a marker that fails its
+        // structural checks does not suppress the `_quantization_metadata` fallback that might
+        // still be able to group the same layer.
+        const grouped = switch (scheme) {
+            .nvfp4 => try appendNvfp4Cluster(source, &name_map, base_name, t, &fp4_list, arena_alloc, allocator),
+            .float8_e4m3fn => try appendFloat8Cluster(source, &name_map, base_name, t, &float8_list, arena_alloc, allocator),
+            .mxfp4 => try appendMxfp4Cluster(source, &name_map, base_name, t, &mxfp4_list, arena_alloc, allocator),
+            .mxfp8_e4m3fn => try appendMxfp8Cluster(source, &name_map, base_name, t, &mxfp8_list, arena_alloc, allocator),
+            .int8_convrot => blk: {
                 const convrot = comfyQuantBool(data, "convrot", false);
                 const group_size = comfyQuantInt(data, "convrot_groupsize", 256);
-                if (convrot and (!DataTransform.Quantizer.isValidHadamardSize(group_size) or cols % group_size != 0)) {
-                    std.log.warn("TensorClusters: int8_convrot cluster {s} has incompatible group_size {} for cols {}; skipping", .{ base_name, group_size, cols });
-                    continue;
-                }
-
-                try int8_convrot_list.append(arena_alloc, .{
-                    .base_name = base_name,
-                    .weight = weight,
-                    .weight_scale = weight_scale,
-                    .comfy_quant = t,
-                    .rows = rows,
-                    .cols = cols,
-                    .convrot = convrot,
-                    .group_size = group_size,
-                });
-                std.log.debug("TensorClusters: grouped int8_convrot cluster {s} [{}, {}] convrot={} gs={}", .{
-                    base_name, rows, cols, convrot, group_size,
-                });
+                break :blk try appendInt8ConvrotCluster(source, &name_map, base_name, convrot, group_size, t, &int8_convrot_list, arena_alloc, allocator);
             },
-            .unknown => {},
+            .unknown => false,
+        };
+        if (grouped) try seen_bases.put(base_name, {});
+    }
+
+    // Fallback for the marker-less layout ComfyUI ingests via convert_old_quants: a single
+    // file-level `_quantization_metadata` header maps each layer base name to its quant identity.
+    // Group every supported scheme from it (skipping bases already handled by a marker above).
+    if (source.getSourceMetadata()) |meta| {
+        if (meta.get("_quantization_metadata")) |qm_val| {
+            if (qm_val == .string) {
+                try groupFromQuantMetadata(source, &name_map, qm_val.string, &fp4_list, &float8_list, &mxfp4_list, &mxfp8_list, &int8_convrot_list, &seen_bases, arena_alloc, allocator);
+            }
         }
     }
 
@@ -751,6 +980,26 @@ pub fn tryDequantCluster(
     return null;
 }
 
+/// Single dequant entry point for the safetensors writer: reconstruct output tensor `t`'s source
+/// data as F32 whether the source is a cluster (int8_convrot/nvfp4/fp8/mx*, via the per-cluster
+/// dequantizers in `tryDequantCluster`) or a plain tensor (via a generic name-matched dequant).
+/// Returns null if no source matches. Caller owns the returned slice.
+pub fn dequantSourceToF32(
+    t: types.Tensor,
+    source: anytype,
+    groups: *const GroupResult,
+    allocator: std.mem.Allocator,
+    pool: *thread_pool_mod.ThreadPool,
+) !?[]f32 {
+    if (try tryDequantCluster(t, source, groups, allocator, pool)) |cluster_f32| return cluster_f32;
+
+    var n_elements: u64 = 1;
+    for (t.dims) |d| n_elements *= d;
+    if (try loadMatchingSourceAsF32(source, allocator, t.name, n_elements, pool)) |plain|
+        return plain.data;
+    return null;
+}
+
 /// Replace cluster physical tensors in `model_tensors` with single logical BF16 tensors.
 /// Companion tensors (weight_scale, weight_scale_2, comfy_quant) are removed from the list.
 pub fn collapseModelTensors(
@@ -779,7 +1028,7 @@ pub fn collapseModelTensors(
             }
             if (nameSuffixMatch(cluster.weight_scale.name, t.name) or
                 nameSuffixMatch(cluster.weight_scale_2.name, t.name) or
-                nameSuffixMatch(cluster.comfy_quant.name, t.name))
+                (if (cluster.comfy_quant) |cq| nameSuffixMatch(cq.name, t.name) else false))
             {
                 handled = true; // drop companion tensor
                 break;
@@ -803,7 +1052,7 @@ pub fn collapseModelTensors(
                 else
                     false;
                 if (nameSuffixMatch(cluster.weight_scale.name, t.name) or
-                    nameSuffixMatch(cluster.comfy_quant.name, t.name) or
+                    (if (cluster.comfy_quant) |cq| nameSuffixMatch(cq.name, t.name) else false) or
                     input_scale_match)
                 {
                     handled = true;
@@ -824,7 +1073,7 @@ pub fn collapseModelTensors(
                     break;
                 }
                 if (nameSuffixMatch(cluster.weight_scale.name, t.name) or
-                    nameSuffixMatch(cluster.comfy_quant.name, t.name))
+                    (if (cluster.comfy_quant) |cq| nameSuffixMatch(cq.name, t.name) else false))
                 {
                     handled = true;
                     break;
@@ -845,7 +1094,7 @@ pub fn collapseModelTensors(
                     break;
                 }
                 if (nameSuffixMatch(cluster.weight_scale.name, t.name) or
-                    nameSuffixMatch(cluster.comfy_quant.name, t.name))
+                    (if (cluster.comfy_quant) |cq| nameSuffixMatch(cq.name, t.name) else false))
                 {
                     handled = true;
                     break;
@@ -865,7 +1114,7 @@ pub fn collapseModelTensors(
                     break;
                 }
                 if (nameSuffixMatch(cluster.weight_scale.name, t.name) or
-                    nameSuffixMatch(cluster.comfy_quant.name, t.name))
+                    (if (cluster.comfy_quant) |cq| nameSuffixMatch(cq.name, t.name) else false))
                 {
                     handled = true;
                     break;
@@ -1158,6 +1407,207 @@ test "parseComfyQuantScheme: int8 convrot and its boolean/int fields" {
     try testing.expectEqual(false, comfyQuantBool(blob, "missing", false));
     try testing.expectEqual(@as(usize, 256), comfyQuantInt(blob, "convrot_groupsize", 999));
     try testing.expectEqual(@as(usize, 64), comfyQuantInt("{\"format\":\"int8_tensorwise\"}", "convrot_groupsize", 64));
+}
+
+test "_quantization_metadata: comfy-kitchen layer identity round-trips through the shared parsers" {
+    // comfy-kitchen (PR #37) ships no per-tensor `.comfy_quant` markers; it stores a single
+    // file-level `_quantization_metadata` header mapping each layer to its identity, using
+    // `per_channel` where the marker layout used `per_row`. groupFromQuantMetadata re-serializes
+    // each layer Value and routes it through parseComfyQuantScheme/comfyQuantBool/comfyQuantInt;
+    // this exercises that round-trip on the exact field layout produced by the converter.
+    const allocator = std.testing.allocator;
+    const header =
+        \\{"format_version": "1.0", "layers": {
+        \\  "blocks.0.attn.gate": {"format": "int8_tensorwise", "per_channel": true, "convrot": true, "convrot_groupsize": 256},
+        \\  "blocks.0.norm": {"format": "bf16"}
+        \\}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, header, .{});
+    defer parsed.deinit();
+    const layers = parsed.value.object.get("layers").?.object;
+
+    const gate = layers.get("blocks.0.attn.gate").?;
+    const gate_json = try std.json.Stringify.valueAlloc(allocator, gate, .{});
+    defer allocator.free(gate_json);
+    try testing.expectEqual(.int8_convrot, parseComfyQuantScheme(gate_json));
+    try testing.expectEqual(true, comfyQuantBool(gate_json, "convrot", false));
+    try testing.expectEqual(@as(usize, 256), comfyQuantInt(gate_json, "convrot_groupsize", 999));
+
+    // A non-int8 layer resolves to .unknown and is skipped (warned) rather than misgrouped.
+    const norm = layers.get("blocks.0.norm").?;
+    const norm_json = try std.json.Stringify.valueAlloc(allocator, norm, .{});
+    defer allocator.free(norm_json);
+    try testing.expectEqual(.unknown, parseComfyQuantScheme(norm_json));
+}
+
+test "resolveClusterBase: prefix-less metadata key resolves against prefixed tensor names" {
+    // comfy-kitchen `_quantization_metadata` keys are logical layer names that may omit the
+    // "model.diffusion_model." prefix the actual tensors carry. resolveClusterBase must
+    // match fully-qualified keys directly via `name_map` and prefix-less keys by dot-separated
+    // suffix, returning the full source-tensor base name.
+    const T = types.Tensor;
+    var dims = [_]usize{}; // unused by resolveClusterBase; a mutable []usize placeholder
+    var tensors = [_]T{
+        .{ .name = "model.diffusion_model.blocks.0.attn.gate.weight", .type = "I8", .dims = &dims, .size = 0, .offset = 0 },
+        .{ .name = "model.diffusion_model.blocks.0.attn.gate.weight_scale", .type = "F32", .dims = &dims, .size = 0, .offset = 0 },
+        .{ .name = "model.diffusion_model.blocks.0.norm.weight", .type = "F32", .dims = &dims, .size = 0, .offset = 0 },
+    };
+    const src = .{ .tensors = .{ .items = @as([]T, &tensors) } };
+    const alloc = std.testing.allocator;
+
+    var name_map = std.StringHashMap(usize).init(alloc);
+    defer name_map.deinit();
+    for (tensors, 0..) |t, i| try name_map.put(t.name, i);
+
+    // Bare key → full prefixed base name (suffix scan).
+    try testing.expectEqualStrings(
+        "model.diffusion_model.blocks.0.attn.gate",
+        (try resolveClusterBase(src, &name_map, "blocks.0.attn.gate", alloc)).?,
+    );
+    // Fully-qualified key resolves via the name_map fast path.
+    try testing.expectEqualStrings(
+        "model.diffusion_model.blocks.0.attn.gate",
+        (try resolveClusterBase(src, &name_map, "model.diffusion_model.blocks.0.attn.gate", alloc)).?,
+    );
+    // No `<key>.weight` tensor → null (the fallback then skips with a warning).
+    try testing.expectEqual(@as(?[]const u8, null), try resolveClusterBase(src, &name_map, "blocks.0.attn.missing", alloc));
+    // Suffix that does not fall on a dot boundary must not match ("ate.weight" ⊄ ".gate.weight").
+    try testing.expectEqual(@as(?[]const u8, null), try resolveClusterBase(src, &name_map, "ate", alloc));
+}
+
+test "resolveClusterBase: ambiguous prefix-less key matching multiple tensors resolves to null" {
+    // A prefix-less key that suffix-matches more than one `.weight` tensor is ambiguous; rather
+    // than silently binding to whichever comes first, resolveClusterBase returns null so the
+    // caller skips the layer (warned). A fully-qualified key still resolves unambiguously.
+    const T = types.Tensor;
+    var dims = [_]usize{};
+    var tensors = [_]T{
+        .{ .name = "a.blocks.0.attn.gate.weight", .type = "I8", .dims = &dims, .size = 0, .offset = 0 },
+        .{ .name = "b.blocks.0.attn.gate.weight", .type = "I8", .dims = &dims, .size = 0, .offset = 0 },
+    };
+    const src = .{ .tensors = .{ .items = @as([]T, &tensors) } };
+    const alloc = std.testing.allocator;
+
+    var name_map = std.StringHashMap(usize).init(alloc);
+    defer name_map.deinit();
+    for (tensors, 0..) |t, i| try name_map.put(t.name, i);
+
+    // Prefix-less "blocks.0.attn.gate" suffix-matches both a.* and b.* → ambiguous → null.
+    try testing.expectEqual(@as(?[]const u8, null), try resolveClusterBase(src, &name_map, "blocks.0.attn.gate", alloc));
+    // The fully-qualified key is unambiguous and resolves via the fast path.
+    try testing.expectEqualStrings(
+        "a.blocks.0.attn.gate",
+        (try resolveClusterBase(src, &name_map, "a.blocks.0.attn.gate", alloc)).?,
+    );
+}
+
+test "groupFromQuantMetadata: routes every supported header scheme to its cluster list" {
+    // Mirrors ComfyUI convert_old_quants: a marker-less `_quantization_metadata` header maps each
+    // layer to {format, ...}, and each supported scheme must land in its own cluster list with a
+    // null comfy_quant (no per-tensor marker in this layout). Grouping reads only tensor metadata
+    // (names/dims/size), so a lightweight mock source suffices — no file IO.
+    const T = types.Tensor;
+    const alloc = std.testing.allocator;
+
+    var d_full = [_]usize{ 4, 8 };  // fp8 / mxfp8 / int8 store [rows, cols]
+    var d_half = [_]usize{ 4, 4 };  // nvfp4 stores [rows, cols/2] -> logical cols = 8
+    var d_scale = [_]usize{ 4, 1 };
+
+    var tensors = [_]T{
+        .{ .name = "fp8.weight", .type = "F8_E4M3", .dims = &d_full, .size = 32, .offset = 0 },
+        .{ .name = "fp8.weight_scale", .type = "F32", .dims = &d_scale, .size = 4, .offset = 0 },
+        .{ .name = "nv.weight", .type = "U8", .dims = &d_half, .size = 16, .offset = 0 },
+        .{ .name = "nv.weight_scale", .type = "F8_E4M3", .dims = &d_scale, .size = 4, .offset = 0 },
+        .{ .name = "nv.weight_scale_2", .type = "F32", .dims = &d_scale, .size = 4, .offset = 0 },
+        .{ .name = "mx.weight", .type = "F8_E4M3", .dims = &d_full, .size = 32, .offset = 0 },
+        .{ .name = "mx.weight_scale", .type = "U8", .dims = &d_scale, .size = 4, .offset = 0 },
+        .{ .name = "i8.weight", .type = "I8", .dims = &d_full, .size = 32, .offset = 0 },
+        .{ .name = "i8.weight_scale", .type = "F32", .dims = &d_scale, .size = 16, .offset = 0 },
+    };
+    const src = .{ .tensors = .{ .items = @as([]T, &tensors) } };
+
+    var name_map = std.StringHashMap(usize).init(alloc);
+    defer name_map.deinit();
+    for (tensors, 0..) |t, i| try name_map.put(t.name, i);
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var fp4_list: std.ArrayList(Fp4Cluster) = .empty;
+    var float8_list: std.ArrayList(Float8Cluster) = .empty;
+    var mxfp4_list: std.ArrayList(Mxfp4Cluster) = .empty;
+    var mxfp8_list: std.ArrayList(Mxfp8Cluster) = .empty;
+    var int8_list: std.ArrayList(Int8ConvrotCluster) = .empty;
+
+    var seen = std.StringHashMap(void).init(alloc);
+    defer seen.deinit();
+
+    // The "norm" bf16 layer resolves to .unknown and is skipped (warned), not misgrouped.
+    const header =
+        \\{"layers": {
+        \\  "fp8": {"format": "float8_e4m3fn"},
+        \\  "nv":  {"format": "nvfp4"},
+        \\  "mx":  {"format": "mxfp8"},
+        \\  "i8":  {"format": "int8_tensorwise", "convrot": true, "convrot_groupsize": 4},
+        \\  "norm": {"format": "bf16"}
+        \\}}
+    ;
+
+    try groupFromQuantMetadata(src, &name_map, header, &fp4_list, &float8_list, &mxfp4_list, &mxfp8_list, &int8_list, &seen, aa, alloc);
+
+    try testing.expectEqual(@as(usize, 1), fp4_list.items.len);
+    try testing.expectEqual(@as(usize, 1), float8_list.items.len);
+    try testing.expectEqual(@as(usize, 1), mxfp8_list.items.len);
+    try testing.expectEqual(@as(usize, 1), int8_list.items.len);
+    try testing.expectEqual(@as(usize, 0), mxfp4_list.items.len); // no mxfp4 layer in the header
+
+    // Header-sourced clusters carry a null comfy_quant, and dims decode correctly.
+    try testing.expectEqual(@as(?types.Tensor, null), fp4_list.items[0].comfy_quant);
+    try testing.expectEqual(@as(usize, 8), fp4_list.items[0].cols); // nvfp4: dims[1]*2
+    try testing.expectEqual(@as(?types.Tensor, null), float8_list.items[0].comfy_quant);
+    try testing.expectEqual(@as(usize, 8), float8_list.items[0].cols);
+    try testing.expectEqual(@as(?types.Tensor, null), int8_list.items[0].comfy_quant);
+    try testing.expect(int8_list.items[0].convrot);
+    try testing.expectEqual(@as(usize, 4), int8_list.items[0].group_size);
+}
+
+test "groupFromQuantMetadata: skips bases already grouped via a per-tensor marker" {
+    // If both a marker and a header describe the same layer, `seen` (populated by the marker pass)
+    // suppresses the header entry so the cluster is not created twice.
+    const T = types.Tensor;
+    const alloc = std.testing.allocator;
+
+    var d_full = [_]usize{ 4, 8 };
+    var d_scale = [_]usize{ 4, 1 };
+    var tensors = [_]T{
+        .{ .name = "fp8.weight", .type = "F8_E4M3", .dims = &d_full, .size = 32, .offset = 0 },
+        .{ .name = "fp8.weight_scale", .type = "F32", .dims = &d_scale, .size = 4, .offset = 0 },
+    };
+    const src = .{ .tensors = .{ .items = @as([]T, &tensors) } };
+
+    var name_map = std.StringHashMap(usize).init(alloc);
+    defer name_map.deinit();
+    for (tensors, 0..) |t, i| try name_map.put(t.name, i);
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var fp4_list: std.ArrayList(Fp4Cluster) = .empty;
+    var float8_list: std.ArrayList(Float8Cluster) = .empty;
+    var mxfp4_list: std.ArrayList(Mxfp4Cluster) = .empty;
+    var mxfp8_list: std.ArrayList(Mxfp8Cluster) = .empty;
+    var int8_list: std.ArrayList(Int8ConvrotCluster) = .empty;
+
+    var seen = std.StringHashMap(void).init(alloc);
+    defer seen.deinit();
+    try seen.put("fp8", {}); // pretend the marker pass already grouped this base
+
+    const header = "{\"layers\": {\"fp8\": {\"format\": \"float8_e4m3fn\"}}}";
+    try groupFromQuantMetadata(src, &name_map, header, &fp4_list, &float8_list, &mxfp4_list, &mxfp8_list, &int8_list, &seen, aa, alloc);
+
+    try testing.expectEqual(@as(usize, 0), float8_list.items.len); // suppressed by `seen`
 }
 
 test "ConvRot INT8 cluster: quantize → dequantize round-trip (convrot on)" {
