@@ -43,12 +43,12 @@ const gguf_type_names = blk: {
 
 // Safetensors output types that we can convert
 const st_target_types = [_]ggufy.types.DataType{
-    .F32, .F16, .BF16, .F8_E4M3, .SCALED_F8_E4M3, .F8_E5M2, .MXFP8_E4M3, .NVFP4, .INT8, .INT8_CONVROT, .INT4, .INT4_CONVROT,
+    .F32, .F16, .BF16, .F8_E4M3, .SCALED_F8_E4M3, .F8_E5M2, .MXFP8_E4M3, .NVFP4, .INT8, .INT8_CONVROT, .INT4_CONVROT, .INT4_CONVROT_SR,
 };
 
 // User-facing display names — must stay in sync with st_target_types.
 const st_type_names = [_][]const u8{
-    "F32", "F16", "BF16", "F8_E4M3", "Scaled F8_E4M3", "F8_E5M2", "MXFP8_E4M3", "NVFP4", "INT8", "INT8 ConvRot", "INT4 (no ComfyUI support)", "INT4 ConvRot (no ComfyUI support)",
+    "F32", "F16", "BF16", "F8_E4M3", "Scaled F8_E4M3", "F8_E5M2", "MXFP8_E4M3", "NVFP4", "INT8", "INT8 ConvRot", "INT4 ConvRot", "INT4 ConvRot SR",
 };
 
 comptime {
@@ -756,6 +756,45 @@ fn showInputFile() void {
             _ = dvui.checkbox(@src(), &state.allow_unknown_arch, "Convert anyway", .{});
         }
 
+        // Estimated output size — recompute only when a size-affecting option changes.
+        {
+            const sig = state.predictionSignature();
+            if (state.prev_pred_signature == null or state.prev_pred_signature.? != sig) {
+                state.prev_pred_signature = sig;
+                state.predicted_size = fileHandling.predictSize(gpa, &state);
+            }
+
+            if (state.target_dtype != null) {
+                if (state.predicted_size) |psz| {
+                    // Show the exact byte count alongside the human-readable size: `formatBytes`
+                    // uses binary units (÷1024) but labels them "GB", whereas most file browsers
+                    // report decimal "GB" (÷1000), so the pretty number alone looks like a
+                    // mismatch (e.g. 7.50 GB here vs 8.1 GB in a decimal file browser).
+                    var out_buf: [16]u8 = undefined;
+                    const out_str = formatBytes(psz, &out_buf);
+                    var out_commas: [32]u8 = undefined;
+                    const out_bytes_str = formatWithCommas(psz, &out_commas);
+                    if (file.sizeInBytes > 0) {
+                        const pct = @as(f64, @floatFromInt(psz)) / @as(f64, @floatFromInt(file.sizeInBytes)) * 100.0;
+                        dvui.label(@src(), "Estimated output: {s} ({s} bytes)  \u{2022}  {d:.0}% of input", .{ out_str, out_bytes_str, pct }, .{
+                            .margin = .{ .x = 0, .y = 8, .w = 0, .h = 2 },
+                            .font = .theme(.body),
+                        });
+                    } else {
+                        dvui.label(@src(), "Estimated output: {s} ({s} bytes)", .{ out_str, out_bytes_str }, .{
+                            .margin = .{ .x = 0, .y = 8, .w = 0, .h = 2 },
+                            .font = .theme(.body),
+                        });
+                    }
+                } else {
+                    dvui.label(@src(), "Estimated output: unavailable", .{}, .{
+                        .margin = .{ .x = 0, .y = 8, .w = 0, .h = 2 },
+                        .color_text = dim_color,
+                    });
+                }
+            }
+        }
+
         // Action buttons
         if (state.same_file_error) {
             dvui.label(@src(), "Output path cannot be the same as the input file.", .{}, .{
@@ -853,22 +892,7 @@ fn showInputFile() void {
 /// Compute the output path and either trigger the conversion or show the
 /// overwrite-confirmation dialog.
 fn launchConversion(fa: std.mem.Allocator) void {
-    const folder = state.targetFolder();
-    const filename = state.targetFilename();
-
-    const opts = conv.ConvertOptions{
-        .io = state.io,
-        .path = state.file_selected.?,
-        .filetype = state.target_filetype,
-        .datatype = state.target_dtype,
-        .template_path = null,
-        .output_dir = if (folder.len > 0) folder else null,
-        .output_name = if (filename.len > 0) filename else null,
-        .threads = 1,
-        .skip_sensitivity = false,
-        .quantization_aggressiveness = 50,
-        .model_only = state.model_only,
-    };
+    const opts = fileHandling.buildConvertOptions(&state);
 
     const out_path = conv.computeOutputPath(opts, fa) catch {
         // Couldn't compute path - just fire and let the thread report the error.

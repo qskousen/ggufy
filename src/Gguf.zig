@@ -562,6 +562,48 @@ pub fn calculateTensorSize(t: types.Tensor) !u64 {
     return ggml_type.calcSizeInBytes(n_elements);
 }
 
+/// Compute the exact on-disk byte size a GGUF file with these `tensors` and `metadata`
+/// would occupy, without writing anything. The header/metadata/tensor-info region is
+/// measured by running the very same `*Tracked` serializers `saveWithSTData` uses
+/// against a discard sink (each returns its own byte count, so there is no risk of the
+/// prediction drifting from the writer), and the tensor-data region is summed from the
+/// deterministic per-type sizes with the same per-tensor alignment padding.
+pub fn calculateFileSize(tensors: []const types.Tensor, metadata: *std.json.ObjectMap, alignment: u32) !u64 {
+    var discard_buf: [64 * 1024]u8 = undefined;
+    var writer = nw.nullWriter(&discard_buf);
+    const w = &writer.interface;
+
+    var total: u64 = 0;
+    total += try writeHeaderTracked(w, tensors.len, metadata.count());
+
+    var meta_it = metadata.iterator();
+    while (meta_it.next()) |meta| {
+        total += try writeMetadataKVJsonTracked(w, meta.key_ptr.*, meta.value_ptr.*);
+    }
+
+    var offset: u64 = 0;
+    for (tensors) |t| {
+        const d_type = try GgmlType.fromString(t.type);
+        total += try writeTensorInfoTracked(w, t.name, t.dims, d_type, offset);
+        var next_offset = offset + t.size;
+        const remainder = next_offset % alignment;
+        if (remainder != 0) next_offset += (alignment - remainder);
+        offset = next_offset;
+    }
+
+    // Pad the header/metadata/tensor-info section up to the alignment boundary that
+    // begins the tensor-data region (mirrors maybeWritePadding in saveWithSTData).
+    total += (alignment - (total % alignment)) % alignment;
+
+    // Tensor-data region: each tensor's data is written, then padded to alignment.
+    for (tensors) |t| {
+        const size = try calculateTensorSize(t);
+        total += size + (alignment - (size % alignment)) % alignment;
+    }
+
+    return total;
+}
+
 pub fn writeHeaderTracked(writer: *std.Io.Writer, tensor_count: u64, metadata_count: u64) !u64 {
     _ = try writer.write("GGUF");
     try writer.writeInt(u32, 3, .little); // Version 3

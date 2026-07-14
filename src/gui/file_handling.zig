@@ -256,17 +256,15 @@ pub fn doGenSensitivities(arena_alloc: std.mem.Allocator, state: *guiState.State
 
 /// Convert the loaded file according to the options in state.
 /// Handles convert_state transitions.  Runs on a detached thread.
-pub fn convertFile(alloc: std.mem.Allocator, arena_alloc: std.mem.Allocator, state: *guiState.State) void {
-    state.convert_state.store(.converting, .release);
-    pushWakeupEvent(state);
-
-    const path = state.file_selected.?;
+/// Build a ConvertOptions from the current GUI state (without progress callbacks).
+/// Shared by the real conversion and the output-size prediction so both agree on
+/// exactly which options are in effect.
+pub fn buildConvertOptions(state: *guiState.State) conv.ConvertOptions {
     const folder = state.targetFolder();
     const filename = state.targetFilename();
-
-    const opts = conv.ConvertOptions{
+    return conv.ConvertOptions{
         .io = state.io,
-        .path = path,
+        .path = state.file_selected.?,
         .filetype = state.target_filetype,
         .datatype = state.target_dtype,
         .output_dir = if (folder.len > 0) folder else null,
@@ -280,12 +278,55 @@ pub fn convertFile(alloc: std.mem.Allocator, arena_alloc: std.mem.Allocator, sta
         .allow_unknown_arch = state.allow_unknown_arch,
         .allow_upscale = state.allow_upscale,
         .arch_override = state.archOverride(),
-        .callbacks = .{
-            .progress_fn = progressCallback,
-            .progress_ctx = state,
-            .cancel_fn = cancelCallback,
-            .cancel_ctx = state,
+    };
+}
+
+/// Predict the exact final output size for the current options without converting.
+/// Opens the source file (header/metadata only — no tensor data) and runs the same
+/// pipeline the real conversion uses. Returns null if the size can't be determined
+/// (e.g. no data type selected, or an unrecognized architecture without override).
+pub fn predictSize(alloc: std.mem.Allocator, state: *guiState.State) ?u64 {
+    if (state.file_selected == null or state.target_dtype == null) return null;
+    const path = state.file_selected.?;
+
+    var pred_arena = std.heap.ArenaAllocator.init(alloc);
+    defer pred_arena.deinit();
+    const pa = pred_arena.allocator();
+
+    const opts = buildConvertOptions(state);
+
+    const file = std.Io.Dir.cwd().openFile(state.io, path, .{ .mode = .read_only }) catch return null;
+    var read_buf: [8]u8 = undefined;
+    var file_reader = file.reader(state.io, &read_buf);
+    const file_type = ggufy.types.FileType.detect_from_file(&file_reader.interface, alloc) catch ggufy.types.FileType.safetensors;
+    file.close(state.io);
+
+    switch (file_type) {
+        .safetensors => {
+            var f = ggufy.safetensor.init(path, state.io, alloc, pa, false, false) catch return null;
+            defer f.deinit();
+            return conv.predictOutputSize(&f, opts, alloc, pa) catch null;
         },
+        .gguf => {
+            var f = ggufy.gguf.init(path, state.io, alloc, pa, false) catch return null;
+            defer f.deinit();
+            return conv.predictOutputSize(&f, opts, alloc, pa) catch null;
+        },
+    }
+}
+
+pub fn convertFile(alloc: std.mem.Allocator, arena_alloc: std.mem.Allocator, state: *guiState.State) void {
+    state.convert_state.store(.converting, .release);
+    pushWakeupEvent(state);
+
+    const path = state.file_selected.?;
+
+    var opts = buildConvertOptions(state);
+    opts.callbacks = .{
+        .progress_fn = progressCallback,
+        .progress_ctx = state,
+        .cancel_fn = cancelCallback,
+        .cancel_ctx = state,
     };
 
     // Compute output path for display after completion.

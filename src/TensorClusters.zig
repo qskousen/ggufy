@@ -3,7 +3,7 @@ const types = @import("types.zig");
 const DataTransform = @import("DataTransform.zig");
 const thread_pool_mod = @import("ThreadPool.zig");
 
-pub const ComfyQuantScheme = enum { nvfp4, float8_e4m3fn, mxfp4, mxfp8_e4m3fn, int8_convrot, int4_tensorwise, unknown };
+pub const ComfyQuantScheme = enum { nvfp4, float8_e4m3fn, mxfp4, mxfp8_e4m3fn, int8_convrot, convrot_w4a4, unknown };
 
 pub const Fp4Cluster = struct {
     base_name: []const u8,
@@ -66,12 +66,12 @@ pub const Int8ConvrotCluster = struct {
     group_size: usize,
 };
 
-/// int4 cluster (ggufy "int4_tensorwise", optional convrot):
-/// U8 nibble-packed signed 4-bit weight, F32 per-row scale.
+/// int4 cluster (ComfyUI "convrot_w4a4", always Hadamard-rotated):
+/// nibble-packed signed 4-bit weight, F32 per-row scale.
 pub const Int4Cluster = struct {
     base_name: []const u8,
-    weight: types.Tensor,        // U8, [rows, cols/2] (nibble-packed)
-    weight_scale: types.Tensor,  // F32, [rows, 1]
+    weight: types.Tensor,        // I8, [rows, cols/2] (nibble-packed, two signed 4-bit values per byte)
+    weight_scale: types.Tensor,  // F32, [rows]
     // Per-tensor `.comfy_quant` marker, or null when sourced from the `_quantization_metadata` header.
     comfy_quant: ?types.Tensor,
     rows: usize,
@@ -112,8 +112,9 @@ pub fn parseComfyQuantScheme(data: []const u8) ComfyQuantScheme {
     // ConvRot ships under the "int8_tensorwise" layout, distinguished by a `convrot`
     // boolean and per-row scaling rather than a dedicated format string.
     if (std.mem.eql(u8, fmt_str, "int8_tensorwise")) return .int8_convrot;
-    // ggufy's own 4-bit sibling of int8_tensorwise (no upstream ComfyUI loader).
-    if (std.mem.eql(u8, fmt_str, "int4_tensorwise")) return .int4_tensorwise;
+    // ComfyUI's 4-bit ConvRot layout; the format name itself implies group-wise
+    // Hadamard rotation (there is no separate `convrot` boolean).
+    if (std.mem.eql(u8, fmt_str, "convrot_w4a4")) return .convrot_w4a4;
     return .unknown;
 }
 
@@ -233,8 +234,8 @@ fn appendInt8ConvrotCluster(
     return true;
 }
 
-/// Build an int4 cluster (ggufy "int4_tensorwise") from a layer `base_name`. The weight is
-/// stored nibble-packed as U8 with dims [rows, cols/2], so the logical column count is twice
+/// Build an int4 cluster (ComfyUI "convrot_w4a4") from a layer `base_name`. The weight is
+/// stored nibble-packed with dims [rows, cols/2], so the logical column count is twice
 /// the packed second dim. See `appendInt8ConvrotCluster` for the argument conventions.
 fn appendInt4Cluster(
     source: anytype,
@@ -602,10 +603,10 @@ fn groupFromQuantMetadata(
                 const group_size = comfyQuantInt(layer_json, "convrot_groupsize", 256);
                 break :blk try appendInt8ConvrotCluster(source, name_map, base_name, convrot, group_size, null, int8_convrot_list, arena_alloc, allocator);
             },
-            .int4_tensorwise => blk: {
-                const convrot = comfyQuantBool(layer_json, "convrot", false);
+            .convrot_w4a4 => blk: {
+                // The convrot_w4a4 format is always Hadamard-rotated; only the group size varies.
                 const group_size = comfyQuantInt(layer_json, "convrot_groupsize", 256);
-                break :blk try appendInt4Cluster(source, name_map, base_name, convrot, group_size, null, int4_list, arena_alloc, allocator);
+                break :blk try appendInt4Cluster(source, name_map, base_name, true, group_size, null, int4_list, arena_alloc, allocator);
             },
             .unknown => unreachable, // handled above
         };
@@ -664,10 +665,10 @@ pub fn groupClusters(
                 const group_size = comfyQuantInt(data, "convrot_groupsize", 256);
                 break :blk try appendInt8ConvrotCluster(source, &name_map, base_name, convrot, group_size, t, &int8_convrot_list, arena_alloc, allocator);
             },
-            .int4_tensorwise => blk: {
-                const convrot = comfyQuantBool(data, "convrot", false);
+            .convrot_w4a4 => blk: {
+                // The convrot_w4a4 format is always Hadamard-rotated; only the group size varies.
                 const group_size = comfyQuantInt(data, "convrot_groupsize", 256);
-                break :blk try appendInt4Cluster(source, &name_map, base_name, convrot, group_size, t, &int4_list, arena_alloc, allocator);
+                break :blk try appendInt4Cluster(source, &name_map, base_name, true, group_size, t, &int4_list, arena_alloc, allocator);
             },
             .unknown => false,
         };
@@ -1326,17 +1327,20 @@ pub const nvfp4_comfy_json = "{\"format\": \"nvfp4\"}";
 pub const int8_comfy_json = "{\"per_row\": true, \"format\": \"int8_tensorwise\"}";
 pub const int8_convrot_comfy_json = "{\"convrot\": true, \"convrot_groupsize\": 256, \"per_row\": true, \"format\": \"int8_tensorwise\"}";
 pub const int8_convrot_group_size: u64 = 256;
-// ggufy's own 4-bit layout (no upstream ComfyUI loader). Same shape as int8_tensorwise
-// but the weight is nibble-packed signed 4-bit; convrot reuses the int8 group size.
-pub const int4_comfy_json = "{\"per_row\": true, \"format\": \"int4_tensorwise\"}";
-pub const int4_convrot_comfy_json = "{\"convrot\": true, \"convrot_groupsize\": 256, \"per_row\": true, \"format\": \"int4_tensorwise\"}";
+// ComfyUI "convrot_w4a4": nibble-packed signed 4-bit weight (Hadamard-rotated group-wise
+// at convrot_groupsize=256) with per-row F32 scales. quant_group_size=64 is a kernel-tiling
+// contract value (storage is still per-row); linear_dtype selects the int4 MMA path.
+pub const int4_convrot_comfy_json = "{\"format\": \"convrot_w4a4\", \"convrot_groupsize\": 256, \"quant_group_size\": 64, \"linear_dtype\": \"int4\"}";
 pub const int4_convrot_group_size: u64 = 256;
+/// Seed used for INT4_CONVROT_SR stochastic rounding when no `--stochastic-rounding`
+/// override is supplied. Any nonzero value works; 0 would disable stochastic rounding.
+pub const default_stochastic_seed: u64 = 0xC0FFEE;
 
 /// True if `dtype` is a ComfyUI safetensors cluster type (expands into weight + scale(s) +
 /// comfy_quant sub-tensors on disk).
 pub fn isClusterType(dtype: types.DataType) bool {
     return switch (dtype) {
-        .SCALED_F8_E4M3, .MXFP4, .MXFP8_E4M3, .NVFP4, .INT8, .INT8_CONVROT, .INT4, .INT4_CONVROT => true,
+        .SCALED_F8_E4M3, .MXFP4, .MXFP8_E4M3, .NVFP4, .INT8, .INT8_CONVROT, .INT4_CONVROT, .INT4_CONVROT_SR => true,
         else => false,
     };
 }
@@ -1405,12 +1409,13 @@ pub fn clusterWriteLayout(arena: std.mem.Allocator, dtype: types.DataType, dims:
             try list.append(arena, .{ .suffix = ".weight_scale", .dtype = "F32", .dims = try arena.dupe(usize, &.{ rows, 1 }), .bytes = rows * 4 });
             try list.append(arena, try comfy.spec(arena, json));
         },
-        .INT4, .INT4_CONVROT => {
-            // Weight is nibble-packed two values/byte along the row (like NVFP4's U8 weight).
-            const json = if (dtype == .INT4_CONVROT) int4_convrot_comfy_json else int4_comfy_json;
-            try list.append(arena, .{ .suffix = ".weight", .dtype = "U8", .dims = try arena.dupe(usize, &.{ rows, cols / 2 }), .bytes = rows * (cols / 2) });
-            try list.append(arena, .{ .suffix = ".weight_scale", .dtype = "F32", .dims = try arena.dupe(usize, &.{ rows, 1 }), .bytes = rows * 4 });
-            try list.append(arena, try comfy.spec(arena, json));
+        .INT4_CONVROT, .INT4_CONVROT_SR => {
+            // convrot_w4a4: signed int8 weight, two 4-bit nibbles per byte along the column dim,
+            // with 1-D per-row F32 scales (matching comfy_kitchen's on-disk layout). SR shares
+            // this exact layout — only the nibble values differ.
+            try list.append(arena, .{ .suffix = ".weight", .dtype = "I8", .dims = try arena.dupe(usize, &.{ rows, cols / 2 }), .bytes = rows * (cols / 2) });
+            try list.append(arena, .{ .suffix = ".weight_scale", .dtype = "F32", .dims = try arena.dupe(usize, &.{rows}), .bytes = rows * 4 });
+            try list.append(arena, try comfy.spec(arena, int4_convrot_comfy_json));
         },
         else => return null,
     }
@@ -1464,12 +1469,15 @@ fn readTensorBytesSized(source: anytype, tensor: types.Tensor, allocator: std.me
 
 /// Quantize `f32_data` to the cluster `dtype` and write its physical bytes
 /// ([weight][scale...][comfy_quant]) to `writer`, in the order given by clusterWriteLayout.
+/// `stochastic_rounding` is the resolved SR seed; it is applied only to INT4_CONVROT_SR
+/// (all other dest types quantize deterministically).
 pub fn writeClusterData(
     writer: *std.Io.Writer,
     allocator: std.mem.Allocator,
     dtype: types.DataType,
     f32_data: []const f32,
     dims: []const usize,
+    stochastic_rounding: u64,
     pool: *thread_pool_mod.ThreadPool,
 ) !void {
     const rc = rowsCols(dims);
@@ -1526,14 +1534,16 @@ pub fn writeClusterData(
             try writer.writeAll(std.mem.sliceAsBytes(cluster.scale));
             try writer.writeAll(if (is_convrot) int8_convrot_comfy_json else int8_comfy_json);
         },
-        .INT4, .INT4_CONVROT => {
-            const is_convrot = dtype == .INT4_CONVROT;
-            const cluster = try Q.quantizeToInt4(allocator, f32_data, @intCast(rows), @intCast(cols), is_convrot, @intCast(int4_convrot_group_size), pool);
+        .INT4_CONVROT, .INT4_CONVROT_SR => {
+            // Both write the same convrot_w4a4 layout; SR differs only by rounding the weights
+            // stochastically (nonzero seed). Non-SR always quantizes deterministically (seed 0).
+            const seed: u64 = if (dtype == .INT4_CONVROT_SR) stochastic_rounding else 0;
+            const cluster = try Q.quantizeToInt4(allocator, f32_data, @intCast(rows), @intCast(cols), true, @intCast(int4_convrot_group_size), seed, pool);
             defer allocator.free(cluster.weight);
             defer allocator.free(cluster.scale);
             try writer.writeAll(cluster.weight);
             try writer.writeAll(std.mem.sliceAsBytes(cluster.scale));
-            try writer.writeAll(if (is_convrot) int4_convrot_comfy_json else int4_comfy_json);
+            try writer.writeAll(int4_convrot_comfy_json);
         },
         else => return error.NotAClusterType,
     }
@@ -1989,68 +1999,12 @@ test "plain INT8 cluster: quantize → dequantize round-trip (convrot off, any s
     }
 }
 
-test "plain int4 quantize: matches NumPy reference bit-for-bit (no rotation)" {
-    // int4_tensorwise has no upstream loader, so the reference is gen_int4_fixtures.py's
-    // NumPy implementation of the exact spec. With convrot=false there is no fast-vs-dense
-    // rotation difference, so our quantizer must reproduce it byte-for-byte.
-    const allocator = std.testing.allocator;
-
-    const input_raw = (try loadFixture(allocator, "convrot_expected.f32")) orelse return error.SkipZigTest;
-    defer allocator.free(input_raw);
-    const ref_w = (try loadFixture(allocator, "int4_plain_weight.u8")) orelse return error.SkipZigTest;
-    defer allocator.free(ref_w);
-    const ref_s_raw = (try loadFixture(allocator, "int4_plain_scale.f32")) orelse return error.SkipZigTest;
-    defer allocator.free(ref_s_raw);
-
-    const rows: usize = 16;
-    const cols: usize = 6144;
-    const input: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(input_raw)));
-    const ref_scale: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(ref_s_raw)));
-    try testing.expectEqual(rows * cols, input.len);
-    try testing.expectEqual(rows * (cols / 2), ref_w.len);
-
-    var pool: thread_pool_mod.ThreadPool = undefined;
-    try pool.init(.{ .allocator = allocator, .n_jobs = 4 });
-    defer pool.deinit();
-
-    const enc = try DataTransform.Quantizer.quantizeToInt4(allocator, input, rows, cols, false, 0, &pool);
-    defer allocator.free(enc.weight);
-    defer allocator.free(enc.scale);
-
-    for (enc.weight, ref_w) |ours, theirs| try testing.expectEqual(theirs, ours);
-    for (enc.scale, ref_scale) |ours, theirs| try testing.expectApproxEqAbs(theirs, ours, 1e-12);
-}
-
-test "plain int4 dequant: matches NumPy reference exactly" {
-    // Dequant is deterministic (int * scale, no rotation), so it must match to the bit.
-    const allocator = std.testing.allocator;
-
-    const ref_w = (try loadFixture(allocator, "int4_plain_weight.u8")) orelse return error.SkipZigTest;
-    defer allocator.free(ref_w);
-    const ref_s_raw = (try loadFixture(allocator, "int4_plain_scale.f32")) orelse return error.SkipZigTest;
-    defer allocator.free(ref_s_raw);
-    const expected_raw = (try loadFixture(allocator, "int4_plain_expected.f32")) orelse return error.SkipZigTest;
-    defer allocator.free(expected_raw);
-
-    const rows: usize = 16;
-    const cols: usize = 6144;
-    const ref_scale: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(ref_s_raw)));
-    const expected: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(expected_raw)));
-
-    var pool: thread_pool_mod.ThreadPool = undefined;
-    try pool.init(.{ .allocator = allocator, .n_jobs = 4 });
-    defer pool.deinit();
-
-    const got = try dequantizeInt4Raw(ref_w, ref_scale, rows, cols, false, 0, allocator, &pool);
-    defer allocator.free(got);
-
-    for (got, expected) |ours, theirs| try testing.expectEqual(theirs, ours);
-}
-
-test "ConvRot int4 quantize: matches NumPy reference within rounding" {
-    // Fast vs. dense Hadamard can flip a rare rounding boundary, so we require the vast
-    // majority of nibbles exact and all within ±1 int4 step. Nibbles are compared after
-    // unpacking so a single flipped nibble is not masked by the shared byte.
+test "ConvRot int4 quantize: matches comfy_kitchen convrot_w4a4 within rounding" {
+    // Reference is comfy_kitchen's quantize_convrot_w4a4_weight (stochastic_rounding=0, so
+    // deterministic round-half-even, clamp [-7,7]). Our fast radix-4 Hadamard vs. comfy's dense
+    // matmul can flip a rare rounding boundary, so we require the vast majority of nibbles exact
+    // and all within ±1 int4 step. Nibbles are compared after unpacking so a single flipped
+    // nibble is not masked by the shared byte. seed=0 selects the deterministic path.
     const allocator = std.testing.allocator;
 
     const input_raw = (try loadFixture(allocator, "convrot_expected.f32")) orelse return error.SkipZigTest;
@@ -2068,7 +2022,7 @@ test "ConvRot int4 quantize: matches NumPy reference within rounding" {
     try pool.init(.{ .allocator = allocator, .n_jobs = 4 });
     defer pool.deinit();
 
-    const enc = try DataTransform.Quantizer.quantizeToInt4(allocator, input, rows, cols, true, gs, &pool);
+    const enc = try DataTransform.Quantizer.quantizeToInt4(allocator, input, rows, cols, true, gs, 0, &pool);
     defer allocator.free(enc.weight);
     defer allocator.free(enc.scale);
 
@@ -2088,9 +2042,9 @@ test "ConvRot int4 quantize: matches NumPy reference within rounding" {
     try testing.expect(mismatches * 100 < n_nibbles);        // < 1% differ by ±1
 }
 
-test "ConvRot int4 dequant: matches NumPy reference within rounding" {
-    // Feed NumPy's own convrot weight+scale through our dequant; only the fast-vs-dense
-    // un-rotation can differ, so results match within a tight tolerance.
+test "ConvRot int4 dequant: matches comfy_kitchen convrot_w4a4 within rounding" {
+    // Feed comfy_kitchen's own convrot_w4a4 weight+scale through our dequant; only the
+    // fast-vs-dense un-rotation can differ, so results match within a tight tolerance.
     const allocator = std.testing.allocator;
 
     const ref_w = (try loadFixture(allocator, "int4_convrot_weight.u8")) orelse return error.SkipZigTest;
@@ -2116,14 +2070,17 @@ test "ConvRot int4 dequant: matches NumPy reference within rounding" {
     for (got, expected) |ours, theirs| try testing.expectApproxEqAbs(theirs, ours, 1e-4);
 }
 
-test "int4 cluster: quantize → dequantize round-trip (convrot off, any shape)" {
+test "int4 stochastic rounding: reproducible, seed-dependent, same scale, unbiased" {
+    // Verifies the SR contract: (1) a nonzero seed is fully reproducible regardless of thread
+    // count, (2) different seeds produce different nibbles, (3) the per-row scale is independent
+    // of the rounding mode, and (4) stochastic rounding stays within ±1 step of deterministic
+    // rounding while remaining (statistically) unbiased about it.
     const allocator = std.testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x1114);
     const rand = prng.random();
 
-    // Even (but non-power-of-4) columns: plain int4 must work where convrot cannot.
     const rows: usize = 10;
-    const cols: usize = 200;
+    const cols: usize = 256; // valid convrot group size (power of 4)
 
     const w = try allocator.alloc(f32, rows * cols);
     defer allocator.free(w);
@@ -2132,24 +2089,48 @@ test "int4 cluster: quantize → dequantize round-trip (convrot off, any shape)"
     var pool: thread_pool_mod.ThreadPool = undefined;
     try pool.init(.{ .allocator = allocator, .n_jobs = 2 });
     defer pool.deinit();
+    var pool1: thread_pool_mod.ThreadPool = undefined;
+    try pool1.init(.{ .allocator = allocator, .n_jobs = 1 });
+    defer pool1.deinit();
 
-    const enc = try DataTransform.Quantizer.quantizeToInt4(allocator, w, rows, cols, false, 0, &pool);
-    defer allocator.free(enc.weight);
-    defer allocator.free(enc.scale);
-    try testing.expectEqual(rows * (cols / 2), enc.weight.len);
+    const gs: usize = 256;
+    const det = try DataTransform.Quantizer.quantizeToInt4(allocator, w, rows, cols, true, gs, 0, &pool);
+    defer allocator.free(det.weight);
+    defer allocator.free(det.scale);
 
-    const got = try dequantizeInt4Raw(enc.weight, enc.scale, rows, cols, false, 0, allocator, &pool);
-    defer allocator.free(got);
+    const sr_a = try DataTransform.Quantizer.quantizeToInt4(allocator, w, rows, cols, true, gs, 42, &pool);
+    defer allocator.free(sr_a.weight);
+    defer allocator.free(sr_a.scale);
+    // Same seed but a different thread count → identical bytes (RNG keyed by element index).
+    const sr_a1 = try DataTransform.Quantizer.quantizeToInt4(allocator, w, rows, cols, true, gs, 42, &pool1);
+    defer allocator.free(sr_a1.weight);
+    defer allocator.free(sr_a1.scale);
+    const sr_b = try DataTransform.Quantizer.quantizeToInt4(allocator, w, rows, cols, true, gs, 7, &pool);
+    defer allocator.free(sr_b.weight);
+    defer allocator.free(sr_b.scale);
 
-    // No rotation, so error is bounded per element by half the per-row quantization step.
-    for (0..rows) |r| {
-        var amax: f32 = 0;
-        for (w[r * cols .. r * cols + cols]) |v| amax = @max(amax, @abs(v));
-        const step = @max(amax / 7.0, 1e-30);
-        for (0..cols) |c| {
-            try testing.expect(@abs(got[r * cols + c] - w[r * cols + c]) <= step * 0.5 + 1e-6);
+    // (1) reproducible across thread counts.
+    for (sr_a.weight, sr_a1.weight) |x, y| try testing.expectEqual(x, y);
+    // (3) scale is the same regardless of rounding mode/seed.
+    for (det.scale, sr_a.scale) |x, y| try testing.expectEqual(x, y);
+    for (det.scale, sr_b.scale) |x, y| try testing.expectEqual(x, y);
+
+    // (2) different seeds differ somewhere, and (4) SR stays within ±1 step of deterministic.
+    var seed_diffs: usize = 0;
+    var signed_delta: i64 = 0;
+    for (det.weight, sr_a.weight, sr_b.weight) |d, a, b| {
+        if (a != b) seed_diffs += 1;
+        const nd = [2]i16{ signExtendNibble(d & 0x0F), signExtendNibble(d >> 4) };
+        const na = [2]i16{ signExtendNibble(a & 0x0F), signExtendNibble(a >> 4) };
+        for (nd, na) |dv, av| {
+            try testing.expect(@abs(av - dv) <= 1); // never more than one step from deterministic
+            signed_delta += @as(i64, av - dv);
         }
     }
+    try testing.expect(seed_diffs > 0);
+    // (4) unbiased: mean signed deviation over ~2560 nibbles is small (not a systematic drift).
+    const n_nibbles: i64 = @intCast(det.weight.len * 2);
+    try testing.expect(@abs(signed_delta) * 10 < n_nibbles); // |mean| < 0.1 step
 }
 
 test "NVFP4 cuBLAS tiled block index: spot-checks" {

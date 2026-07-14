@@ -96,6 +96,12 @@ pub const State = struct {
     convert_tensor_dst_type_len: usize = 0,
     convert_tensor_elements: u64 = 0,
 
+    // Predicted output size (bytes) shown before Convert. Recomputed only when a
+    // size-affecting option changes, tracked via `prev_pred_signature`. Null means
+    // "not yet computed" or "prediction unavailable" (e.g. no data type selected).
+    predicted_size: ?u64 = null,
+    prev_pred_signature: ?u64 = null,
+
     // Overwrite confirmation
     overwrite_pending_path_buf: [std.fs.max_path_bytes]u8 = undefined,
     overwrite_pending_path: ?[]u8 = null,
@@ -136,5 +142,24 @@ pub const State = struct {
 
     pub fn toolStatus(self: *const State) []const u8 {
         return self.tool_status_buf[0..self.tool_status_len];
+    }
+
+    /// A hash of every option that affects the predicted output size. When it changes,
+    /// the predicted size is recomputed; otherwise the cached value is reused so the
+    /// (relatively cheap, but non-trivial) prediction doesn't run every frame.
+    pub fn predictionSignature(self: *const State) u64 {
+        var h = std.hash.Wyhash.init(0);
+        std.hash.autoHash(&h, self.target_filetype);
+        if (self.target_dtype) |dt| std.hash.autoHash(&h, dt) else std.hash.autoHash(&h, @as(u16, 0xFFFF));
+        std.hash.autoHash(&h, self.target_aggressiveness);
+        std.hash.autoHash(&h, self.skip_sensitivity);
+        std.hash.autoHash(&h, self.model_only);
+        std.hash.autoHash(&h, self.allow_unknown_arch);
+        std.hash.autoHash(&h, self.allow_upscale);
+        h.update(std.mem.sliceTo(&self.arch_override_buf, 0));
+        if (self.template_path) |p| h.update(p);
+        if (self.sensitivity_path) |p| h.update(p);
+        if (self.file_selected) |p| h.update(p);
+        return h.final();
     }
 };

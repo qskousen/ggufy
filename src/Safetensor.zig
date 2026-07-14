@@ -789,31 +789,38 @@ fn putClusterHeaderEntry(
     try header_obj.put(arena, name, .{ .object = obj });
 }
 
-pub fn saveWithSTData(self: Safetensors, source: anytype, threads: usize, callbacks: cb.ConvertCallbacks, groups: *const TensorClusters.GroupResult) !void {
-    // Build the full header JSON object (tensor entries + __metadata__)
+/// Build the full SafeTensors header JSON object (tensor/sub-tensor entries plus the
+/// optional `__metadata__` map) from a tensor list. Shared by the writer
+/// (`saveWithSTData`) and the size predictor (`calculateFileSize`) so the serialized
+/// header — whose byte length is part of the file size — is identical for both.
+fn buildHeaderObject(
+    arena: std.mem.Allocator,
+    metadata: ?std.json.ObjectMap,
+    tensors: []const types.Tensor,
+) !std.json.ObjectMap {
     var header_obj = std.json.ObjectMap.empty;
 
     // Add __metadata__ under its special key
-    if (self.metadata) |meta| {
-        try header_obj.put(self.arena_alloc,"__metadata__", .{ .object = meta });
+    if (metadata) |meta| {
+        try header_obj.put(arena, "__metadata__", .{ .object = meta });
     }
 
     // Add each tensor entry
-    for (self.tensors.items) |t| {
+    for (tensors) |t| {
         // ComfyUI cluster dest types expand into [weight][scale...][comfy_quant] sub-tensors,
         // laid out per TensorClusters.clusterWriteLayout (the shared source of truth also used
         // by the size computation and the data writer below).
         {
             const dt = try types.DataType.fromString(t.type);
-            if (try TensorClusters.clusterWriteLayout(self.arena_alloc, dt, t.dims)) |specs| {
+            if (try TensorClusters.clusterWriteLayout(arena, dt, t.dims)) |specs| {
                 const base = if (std.mem.endsWith(u8, t.name, ".weight"))
                     t.name[0 .. t.name.len - ".weight".len]
                 else
                     t.name;
                 var off = t.offset;
                 for (specs) |s| {
-                    const name = try std.fmt.allocPrint(self.arena_alloc, "{s}{s}", .{ base, s.suffix });
-                    try putClusterHeaderEntry(self.arena_alloc, &header_obj, name, s.dtype, s.dims, off, off + s.bytes);
+                    const name = try std.fmt.allocPrint(arena, "{s}{s}", .{ base, s.suffix });
+                    try putClusterHeaderEntry(arena, &header_obj, name, s.dtype, s.dims, off, off + s.bytes);
                     off += s.bytes;
                 }
                 continue;
@@ -822,21 +829,52 @@ pub fn saveWithSTData(self: Safetensors, source: anytype, threads: usize, callba
 
         var tensor_obj = std.json.ObjectMap.empty;
 
-        try tensor_obj.put(self.arena_alloc,"dtype", .{ .string = t.type });
+        try tensor_obj.put(arena, "dtype", .{ .string = t.type });
 
-        var shape_arr = std.json.Array.init(self.arena_alloc);
+        var shape_arr = std.json.Array.init(arena);
         for (t.dims) |d| {
             try shape_arr.append(.{ .integer = @intCast(d) });
         }
-        try tensor_obj.put(self.arena_alloc,"shape", .{ .array = shape_arr });
+        try tensor_obj.put(arena, "shape", .{ .array = shape_arr });
 
-        var offsets_arr = std.json.Array.init(self.arena_alloc);
+        var offsets_arr = std.json.Array.init(arena);
         try offsets_arr.append(.{ .integer = @intCast(t.offset) });
         try offsets_arr.append(.{ .integer = @intCast(t.offset + t.size) });
-        try tensor_obj.put(self.arena_alloc,"data_offsets", .{ .array = offsets_arr });
+        try tensor_obj.put(arena, "data_offsets", .{ .array = offsets_arr });
 
-        try header_obj.put(self.arena_alloc,t.name, .{ .object = tensor_obj });
+        try header_obj.put(arena, t.name, .{ .object = tensor_obj });
     }
+
+    return header_obj;
+}
+
+/// Compute the exact on-disk byte size a SafeTensors file with these `tensors` and
+/// `metadata` would occupy, without writing anything: the 8-byte header-length prefix
+/// plus the serialized header JSON plus the contiguous (unpadded) tensor-data region.
+/// `t.size` already carries the full cluster size for cluster dest types, so summing it
+/// covers both plain and clustered tensors.
+pub fn calculateFileSize(
+    tensors: []const types.Tensor,
+    metadata: ?std.json.ObjectMap,
+    arena_alloc: std.mem.Allocator,
+    allocator: std.mem.Allocator,
+) !u64 {
+    const header_obj = try buildHeaderObject(arena_alloc, metadata, tensors);
+
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try std.json.Stringify.value(std.json.Value{ .object = header_obj }, .{}, &aw.writer);
+    const header_size: u64 = aw.written().len;
+
+    var data_size: u64 = 0;
+    for (tensors) |t| data_size += t.size;
+
+    return 8 + header_size + data_size;
+}
+
+pub fn saveWithSTData(self: Safetensors, source: anytype, threads: usize, callbacks: cb.ConvertCallbacks, groups: *const TensorClusters.GroupResult, stochastic_rounding: u64) !void {
+    // Build the full header JSON object (tensor entries + __metadata__)
+    const header_obj = try buildHeaderObject(self.arena_alloc, self.metadata, self.tensors.items);
 
     // Serialize the full header to bytes
     var aw: std.Io.Writer.Allocating = .init(self.allocator);
@@ -894,7 +932,7 @@ pub fn saveWithSTData(self: Safetensors, source: anytype, threads: usize, callba
             if (src_f32) |data| {
                 defer self.allocator.free(data);
                 if (dest_is_cluster) {
-                    try TensorClusters.writeClusterData(&writer.interface, self.allocator, dt, data, t.dims, &pool);
+                    try TensorClusters.writeClusterData(&writer.interface, self.allocator, dt, data, t.dims, stochastic_rounding, &pool);
                 } else {
                     const out = try DataTransform.Quantizer.convertTensorData(
                         self.allocator, std.mem.sliceAsBytes(data), .F32, dt, data.len, &pool,

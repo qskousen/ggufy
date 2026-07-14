@@ -49,6 +49,11 @@ pub const ConvertOptions = struct {
     /// has higher nominal precision than some source tensors (e.g. q4_k → f16).
     /// Upscaling does NOT recover lost precision; the extra bits are fill-in.
     allow_upscale: bool = false,
+    /// Stochastic-rounding seed for the INT4_CONVROT_SR output type. `null` uses the
+    /// baked-in default seed (TensorClusters.default_stochastic_seed); `0` disables
+    /// stochastic rounding (making SR output identical to plain INT4_CONVROT — the
+    /// deterministic path used for bit-for-bit comparison). Ignored by all other types.
+    stochastic_rounding: ?u64 = null,
     /// Optional GUI progress/cancel hooks.  No-ops when null.
     callbacks: cb.ConvertCallbacks = .{},
 };
@@ -170,23 +175,28 @@ pub fn computeOutputPath(opts: ConvertOptions, arena_alloc: std.mem.Allocator) !
 
 /// Entry point: convert a SafeTensors or GGUF file according to `opts`.
 /// `f` is the already-opened source handle (either *st or *gguf.Gguf).
-pub fn convert(
+/// The result of running the shape/type/metadata-determining half of a conversion,
+/// stopping just short of writing any output. Shared by `convert` (which then writes)
+/// and `predictOutputSize` (which then measures) so both operate on identical tensor
+/// types, sizes, offsets and grouping. All members are backed by `arena_alloc`.
+pub const PreparedConversion = struct {
+    arch: *const imagearch.Arch,
+    model_tensors: std.ArrayList(types.Tensor),
+    template_metadata: ?std.json.ObjectMap,
+    extra_metadata: std.json.ObjectMap,
+    groups: TensorClusters.GroupResult,
+};
+
+/// Run everything from architecture detection through quantization-type assignment,
+/// shape-fix and tensor sorting — i.e. the full conversion pipeline up to (but not
+/// including) the output write. After this returns, every tensor's `type`, `size` and
+/// `offset` are final, which is exactly what both writing and size prediction need.
+pub fn prepareConversion(
     f: anytype,
     opts: ConvertOptions,
     allocator: std.mem.Allocator,
     arena_alloc: std.mem.Allocator,
-) !void {
-    // --- Upscaling guard ------------------------------------------------------
-    if (!opts.allow_upscale and detectUpscaling(f.tensors.items, opts.datatype)) {
-        std.log.err(
-            "Source contains lossy-quantized tensors; converting to a higher-precision " ++
-            "format will NOT recover lost information — the extra bits are fill-in only. " ++
-            "Pass --allow-upscale (-U) to convert anyway.",
-            .{},
-        );
-        return error.UpscalingNotAllowed;
-    }
-
+) !PreparedConversion {
     // --- Detect architecture --------------------------------------------------
     const arch = blk: {
         const result = imagearch.detectArchFromTensorsOrError(f.tensors.items, allocator);
@@ -240,30 +250,84 @@ pub fn convert(
         }.lessThan);
     }
 
+    return .{
+        .arch = arch,
+        .model_tensors = model_tensors,
+        .template_metadata = template_metadata,
+        .extra_metadata = extra_metadata,
+        .groups = groups,
+    };
+}
+
+pub fn convert(
+    f: anytype,
+    opts: ConvertOptions,
+    allocator: std.mem.Allocator,
+    arena_alloc: std.mem.Allocator,
+) !void {
+    // --- Upscaling guard ------------------------------------------------------
+    if (!opts.allow_upscale and detectUpscaling(f.tensors.items, opts.datatype)) {
+        std.log.err(
+            "Source contains lossy-quantized tensors; converting to a higher-precision " ++
+            "format will NOT recover lost information — the extra bits are fill-in only. " ++
+            "Pass --allow-upscale (-U) to convert anyway.",
+            .{},
+        );
+        return error.UpscalingNotAllowed;
+    }
+
+    var prep = try prepareConversion(f, opts, allocator, arena_alloc);
+
     // --- Write output ---------------------------------------------------------
     switch (opts.filetype) {
         .gguf => try writeGguf(
             f,
-            model_tensors,
-            arch,
-            template_metadata,
-            extra_metadata,
+            prep.model_tensors,
+            prep.arch,
+            prep.template_metadata,
+            prep.extra_metadata,
             opts,
             allocator,
             arena_alloc,
-            &groups,
+            &prep.groups,
         ),
         .safetensors => try writeSafetensors(
             f,
-            model_tensors,
-            arch,
-            template_metadata,
-            extra_metadata,
+            prep.model_tensors,
+            prep.arch,
+            prep.template_metadata,
+            prep.extra_metadata,
             opts,
             allocator,
             arena_alloc,
-            &groups,
+            &prep.groups,
         ),
+    }
+}
+
+/// Compute the exact size in bytes of the file `convert` would produce with these
+/// options, WITHOUT reading tensor data or writing anything. Reuses the same
+/// pipeline (`prepareConversion`) and the same serializers the writers use, so the
+/// prediction matches the real output byte-for-byte.
+pub fn predictOutputSize(
+    f: anytype,
+    opts: ConvertOptions,
+    allocator: std.mem.Allocator,
+    arena_alloc: std.mem.Allocator,
+) !u64 {
+    const prep = try prepareConversion(f, opts, allocator, arena_alloc);
+
+    switch (opts.filetype) {
+        .gguf => {
+            var metadata: std.json.ObjectMap = .empty;
+            try buildGgufMetadata(&metadata, f, prep.arch, prep.template_metadata, prep.extra_metadata, opts, arena_alloc);
+            return try gguf.calculateFileSize(prep.model_tensors.items, &metadata, 32);
+        },
+        .safetensors => {
+            var metadata: ?std.json.ObjectMap = null;
+            try buildSafetensorsMetadata(&metadata, f, prep.template_metadata, prep.extra_metadata, arena_alloc);
+            return try st.calculateFileSize(prep.model_tensors.items, metadata, arena_alloc, allocator);
+        },
     }
 }
 
@@ -720,9 +784,9 @@ fn clusterEligible(t: *const types.Tensor, ttype: types.DataType, num_elements: 
             (num_elements / n_cols) % 128 == 0 and !arch.isNvfp4Passthrough(t.name),
         .INT8 => t.dims.len == 2 and n_cols >= 1,
         .INT8_CONVROT => t.dims.len == 2 and n_cols % TensorClusters.int8_convrot_group_size == 0,
-        // int4 nibble-packs two columns per byte, so the column count must be even.
-        .INT4 => t.dims.len == 2 and n_cols >= 2 and n_cols % 2 == 0,
-        .INT4_CONVROT => t.dims.len == 2 and n_cols % TensorClusters.int4_convrot_group_size == 0,
+        // convrot_w4a4 rotates in column-groups of convrot_groupsize, so the input dim must
+        // be divisible by it (which also guarantees the even column count nibble-packing needs).
+        .INT4_CONVROT, .INT4_CONVROT_SR => t.dims.len == 2 and n_cols % TensorClusters.int4_convrot_group_size == 0,
         else => false,
     };
 }
@@ -945,6 +1009,60 @@ fn stampConverterProvenance(metadata: *std.json.ObjectMap) void {
     }
 }
 
+/// Assemble the final GGUF metadata map (added/overwritten standard keys, merged
+/// template/source keys, extra shape-fix records, dropped source quant header,
+/// stamped provenance, merged base config) into `metadata`. Shared by the real
+/// writer (`writeGguf`) and the size predictor so both serialize identical metadata.
+fn buildGgufMetadata(
+    metadata: *std.json.ObjectMap,
+    f: anytype,
+    arch: *const imagearch.Arch,
+    template_metadata: ?std.json.ObjectMap,
+    extra_metadata: std.json.ObjectMap,
+    opts: ConvertOptions,
+    arena_alloc: std.mem.Allocator,
+) !void {
+    // Standard metadata.
+    const arch_name = opts.arch_override orelse arch.name;
+    try metadata.put(arena_alloc, try arena_alloc.dupe(u8, "general.architecture"), .{ .string = arch_name });
+    try metadata.put(arena_alloc, try arena_alloc.dupe(u8, "general.quantization_version"), .{ .integer = 2 });
+    try metadata.put(arena_alloc, try arena_alloc.dupe(u8, "general.file_type"), .{ .integer = ggufFileType(opts.datatype) });
+
+    // Template metadata takes priority over source-file metadata.
+    if (template_metadata) |meta| {
+        var it = meta.iterator();
+        while (it.next()) |entry| {
+            if (!metadata.contains(entry.key_ptr.*))
+                try metadata.put(arena_alloc, try arena_alloc.dupe(u8, entry.key_ptr.*), entry.value_ptr.*);
+        }
+    } else if (f.getSourceMetadata()) |meta| {
+        var it = meta.iterator();
+        while (it.next()) |entry| {
+            if (!metadata.contains(entry.key_ptr.*))
+                try metadata.put(arena_alloc, try arena_alloc.dupe(u8, entry.key_ptr.*), entry.value_ptr.*);
+        }
+    }
+
+    // Extra metadata (e.g. shape-fix records).
+    var extra_it = extra_metadata.iterator();
+    while (extra_it.next()) |entry| {
+        if (!metadata.contains(entry.key_ptr.*))
+            try metadata.put(arena_alloc, try arena_alloc.dupe(u8, entry.key_ptr.*), entry.value_ptr.*);
+    }
+
+    // Drop the source quantization header — it describes the pre-conversion layout —
+    // and correct any converter-provenance keys carried over from the source tool.
+    _ = metadata.swapRemove(source_quant_metadata_key);
+    stampConverterProvenance(metadata);
+
+    // Merge arch base config (vae/audio_vae/vocoder etc.) into the `config` KV.
+    // Fine-tuned source files often omit these sections; they are architectural
+    // constants for the base model that ComfyUI needs to initialise decoders.
+    if (arch.base_config_json.len > 0) {
+        try mergeBaseConfig(metadata, arch.base_config_json, arena_alloc);
+    }
+}
+
 fn writeGguf(
     f: anytype,
     model_tensors: std.ArrayList(types.Tensor),
@@ -978,45 +1096,7 @@ fn writeGguf(
     defer out_gguf.deinit();
     out_gguf.tensors = model_tensors;
 
-    // Standard metadata.
-    const arch_name = opts.arch_override orelse arch.name;
-    try out_gguf.metadata.put(arena_alloc,try arena_alloc.dupe(u8, "general.architecture"), .{ .string = arch_name });
-    try out_gguf.metadata.put(arena_alloc,try arena_alloc.dupe(u8, "general.quantization_version"), .{ .integer = 2 });
-    try out_gguf.metadata.put(arena_alloc, try arena_alloc.dupe(u8, "general.file_type"), .{ .integer = ggufFileType(opts.datatype) });
-
-    // Template metadata takes priority over source-file metadata.
-    if (template_metadata) |meta| {
-        var it = meta.iterator();
-        while (it.next()) |entry| {
-            if (!out_gguf.metadata.contains(entry.key_ptr.*))
-                try out_gguf.metadata.put(arena_alloc,try arena_alloc.dupe(u8, entry.key_ptr.*), entry.value_ptr.*);
-        }
-    } else if (f.getSourceMetadata()) |meta| {
-        var it = meta.iterator();
-        while (it.next()) |entry| {
-            if (!out_gguf.metadata.contains(entry.key_ptr.*))
-                try out_gguf.metadata.put(arena_alloc,try arena_alloc.dupe(u8, entry.key_ptr.*), entry.value_ptr.*);
-        }
-    }
-
-    // Extra metadata (e.g. shape-fix records).
-    var extra_it = extra_metadata.iterator();
-    while (extra_it.next()) |entry| {
-        if (!out_gguf.metadata.contains(entry.key_ptr.*))
-            try out_gguf.metadata.put(arena_alloc,try arena_alloc.dupe(u8, entry.key_ptr.*), entry.value_ptr.*);
-    }
-
-    // Drop the source quantization header — it describes the pre-conversion layout —
-    // and correct any converter-provenance keys carried over from the source tool.
-    _ = out_gguf.metadata.swapRemove(source_quant_metadata_key);
-    stampConverterProvenance(&out_gguf.metadata);
-
-    // Merge arch base config (vae/audio_vae/vocoder etc.) into the `config` KV.
-    // Fine-tuned source files often omit these sections; they are architectural
-    // constants for the base model that ComfyUI needs to initialise decoders.
-    if (arch.base_config_json.len > 0) {
-        try mergeBaseConfig(&out_gguf.metadata, arch.base_config_json, arena_alloc);
-    }
+    try buildGgufMetadata(&out_gguf.metadata, f, arch, template_metadata, extra_metadata, opts, arena_alloc);
 
     out_gguf.saveWithSTData(f, opts.threads, opts.callbacks, groups) catch |err| {
         if (err == error.Cancelled) {
@@ -1025,6 +1105,51 @@ fn writeGguf(
         return err;
     };
     std.log.info("Converted to {s}", .{out_filename});
+}
+
+/// Assemble the final SafeTensors `__metadata__` map (cloned source metadata, merged
+/// template/source keys, extra records, dropped source quant header, stamped
+/// provenance) into `metadata`. Shared by the real writer and the size predictor.
+fn buildSafetensorsMetadata(
+    metadata: *?std.json.ObjectMap,
+    f: anytype,
+    template_metadata: ?std.json.ObjectMap,
+    extra_metadata: std.json.ObjectMap,
+    arena_alloc: std.mem.Allocator,
+) !void {
+    // Copy any metadata from the source, if there is any
+    metadata.* = if (f.getSourceMetadata()) |meta| try meta.clone(arena_alloc) else null;
+
+    // Template metadata takes priority over source-file metadata.
+    if (template_metadata) |meta| {
+        if (metadata.* == null) metadata.* = std.json.ObjectMap.empty;
+        var it = meta.iterator();
+        while (it.next()) |entry| {
+            if (!metadata.*.?.contains(entry.key_ptr.*))
+                try metadata.*.?.put(arena_alloc, try arena_alloc.dupe(u8, entry.key_ptr.*), entry.value_ptr.*);
+        }
+    } else if (f.getSourceMetadata()) |meta| {
+        var it = meta.iterator();
+        while (it.next()) |entry| {
+            if (!metadata.*.?.contains(entry.key_ptr.*))
+                try metadata.*.?.put(arena_alloc, try arena_alloc.dupe(u8, entry.key_ptr.*), entry.value_ptr.*);
+        }
+    }
+
+    // Extra metadata
+    var extra_it = extra_metadata.iterator();
+    while (extra_it.next()) |entry| {
+        if (!metadata.*.?.contains(entry.key_ptr.*))
+            try metadata.*.?.put(arena_alloc, try arena_alloc.dupe(u8, entry.key_ptr.*), entry.value_ptr.*);
+    }
+
+    // Drop the source quantization header. It describes the pre-conversion layout, so
+    // leaving it would make ComfyUI load the dequantized output as a different format and fail.
+    // Also correct any converter-provenance keys present.
+    if (metadata.*) |*m| {
+        _ = m.swapRemove(source_quant_metadata_key);
+        stampConverterProvenance(m);
+    }
 }
 
 fn writeSafetensors(
@@ -1060,41 +1185,10 @@ fn writeSafetensors(
     defer out_st.deinit();
     out_st.tensors = model_tensors;
 
-    // Copy any metadata from the source, if there is any
-    out_st.metadata = if (f.getSourceMetadata()) |meta| try meta.clone(arena_alloc) else null;
+    try buildSafetensorsMetadata(&out_st.metadata, f, template_metadata, extra_metadata, arena_alloc);
 
-    // Template metadata takes priority over source-file metadata.
-    if (template_metadata) |meta| {
-        if (out_st.metadata == null) out_st.metadata = std.json.ObjectMap.empty;
-        var it = meta.iterator();
-        while (it.next()) |entry| {
-            if (!out_st.metadata.?.contains(entry.key_ptr.*))
-                try out_st.metadata.?.put(arena_alloc, try arena_alloc.dupe(u8, entry.key_ptr.*), entry.value_ptr.*);
-        }
-    } else if (f.getSourceMetadata()) |meta| {
-        var it = meta.iterator();
-        while (it.next()) |entry| {
-            if (!out_st.metadata.?.contains(entry.key_ptr.*))
-                try out_st.metadata.?.put(arena_alloc, try arena_alloc.dupe(u8, entry.key_ptr.*), entry.value_ptr.*);
-        }
-    }
-
-    // Extra metadata
-    var extra_it = extra_metadata.iterator();
-    while (extra_it.next()) |entry| {
-        if (!out_st.metadata.?.contains(entry.key_ptr.*))
-            try out_st.metadata.?.put(arena_alloc, try arena_alloc.dupe(u8, entry.key_ptr.*), entry.value_ptr.*);
-    }
-
-    // Drop the source quantization header. It describes the pre-conversion layout, so
-    // leaving it would make ComfyUI load the dequantized output as a different format and fail.
-    // Also correct any converter-provenance keys present.
-    if (out_st.metadata) |*m| {
-        _ = m.swapRemove(source_quant_metadata_key);
-        stampConverterProvenance(m);
-    }
-
-    out_st.saveWithSTData(f, opts.threads, opts.callbacks, groups) catch |err| {
+    const sr_seed: u64 = opts.stochastic_rounding orelse TensorClusters.default_stochastic_seed;
+    out_st.saveWithSTData(f, opts.threads, opts.callbacks, groups, sr_seed) catch |err| {
         if (err == error.Cancelled) {
             std.Io.Dir.deleteFileAbsolute(opts.io, out_filename) catch {};
         }
@@ -1375,4 +1469,87 @@ test "assignTensorType: large 2D weights are quantized" {
     var t = types.Tensor{ .name = "blocks.0.attn.wq.weight", .type = "BF16", .dims = &dims, .size = 0, .offset = 0 };
     try assignTensorType(&t, n, &imagearch.generic_arch, QUANTIZATION_THRESHOLD, opts, false, null, std.testing.allocator);
     try testing.expectEqualStrings("q8_0", t.type);
+}
+
+/// Write a minimal two-tensor SafeTensors file for the size-prediction test. Data is a
+/// constant non-zero byte pattern (finite, non-zero) so cluster/quant scale computation
+/// never hits a divide-by-zero on all-zero input.
+fn writeTestSafetensors(io: std.Io, path: []const u8, a: std.mem.Allocator) !void {
+    const header =
+        \\{"unet.foo.weight":{"dtype":"BF16","shape":[512,512],"data_offsets":[0,524288]},"unet.bar.weight":{"dtype":"F32","shape":[256],"data_offsets":[524288,525312]}}
+    ;
+    const data = try a.alloc(u8, 525312);
+    @memset(data, 0x3C); // finite, non-zero for both BF16 and F32 interpretations
+
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    defer file.close(io);
+    var buf: [4096]u8 = undefined;
+    var fw = file.writer(io, &buf);
+    const w = &fw.interface;
+    try w.writeInt(u64, header.len, .little);
+    try w.writeAll(header);
+    try w.writeAll(data);
+    try w.flush();
+}
+
+test "predictOutputSize matches the actual written file size" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Unique dir per run: the test suite runs multiple binaries in parallel, all of
+    // which include this test, so a shared path would race (one deletes it mid-use).
+    const ts_ns: i96 = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    const token: u64 = @as(u64, @bitCast(@as(i64, @truncate(ts_ns)))) ^ @as(u64, @intFromPtr(&arena));
+    const dir = try std.fmt.allocPrint(a, "/tmp/ggufy_predict_size_test_{x}", .{token});
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const src_path = try std.fmt.allocPrint(a, "{s}/src.safetensors", .{dir});
+    try writeTestSafetensors(io, src_path, a);
+
+    const Case = struct { ft: types.FileType, dt: types.DataType, ext: []const u8 };
+    const cases = [_]Case{
+        .{ .ft = .gguf, .dt = .f16, .ext = "gguf" },
+        .{ .ft = .gguf, .dt = .q8_0, .ext = "gguf" },
+        .{ .ft = .gguf, .dt = .q4_k, .ext = "gguf" },
+        .{ .ft = .safetensors, .dt = .F16, .ext = "safetensors" },
+        .{ .ft = .safetensors, .dt = .SCALED_F8_E4M3, .ext = "safetensors" },
+        .{ .ft = .safetensors, .dt = .MXFP4, .ext = "safetensors" },
+        .{ .ft = .safetensors, .dt = .NVFP4, .ext = "safetensors" },
+    };
+
+    for (cases) |c| {
+        var f = try st.init(src_path, io, gpa, a, false, false);
+        defer f.deinit();
+
+        const opts = ConvertOptions{
+            .io = io,
+            .path = src_path,
+            .filetype = c.ft,
+            .datatype = c.dt,
+            .template_path = null,
+            .output_dir = dir,
+            .output_name = "out",
+            .threads = 1,
+            .skip_sensitivity = true,
+            .quantization_aggressiveness = 0,
+            .allow_unknown_arch = true,
+        };
+
+        const predicted = try predictOutputSize(&f, opts, gpa, a);
+        try convert(&f, opts, gpa, a);
+
+        const out_path = try std.fmt.allocPrint(a, "{s}/out.{s}", .{ dir, c.ext });
+        const actual = (try std.Io.Dir.cwd().statFile(io, out_path, .{})).size;
+        testing.expectEqual(predicted, actual) catch |err| {
+            std.log.err("size mismatch for {s} {s}: predicted={} actual={}", .{ @tagName(c.ft), @tagName(c.dt), predicted, actual });
+            return err;
+        };
+    }
 }

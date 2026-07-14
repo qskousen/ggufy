@@ -20,6 +20,35 @@ const Command = enum {
     version,
 };
 
+/// Format a byte count into a human-readable string (binary units) in `buf`.
+fn formatBytes(bytes: u64, buf: []u8) []const u8 {
+    const units = [_][]const u8{ "B", "KiB", "MiB", "GiB", "TiB" };
+    var value: f64 = @floatFromInt(bytes);
+    var unit: usize = 0;
+    while (value >= 1024.0 and unit < units.len - 1) : (unit += 1) value /= 1024.0;
+    return std.fmt.bufPrint(buf, "{d:.2} {s}", .{ value, units[unit] }) catch buf[0..0];
+}
+
+/// Predict and print the final output size for a convert, without writing anything.
+fn reportPredictedSize(
+    f: anytype,
+    opts: conv.ConvertOptions,
+    allocator: std.mem.Allocator,
+    arena_alloc: std.mem.Allocator,
+    stdout: *std.Io.Writer,
+) !void {
+    const size = conv.predictOutputSize(f, opts, allocator, arena_alloc) catch |err| {
+        if (err == error.UnknownArchitecture) {
+            std.log.err("Architecture not recognized. Pass --allow-unknown-arch (-u) to calculate size anyway. Results may be suboptimal.", .{});
+            return;
+        }
+        return err;
+    };
+    var buf: [32]u8 = undefined;
+    try stdout.print("Estimated output size: {s} ({d} bytes)\n", .{ formatBytes(size, &buf), size });
+    try stdout.flush();
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const start_ts = std.Io.Clock.Timestamp.now(io, .awake);
@@ -41,6 +70,8 @@ pub fn main(init: std.process.Init) !void {
         \\-u, --allow-unknown-arch       Allow converting files with unrecognized architectures. Results may be suboptimal.
         \\-U, --allow-upscale            Allow converting from a lower-precision (quantized/FP8) source to a higher-precision target. The extra bits are fill-in; no quality is recovered.
         \\-A, --arch <NAME>              Set the architecture name written to the GGUF metadata (GGUF output only). Free-form; does not affect conversion behaviour.
+        \\-R, --stochastic-rounding <SEED> Seed for INT4_CONVROT_SR stochastic rounding. Omit for the built-in default seed; pass 0 to disable (deterministic, for comparison). Ignored by other types.
+        \\-c, --calculate-size           With convert: compute and print the exact final output size without writing any file.
         \\<COMMAND>    Specify a command: header, tree, metadata, convert, template, version
         \\<FILENAME>   The file to use for input (not required for the version command)
     );
@@ -54,6 +85,7 @@ pub fn main(init: std.process.Init) !void {
         .INT = clap.parsers.int(usize, 10),
         .QTYPES = clap.parsers.string,
         .NAME = clap.parsers.string,
+        .SEED = clap.parsers.int(u64, 10),
     };
 
     // Initialize our diagnostics, which can be used for reporting useful errors.
@@ -125,6 +157,7 @@ pub fn main(init: std.process.Init) !void {
     const allow_unknown_arch = res.args.@"allow-unknown-arch" != 0;
     const allow_upscale = res.args.@"allow-upscale" != 0;
     const arch_override = res.args.arch;
+    const calculate_size = res.args.@"calculate-size" != 0;
 
     const allowed_quant_families: ?conv.QuantizationFamilies = if (res.args.@"use-quant-types") |s|
         conv.QuantizationFamilies.parse(s) catch {
@@ -133,6 +166,28 @@ pub fn main(init: std.process.Init) !void {
         }
     else
         null;
+
+    // Shared conversion options — used by both the real convert path and the
+    // --calculate-size prediction, so the predicted size matches what convert writes.
+    const convert_opts = conv.ConvertOptions{
+        .io = io,
+        .path = path,
+        .filetype = filetype,
+        .datatype = datatype,
+        .template_path = template_path,
+        .output_dir = output_dir,
+        .output_name = output_name,
+        .threads = threads,
+        .skip_sensitivity = skip_sensitivity,
+        .quantization_aggressiveness = quantization_aggressiveness,
+        .sensitivities_path = sensitivities_path,
+        .allowed_quant_families = allowed_quant_families,
+        .model_only = model_only,
+        .allow_unknown_arch = allow_unknown_arch,
+        .allow_upscale = allow_upscale,
+        .arch_override = arch_override,
+        .stochastic_rounding = res.args.@"stochastic-rounding",
+    };
 
     const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
 
@@ -161,24 +216,9 @@ pub fn main(init: std.process.Init) !void {
                     try f.printMetadata(stdout);
                 },
                 .convert => {
-                    conv.convert(&f, .{
-                        .io = io,
-                        .path = path,
-                        .filetype = filetype,
-                        .datatype = datatype,
-                        .template_path = template_path,
-                        .output_dir = output_dir,
-                        .output_name = output_name,
-                        .threads = threads,
-                        .skip_sensitivity = skip_sensitivity,
-                        .quantization_aggressiveness = quantization_aggressiveness,
-                        .sensitivities_path = sensitivities_path,
-                        .allowed_quant_families = allowed_quant_families,
-                        .model_only = model_only,
-                        .allow_unknown_arch = allow_unknown_arch,
-                        .allow_upscale = allow_upscale,
-                        .arch_override = arch_override,
-                    }, allocator, arena_alloc) catch |err| {
+                    if (calculate_size) {
+                        try reportPredictedSize(&f, convert_opts, allocator, arena_alloc, stdout);
+                    } else conv.convert(&f, convert_opts, allocator, arena_alloc) catch |err| {
                         if (err == error.UnknownArchitecture) {
                             std.log.err("Architecture not recognized. Pass --allow-unknown-arch (-u) to convert anyway. Results may be suboptimal.", .{});
                             return;
@@ -258,24 +298,9 @@ pub fn main(init: std.process.Init) !void {
                     try f.readGgufMetadata(stdout);
                 },
                 .convert => {
-                    conv.convert(&f, .{
-                        .io = io,
-                        .path = path,
-                        .filetype = filetype,
-                        .datatype = datatype,
-                        .template_path = template_path,
-                        .output_dir = output_dir,
-                        .output_name = output_name,
-                        .threads = threads,
-                        .skip_sensitivity = skip_sensitivity,
-                        .quantization_aggressiveness = quantization_aggressiveness,
-                        .sensitivities_path = sensitivities_path,
-                        .allowed_quant_families = allowed_quant_families,
-                        .model_only = model_only,
-                        .allow_unknown_arch = allow_unknown_arch,
-                        .allow_upscale = allow_upscale,
-                        .arch_override = arch_override,
-                    }, allocator, arena_alloc) catch |err| {
+                    if (calculate_size) {
+                        try reportPredictedSize(&f, convert_opts, allocator, arena_alloc, stdout);
+                    } else conv.convert(&f, convert_opts, allocator, arena_alloc) catch |err| {
                         if (err == error.UnknownArchitecture) {
                             std.log.err("Architecture not recognized. Pass --allow-unknown-arch (-u) to convert anyway. Results may be suboptimal.", .{});
                             return;

@@ -892,6 +892,24 @@ pub const Quantizer = struct {
         return if (@mod(fl, 2.0) == 0.0) fl else fl + 1.0;
     }
 
+    /// splitmix64 finalizer — a strong 64→64-bit hash used to derive per-element
+    /// randomness for stochastic rounding independently of thread scheduling.
+    fn splitmix64(x: u64) u64 {
+        var z = x +% 0x9E3779B97F4A7C15;
+        z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
+        z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
+        return z ^ (z >> 31);
+    }
+
+    /// Reproducible uniform draw in [0, 1) for element `idx` under `seed`. Hashing the
+    /// index before combining with the seed decorrelates neighbouring elements, so the
+    /// result depends only on (seed, idx) — never on how rows are split across threads.
+    fn stochasticUniform(seed: u64, idx: u64) f32 {
+        const h = splitmix64(seed ^ splitmix64(idx));
+        // Top 24 bits → an f32 in [0, 1) with full mantissa precision.
+        return @as(f32, @floatFromInt(h >> 40)) * 0x1p-24;
+    }
+
     pub const ConvrotInt8Data = struct {
         weight: []u8, // int8 bit patterns, [rows*cols]
         scale: []f32, // per-row scale, [rows]
@@ -986,16 +1004,22 @@ pub const Quantizer = struct {
     }
 
     // -------------------------------------------------------------------------
-    // int4 (symmetric per-row, optional ConvRot).
+    // int4 ConvRot (ComfyUI "convrot_w4a4").
     //
-    // A 4-bit sibling of the int8_tensorwise path: same per-row amax scaling and
-    // Hadamard convrot, but values are signed 4-bit ([-8, 7]) packed two per byte
-    // along the row (column) dimension. This is ggufy's own "int4_tensorwise"
-    // layout — no upstream ComfyUI loader exists for it. Packing: element 2k goes
-    // in the low nibble of packed byte k, element 2k+1 in the high nibble; each
-    // nibble is the value's two's-complement low 4 bits.
-    //   scale[r] = max(amax(row[r]) / 7, 1e-30)
-    //   q[r,c]   = clamp(round_half_even(row[r,c] / scale[r]), -8, 7)
+    // Symmetric per-row signed 4-bit weight, Hadamard-rotated group-wise before
+    // quantization, packed two nibbles per byte along the column dimension. Matches
+    // comfy_kitchen's quantize_convrot_w4a4_weight:
+    //   scale[r] = max(amax(row[r]) / 7, 1e-30)               (per output row)
+    //   q[r,c]   = clamp(round(row[r,c] / scale[r]), -7, 7)   (symmetric; -8 not emitted)
+    // Packing: element 2k → low nibble of byte k, element 2k+1 → high nibble; each nibble
+    // is the value's two's-complement low 4 bits (identical to _pack_int4_row_major).
+    //
+    // `stochastic_rounding` is a seed: 0 selects deterministic round-half-to-even, which is
+    // bit-compatible with comfy_kitchen's default (stochastic_rounding=0) and is the
+    // validation contract. Any nonzero value enables stochastic rounding — round(x) becomes
+    // floor(x + u), u ~ U[0,1) from a reproducible per-element PRNG keyed by (seed, index).
+    // This mirrors comfy_kitchen's stochastic path but uses ggufy's own RNG, so nonzero
+    // seeds are NOT bit-compatible with torch (statistically equivalent quality only).
     // `cols` must be even. Caller owns both slices.
     // -------------------------------------------------------------------------
 
@@ -1011,6 +1035,7 @@ pub const Quantizer = struct {
         cols: usize,
         convrot: bool,
         group_size: usize,
+        stochastic_rounding: u64,
         pool: *thread_pool_mod.ThreadPool,
     ) !Int4Data {
         if (input.len != rows * cols) return error.InputSizeMismatch;
@@ -1044,7 +1069,7 @@ pub const Quantizer = struct {
             var end = start + rows_per_thread;
             if (i == threads_u64 - 1) end += leftover;
             if (start == end) continue;
-            pool.spawnWg(&wg, quantizeInt4Rows, .{ work, weight, scale, cols, @as(usize, @intCast(start)), @as(usize, @intCast(end)) });
+            pool.spawnWg(&wg, quantizeInt4Rows, .{ work, weight, scale, cols, stochastic_rounding, @as(usize, @intCast(start)), @as(usize, @intCast(end)) });
         }
         wg.wait();
 
@@ -1056,6 +1081,7 @@ pub const Quantizer = struct {
         weight: []u8,
         scale: []f32,
         cols: usize,
+        stochastic_rounding: u64,
         start_row: usize,
         end_row: usize,
     ) void {
@@ -1068,18 +1094,27 @@ pub const Quantizer = struct {
             }
             const s: f32 = @max(amax / 7.0, 1e-30);
             scale[r] = s;
+            const row_base = r * cols; // flat element index of column 0, for the per-element RNG
             for (0..packed_cols) |pc| {
-                const lo = quantizeInt4Nibble(row[2 * pc], s);
-                const hi = quantizeInt4Nibble(row[2 * pc + 1], s);
+                const lo = quantizeInt4Nibble(row[2 * pc], s, stochastic_rounding, row_base + 2 * pc);
+                const hi = quantizeInt4Nibble(row[2 * pc + 1], s, stochastic_rounding, row_base + 2 * pc + 1);
                 weight[r * packed_cols + pc] = lo | (hi << 4);
             }
         }
     }
 
     /// Quantize one value to a signed-4-bit nibble (two's-complement low 4 bits).
-    fn quantizeInt4Nibble(v: f32, s: f32) u8 {
+    /// `seed` 0 → deterministic round-half-to-even; nonzero → stochastic rounding via a
+    /// reproducible per-element draw keyed by (seed, idx). Clamp is [-7, 7] (symmetric,
+    /// matching comfy_kitchen's _INT4_MAX contract — -8 is representable but never emitted).
+    fn quantizeInt4Nibble(v: f32, s: f32, seed: u64, idx: u64) u8 {
         // True division (not multiply-by-reciprocal) to match torch's x/scale bit-for-bit.
-        const q = std.math.clamp(roundHalfToEven(v / s), -8.0, 7.0);
+        const scaled = v / s;
+        const rounded = if (seed == 0)
+            roundHalfToEven(scaled)
+        else
+            @floor(scaled + stochasticUniform(seed, idx));
+        const q = std.math.clamp(rounded, -7.0, 7.0);
         return @as(u8, @bitCast(@as(i8, @intFromFloat(q)))) & 0x0F;
     }
 
@@ -1090,9 +1125,10 @@ pub const Quantizer = struct {
         rows: usize,
         cols: usize,
         group_size: usize,
+        stochastic_rounding: u64,
         pool: *thread_pool_mod.ThreadPool,
     ) !Int4Data {
-        return quantizeToInt4(allocator, input, rows, cols, true, group_size, pool);
+        return quantizeToInt4(allocator, input, rows, cols, true, group_size, stochastic_rounding, pool);
     }
 
     // -------------------------------------------------------------------------

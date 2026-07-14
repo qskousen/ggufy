@@ -68,8 +68,8 @@ pub const DataType = enum {
     NVFP4,
     INT8, // ComfyUI int8_tensorwise cluster: I8 weight + F32 per-row scale + comfy_quant (no rotation)
     INT8_CONVROT, // ComfyUI ConvRot cluster: I8 weight (Hadamard-rotated) + F32 per-row scale + comfy_quant
-    INT4, // int4_tensorwise cluster: U8 nibble-packed signed 4-bit weight + F32 per-row scale + comfy_quant (no rotation)
-    INT4_CONVROT, // ConvRot int4 cluster: nibble-packed signed 4-bit weight (Hadamard-rotated) + F32 per-row scale + comfy_quant
+    INT4_CONVROT, // ComfyUI convrot_w4a4 cluster: I8 nibble-packed signed 4-bit weight (Hadamard-rotated) + F32 per-row scale + comfy_quant
+    INT4_CONVROT_SR, // Same on-disk convrot_w4a4 format as INT4_CONVROT, but quantized with stochastic rounding ("SR")
     BF16,
     F16,
     F32,
@@ -177,7 +177,7 @@ pub const DataType = enum {
 
     pub fn formatType(self: DataType) FileType {
         return switch (self) {
-            .F8_E4M3, .F8_E5M2, .SCALED_F8_E4M3, .F4_E2M1, .MXFP4, .MXFP8_E4M3, .NVFP4, .INT8, .INT8_CONVROT, .INT4, .INT4_CONVROT, .BF16, .F16, .F32, .F64, .I8, .I16, .I32, .I64, .U8, .U16, .U32, .U64 => FileType.safetensors,
+            .F8_E4M3, .F8_E5M2, .SCALED_F8_E4M3, .F4_E2M1, .MXFP4, .MXFP8_E4M3, .NVFP4, .INT8, .INT8_CONVROT, .INT4_CONVROT, .INT4_CONVROT_SR, .BF16, .F16, .F32, .F64, .I8, .I16, .I32, .I64, .U8, .U16, .U32, .U64 => FileType.safetensors,
             .f32, .f16, .q4_0, .q4_1, .q4_2, .q4_3, .q5_0, .q5_1, .q8_0, .q8_1, .q2_k, .q3_k, .q4_k, .q5_k, .q6_k, .q8_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq1_s, .iq4_nl, .iq3_s, .iq2_s, .iq4_xs, .i8, .i16, .i32, .i64, .f64, .iq1_m, .bf16, .q4_0_4_4, .q4_0_4_8, .q4_0_8_8, .tq1_0, .tq2_0, .iq4_nl_4_4, .iq4_nl_4_8, .iq4_nl_8_8, .mxfp4, .nvfp4, .q1_0, .count => FileType.gguf,
         };
     }
@@ -188,7 +188,7 @@ pub const DataType = enum {
         // lower bound.
         if (self == .SCALED_F8_E4M3 or self == .INT8_CONVROT or self == .INT8) return n_elements;
         // INT4 clusters nibble-pack two weights per byte; report the packed weight bytes.
-        if (self == .INT4 or self == .INT4_CONVROT) return (n_elements + 1) / 2;
+        if (self == .INT4_CONVROT or self == .INT4_CONVROT_SR) return (n_elements + 1) / 2;
         return switch (self.formatType()) {
             .safetensors => {
                 const t = Safetensors.DType.fromString(@tagName(self)) catch unreachable;
