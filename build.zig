@@ -127,6 +127,24 @@ pub fn build(b: *std.Build) void {
     const run_bench = b.addRunArtifact(bench);
     b.step("bench", "Run F8 benchmarks").dependOn(&run_bench.step);
 
+    // --- Precision report ---
+
+    const precision = b.addExecutable(.{
+        .name = "precision",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/precision_main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ggml.h", .module = ggml_h_module },
+            },
+        }),
+    });
+    ggml.link(b, precision, target, optimize);
+    const run_precision = b.addRunArtifact(precision);
+    if (b.args) |args| run_precision.addArgs(args);
+    b.step("precision", "Run the quantization precision report").dependOn(&run_precision.step);
+
     const bench_eff = b.addExecutable(.{
         .name = "bench-efficiency",
         .root_module = b.createModule(.{
@@ -203,6 +221,28 @@ pub fn build(b: *std.Build) void {
     });
     ggml.link(b, convert_test, target, optimize);
     test_step.dependOn(&b.addRunArtifact(convert_test).step);
+
+    const precision_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/precision_harness.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ggml.h", .module = ggml_h_module },
+            },
+        }),
+    });
+    ggml.link(b, precision_test, target, optimize);
+    test_step.dependOn(&b.addRunArtifact(precision_test).step);
+
+    const precision_metrics_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/PrecisionMetrics.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(precision_metrics_test).step);
 }
 
 fn get_git_version(allocator: std.mem.Allocator, io: std.Io) ![]const u8 {
