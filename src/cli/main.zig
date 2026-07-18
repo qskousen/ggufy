@@ -238,11 +238,12 @@ pub fn main(init: std.process.Init) !void {
                     var out_writer = out_file.writer(io, &writer_buffer);
                     var writer = &out_writer.interface;
                     const arch_ptr = try imagearch.detectArchFromTensors(f.tensors.items, allocator);
-                    try conv.writeTemplateFromTensors(
-                        f.tensors.items,
+                    try conv.writeTemplateFromFile(
+                        &f,
                         arch_ptr,
                         true, // reverse dims: safetensors → GGUF template convention
                         writer,
+                        allocator,
                         arena_alloc,
                     );
                     try writer.flush();

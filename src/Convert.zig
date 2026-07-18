@@ -225,7 +225,7 @@ pub fn prepareConversion(
 
     // --- Group and collapse NVFP4/FP8 clusters --------------------------------
     var groups = try TensorClusters.groupClusters(f, arena_alloc, allocator);
-    try TensorClusters.collapseModelTensors(&model_tensors, &groups, arena_alloc);
+    try TensorClusters.collapseModelTensors(&model_tensors, &groups, .dequant, arena_alloc);
 
     // --- Assign quantization types (template or auto) -------------------------
     var template_metadata: ?std.json.ObjectMap = null;
@@ -249,6 +249,10 @@ pub fn prepareConversion(
             }
         }.lessThan);
     }
+
+    // --- Assign final on-disk sizes/offsets (both template and auto paths) ----
+    // Must run after any reordering so offsets describe the final tensor order.
+    try assignOutputLayout(&model_tensors, opts, arena_alloc);
 
     return .{
         .arch = arch,
@@ -644,7 +648,6 @@ fn assignQuantTypes(
         }
     }
 
-    var offset: u64 = 0;
     for (model_tensors.items) |*t| {
         var num_elements: u64 = 1;
         for (t.dims) |d| num_elements *= d;
@@ -675,6 +678,35 @@ fn assignQuantTypes(
             try dims_buf.print(arena_alloc, "{}", .{d});
         }
         std.log.debug("{s}: Calculated size {} for type {s} with num elements {} with dims [{s}]", .{ t.name, t.size, t.type, num_elements, dims_buf.items });
+    }
+}
+
+/// Assign every tensor's final on-disk `offset` (and, for ComfyUI cluster dest types on
+/// safetensors, its full cluster `size`) in list order. Runs for BOTH the template and
+/// auto-assign paths — and after any reordering — so output offsets are always a fresh,
+/// contiguous layout instead of meaningless inherited source offsets.
+///
+/// Cluster dest types expand on disk into `[weight][scale...][comfy_quant]`; their recorded
+/// size must be the full cluster size (`clusterWriteSize`), not the packed-weight-only size
+/// that `DataType.calcSizeInBytes` returns. The auto path already sets this in
+/// `assignTensorType`, but the template path (`applyTemplateEntry`) does not, so we make it
+/// authoritative here for both.
+fn assignOutputLayout(
+    model_tensors: *std.ArrayList(types.Tensor),
+    opts: ConvertOptions,
+    arena_alloc: std.mem.Allocator,
+) !void {
+    var offset: u64 = 0;
+    for (model_tensors.items) |*t| {
+        if (opts.filetype == .safetensors) {
+            if (types.DataType.fromString(t.type)) |dt| {
+                if (TensorClusters.isClusterType(dt)) {
+                    if (try TensorClusters.clusterWriteSize(arena_alloc, dt, t.dims)) |cluster_size| {
+                        t.size = cluster_size;
+                    }
+                }
+            } else |_| {}
+        }
 
         // padding only applies to gguf
         if (opts.filetype == .gguf) {
@@ -1271,6 +1303,31 @@ fn filterTensorsForExport(
 /// Pass `reverse_dims = true` for SafeTensors source files so that
 /// applyTemplate (which always un-reverses dimensions) round-trips correctly.
 /// GGUF tensor structs already store dims in GGUF (reversed) order — pass false.
+/// Generate a JSON template from an open source file (`Safetensors`/`Gguf`), collapsing
+/// ComfyUI cluster layouts (`.weight` + `.weight_scale` + `.comfy_quant`) into a single
+/// logical entry carrying the cluster's quant type (INT8_CONVROT, NVFP4, ...). This is
+/// what makes a template round-trip: without it, a template exported from a cluster model
+/// lists the raw sub-tensors as plain `I8`/`F32`/`U8`, which `convert` cannot re-ingest.
+///
+/// `f` must be an opened source file object (exposing `tensors`, `openFileForTensor`,
+/// `getSourceMetadata`) so cluster detection can read the `.comfy_quant` markers.
+pub fn writeTemplateFromFile(
+    f: anytype,
+    arch_opt: ?*const imagearch.Arch,
+    reverse_dims: bool,
+    writer: *std.Io.Writer,
+    allocator: std.mem.Allocator,
+    arena_alloc: std.mem.Allocator,
+) !void {
+    var tensors = try std.ArrayList(types.Tensor).initCapacity(arena_alloc, f.tensors.items.len);
+    for (f.tensors.items) |t| try tensors.append(arena_alloc, t);
+
+    var groups = try TensorClusters.groupClusters(f, arena_alloc, allocator);
+    try TensorClusters.collapseModelTensors(&tensors, &groups, .preserve_quant, arena_alloc);
+
+    try writeTemplateFromTensors(tensors.items, arch_opt, reverse_dims, writer, arena_alloc);
+}
+
 pub fn writeTemplateFromTensors(
     tensors: []const types.Tensor,
     arch_opt: ?*const imagearch.Arch,
@@ -1480,6 +1537,39 @@ fn testOpts(datatype: types.DataType) ConvertOptions {
         .skip_sensitivity = true,
         .quantization_aggressiveness = 0,
     };
+}
+
+test "assignOutputLayout: contiguous offsets and full cluster size for a template-typed cluster" {
+    const a = testing.allocator;
+
+    // Mimics the template path: a cluster dest type whose size was NOT pre-expanded
+    // (applyTemplateEntry leaves it at the packed-weight size / zero), plus plain tensors
+    // whose sizes are already correct. assignOutputLayout must set the full cluster size
+    // and lay every tensor out contiguously from offset 0.
+    var dims_bf = [_]usize{ 4, 4 };
+    var dims_cluster = [_]usize{ 2048, 1024 };
+    var dims_bias = [_]usize{10};
+    var model: std.ArrayList(types.Tensor) = .empty;
+    defer model.deinit(a);
+    try model.append(a, .{ .name = "a.weight", .type = "BF16", .dims = &dims_bf, .size = 32, .offset = 999 });
+    try model.append(a, .{ .name = "b.attn.q.weight", .type = "INT8_CONVROT", .dims = &dims_cluster, .size = 0, .offset = 999 });
+    try model.append(a, .{ .name = "c.bias", .type = "F32", .dims = &dims_bias, .size = 40, .offset = 999 });
+
+    var opts = testOpts(.F16);
+    opts.filetype = .safetensors;
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    try assignOutputLayout(&model, opts, arena.allocator());
+
+    // Full int8_convrot cluster size = I8 weight + F32 per-row scale + comfy_quant JSON.
+    const expected_cluster_size: u64 = 2048 * 1024 + 2048 * 4 + TensorClusters.int8_convrot_comfy_json.len;
+    try testing.expectEqual(expected_cluster_size, model.items[1].size);
+
+    // Offsets are a fresh, contiguous layout starting at 0 (source offsets discarded).
+    try testing.expectEqual(@as(u64, 0), model.items[0].offset);
+    try testing.expectEqual(@as(u64, 32), model.items[1].offset);
+    try testing.expectEqual(@as(u64, 32 + expected_cluster_size), model.items[2].offset);
 }
 
 test "assignTensorType: 1D tensors are never block-quantized" {

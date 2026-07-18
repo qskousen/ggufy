@@ -208,16 +208,35 @@ pub fn doExportTemplate(arena_alloc: std.mem.Allocator, state: *guiState.State) 
     var file_writer = out_file.writer(state.io, &write_buf);
     const writer = &file_writer.interface;
 
-    conv.writeTemplateFromTensors(
-        loaded_file.tensors.items,
-        arch_opt,
-        reverse_dims,
-        writer,
-        arena_alloc,
-    ) catch |err| {
-        setToolStatus(state, true, "Export failed: {s}", .{@errorName(err)});
-        return;
-    };
+    // Re-open the source file so cluster detection can read `.comfy_quant` markers and
+    // collapse ComfyUI cluster layouts into a single logical quant-typed entry — the
+    // TensorFile loaded in `state` holds no open handle. The arena backs both temporary
+    // allocations and the file object for this one-shot export.
+    const src_path = state.file_selected.?;
+    switch (loaded_file.type) {
+        .safetensors => {
+            var f = ggufy.safetensor.init(src_path, state.io, arena_alloc, arena_alloc, false, false) catch |err| {
+                setToolStatus(state, true, "Export failed: {s}", .{@errorName(err)});
+                return;
+            };
+            defer f.deinit();
+            conv.writeTemplateFromFile(&f, arch_opt, reverse_dims, writer, arena_alloc, arena_alloc) catch |err| {
+                setToolStatus(state, true, "Export failed: {s}", .{@errorName(err)});
+                return;
+            };
+        },
+        .gguf => {
+            var f = ggufy.gguf.init(src_path, state.io, arena_alloc, arena_alloc, false) catch |err| {
+                setToolStatus(state, true, "Export failed: {s}", .{@errorName(err)});
+                return;
+            };
+            defer f.deinit();
+            conv.writeTemplateFromFile(&f, arch_opt, reverse_dims, writer, arena_alloc, arena_alloc) catch |err| {
+                setToolStatus(state, true, "Export failed: {s}", .{@errorName(err)});
+                return;
+            };
+        },
+    }
     writer.flush() catch {};
     setToolStatus(state, false, "Template exported to {s}", .{std.fs.path.basename(path)});
 }

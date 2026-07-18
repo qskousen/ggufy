@@ -1159,11 +1159,31 @@ pub fn dequantSourceToF32(
     return null;
 }
 
-/// Replace cluster physical tensors in `model_tensors` with single logical BF16 tensors.
+/// How `collapseModelTensors` types the single logical tensor that replaces each cluster.
+pub const CollapseMode = enum {
+    /// Collapse to a BF16 weight — the dequantized target used by the conversion pipeline,
+    /// which re-quantizes from this float representation.
+    dequant,
+    /// Collapse to a weight carrying the cluster's *logical* quant type (INT8_CONVROT,
+    /// NVFP4, ...). Used by template export so a template generated from a ComfyUI
+    /// cluster model round-trips back through `convert` instead of emitting the raw
+    /// on-disk sub-tensors (I8 weight + weight_scale + comfy_quant) that `convert`
+    /// cannot re-ingest.
+    preserve_quant,
+};
+
+/// Replace cluster physical tensors in `model_tensors` with a single logical tensor.
 /// Companion tensors (weight_scale, weight_scale_2, comfy_quant) are removed from the list.
+/// `mode` selects the collapsed weight's type: `.dequant` → BF16 (conversion input),
+/// `.preserve_quant` → the cluster's logical quant type (template export).
+///
+/// Note: in `.preserve_quant` mode the collapsed `size` field is left at the BF16 estimate.
+/// It is intentionally not the true cluster byte size — the only consumer (template export)
+/// serializes shape + type only and never reads `size`.
 pub fn collapseModelTensors(
     model_tensors: *std.ArrayList(types.Tensor),
     groups: *const GroupResult,
+    mode: CollapseMode,
     arena_alloc: std.mem.Allocator,
 ) !void {
     if (groups.fp4_clusters.len == 0 and groups.float8_clusters.len == 0 and
@@ -1179,7 +1199,7 @@ pub fn collapseModelTensors(
             if (nameSuffixMatch(cluster.weight.name, t.name)) {
                 var new_t = t;
                 new_t.dims = try arena_alloc.dupe(usize, &[_]usize{ cluster.rows, cluster.cols });
-                new_t.type = "BF16";
+                new_t.type = if (mode == .preserve_quant) "NVFP4" else "BF16";
                 new_t.size = cluster.rows * cluster.cols * 2;
                 try new_tensors.append(arena_alloc,new_t);
                 handled = true;
@@ -1198,7 +1218,7 @@ pub fn collapseModelTensors(
             for (groups.float8_clusters) |cluster| {
                 if (nameSuffixMatch(cluster.weight.name, t.name)) {
                     var new_t = t;
-                    new_t.type = "BF16";
+                    new_t.type = if (mode == .preserve_quant) "SCALED_F8_E4M3" else "BF16";
                     var n: usize = 1;
                     for (t.dims) |d| n *= d;
                     new_t.size = n * 2;
@@ -1225,7 +1245,7 @@ pub fn collapseModelTensors(
                 if (nameSuffixMatch(cluster.weight.name, t.name)) {
                     var new_t = t;
                     new_t.dims = try arena_alloc.dupe(usize, &[_]usize{ cluster.rows, cluster.cols });
-                    new_t.type = "BF16";
+                    new_t.type = if (mode == .preserve_quant) "MXFP4" else "BF16";
                     new_t.size = cluster.rows * cluster.cols * 2;
                     try new_tensors.append(arena_alloc,new_t);
                     handled = true;
@@ -1244,7 +1264,7 @@ pub fn collapseModelTensors(
             for (groups.mxfp8_clusters) |cluster| {
                 if (nameSuffixMatch(cluster.weight.name, t.name)) {
                     var new_t = t;
-                    new_t.type = "BF16";
+                    new_t.type = if (mode == .preserve_quant) "MXFP8_E4M3" else "BF16";
                     var n: usize = 1;
                     for (t.dims) |d| n *= d;
                     new_t.size = n * 2;
@@ -1266,7 +1286,10 @@ pub fn collapseModelTensors(
                 if (nameSuffixMatch(cluster.weight.name, t.name)) {
                     var new_t = t;
                     new_t.dims = try arena_alloc.dupe(usize, &[_]usize{ cluster.rows, cluster.cols });
-                    new_t.type = "BF16";
+                    new_t.type = if (mode == .preserve_quant)
+                        (if (cluster.convrot) "INT8_CONVROT" else "INT8")
+                    else
+                        "BF16";
                     new_t.size = cluster.rows * cluster.cols * 2;
                     try new_tensors.append(arena_alloc, new_t);
                     handled = true;
@@ -1286,7 +1309,7 @@ pub fn collapseModelTensors(
                 if (nameSuffixMatch(cluster.weight.name, t.name)) {
                     var new_t = t;
                     new_t.dims = try arena_alloc.dupe(usize, &[_]usize{ cluster.rows, cluster.cols });
-                    new_t.type = "BF16";
+                    new_t.type = if (mode == .preserve_quant) "INT4_CONVROT" else "BF16";
                     new_t.size = cluster.rows * cluster.cols * 2;
                     try new_tensors.append(arena_alloc, new_t);
                     handled = true;
@@ -2344,4 +2367,122 @@ test "NVFP4 dequant: fixture from real ComfyUI model (128×256 slice)" {
         }
     }
     try testing.expectEqual(@as(usize, 0), mismatches);
+}
+
+// Helper for the collapse tests: a physical tensor referenced by name only.
+fn tc_named(name: []const u8) types.Tensor {
+    return .{ .name = name, .type = "", .dims = &[_]usize{}, .size = 0, .offset = 0 };
+}
+
+test "collapseModelTensors preserve_quant: cluster weight keeps its logical quant type, sidecars dropped" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Two int8 layers (one ConvRot, one plain) plus an untouched passthrough tensor.
+    // This mirrors a ComfyUI int8 model: each layer stores weight + weight_scale + comfy_quant.
+    var dims_a = [_]usize{ 2048, 1024 };
+    var dims_b = [_]usize{ 512, 768 };
+    var dims_norm = [_]usize{2048};
+    var model: std.ArrayList(types.Tensor) = .empty;
+    try model.append(a, .{ .name = "blocks.0.attn.q_proj.weight", .type = "I8", .dims = &dims_a, .size = 0, .offset = 0 });
+    try model.append(a, .{ .name = "blocks.0.attn.q_proj.weight_scale", .type = "F32", .dims = &dims_a, .size = 0, .offset = 0 });
+    try model.append(a, .{ .name = "blocks.0.attn.q_proj.comfy_quant", .type = "U8", .dims = &dims_a, .size = 0, .offset = 0 });
+    try model.append(a, .{ .name = "blocks.0.mlp.fc.weight", .type = "I8", .dims = &dims_b, .size = 0, .offset = 0 });
+    try model.append(a, .{ .name = "blocks.0.mlp.fc.weight_scale", .type = "F32", .dims = &dims_b, .size = 0, .offset = 0 });
+    try model.append(a, .{ .name = "blocks.0.mlp.fc.comfy_quant", .type = "U8", .dims = &dims_b, .size = 0, .offset = 0 });
+    try model.append(a, .{ .name = "blocks.0.norm.weight", .type = "BF16", .dims = &dims_norm, .size = 0, .offset = 0 });
+
+    var int8_clusters = [_]Int8ConvrotCluster{
+        .{
+            .base_name = "blocks.0.attn.q_proj",
+            .weight = tc_named("blocks.0.attn.q_proj.weight"),
+            .weight_scale = tc_named("blocks.0.attn.q_proj.weight_scale"),
+            .comfy_quant = tc_named("blocks.0.attn.q_proj.comfy_quant"),
+            .rows = 2048,
+            .cols = 1024,
+            .convrot = true,
+            .group_size = 256,
+        },
+        .{
+            .base_name = "blocks.0.mlp.fc",
+            .weight = tc_named("blocks.0.mlp.fc.weight"),
+            .weight_scale = tc_named("blocks.0.mlp.fc.weight_scale"),
+            .comfy_quant = tc_named("blocks.0.mlp.fc.comfy_quant"),
+            .rows = 512,
+            .cols = 768,
+            .convrot = false,
+            .group_size = 256,
+        },
+    };
+    const groups = GroupResult{
+        .fp4_clusters = &.{},
+        .float8_clusters = &.{},
+        .mxfp4_clusters = &.{},
+        .mxfp8_clusters = &.{},
+        .int8_convrot_clusters = &int8_clusters,
+        .int4_clusters = &.{},
+    };
+
+    try collapseModelTensors(&model, &groups, .preserve_quant, a);
+
+    // sidecars gone; each cluster collapsed to one weight with its logical quant type.
+    try testing.expectEqual(@as(usize, 3), model.items.len);
+
+    const q = model.items[0];
+    try testing.expectEqualStrings("blocks.0.attn.q_proj.weight", q.name);
+    try testing.expectEqualStrings("INT8_CONVROT", q.type); // convrot=true
+    try testing.expectEqual(@as(usize, 2048), q.dims[0]);
+    try testing.expectEqual(@as(usize, 1024), q.dims[1]);
+
+    const fc = model.items[1];
+    try testing.expectEqualStrings("blocks.0.mlp.fc.weight", fc.name);
+    try testing.expectEqualStrings("INT8", fc.type); // convrot=false → plain int8_tensorwise
+
+    const norm = model.items[2];
+    try testing.expectEqualStrings("blocks.0.norm.weight", norm.name);
+    try testing.expectEqualStrings("BF16", norm.type); // passthrough untouched
+
+    // No leftover .weight_scale / .comfy_quant entries.
+    for (model.items) |t| {
+        try testing.expect(!std.mem.endsWith(u8, t.name, ".weight_scale"));
+        try testing.expect(!std.mem.endsWith(u8, t.name, ".comfy_quant"));
+    }
+}
+
+test "collapseModelTensors dequant: same clusters collapse to BF16 (conversion path unchanged)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var dims_a = [_]usize{ 2048, 1024 };
+    var model: std.ArrayList(types.Tensor) = .empty;
+    try model.append(a, .{ .name = "blocks.0.attn.q_proj.weight", .type = "I8", .dims = &dims_a, .size = 0, .offset = 0 });
+    try model.append(a, .{ .name = "blocks.0.attn.q_proj.weight_scale", .type = "F32", .dims = &dims_a, .size = 0, .offset = 0 });
+    try model.append(a, .{ .name = "blocks.0.attn.q_proj.comfy_quant", .type = "U8", .dims = &dims_a, .size = 0, .offset = 0 });
+
+    var int8_clusters = [_]Int8ConvrotCluster{.{
+        .base_name = "blocks.0.attn.q_proj",
+        .weight = tc_named("blocks.0.attn.q_proj.weight"),
+        .weight_scale = tc_named("blocks.0.attn.q_proj.weight_scale"),
+        .comfy_quant = tc_named("blocks.0.attn.q_proj.comfy_quant"),
+        .rows = 2048,
+        .cols = 1024,
+        .convrot = true,
+        .group_size = 256,
+    }};
+    const groups = GroupResult{
+        .fp4_clusters = &.{},
+        .float8_clusters = &.{},
+        .mxfp4_clusters = &.{},
+        .mxfp8_clusters = &.{},
+        .int8_convrot_clusters = &int8_clusters,
+        .int4_clusters = &.{},
+    };
+
+    try collapseModelTensors(&model, &groups, .dequant, a);
+
+    try testing.expectEqual(@as(usize, 1), model.items.len);
+    try testing.expectEqualStrings("BF16", model.items[0].type);
+    try testing.expectEqual(@as(u64, 2048 * 1024 * 2), model.items[0].size);
 }
