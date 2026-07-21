@@ -1661,6 +1661,9 @@ fn writeTestSafetensors(io: std.Io, path: []const u8, a: std.mem.Allocator) !voi
 }
 
 test "predictOutputSize matches the actual written file size" {
+    // The synthetic model has no recognizable architecture, so conversion logs an expected
+    // "unknown architecture" warning. Silence it: a passing test must not write to stderr.
+    testing.log_level = .err;
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();

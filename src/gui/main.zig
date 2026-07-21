@@ -106,8 +106,14 @@ pub fn main(init: std.process.Init) !void {
     main_loop: while (true) {
         const nstime = win.beginWait(interrupted);
 
-        // File load trigger
-        if (state.file_selected_ready.load(.acquire)) {
+        // File load trigger. Only consume the request when idle: starting a new
+        // load resets the shared arena and deinits loaded_file, which would be a
+        // use-after-free if a load or conversion worker is still using them. If
+        // busy, leave file_selected_ready set so the load fires once we're idle.
+        if (state.file_selected_ready.load(.acquire) and
+            state.load_state.load(.acquire) != .loading and
+            state.convert_state.load(.acquire) != .converting)
+        {
             std.log.debug("Loading file: {s}", .{state.file_selected.?});
             state.file_selected_ready.store(false, .release);
             state.load_state.store(.loading, .release);
@@ -201,7 +207,13 @@ fn gui_frame() bool {
             defer fw.deinit();
 
             if (dvui.menuItemLabel(@src(), "Open File...", .{}, .{ .expand = .horizontal }) != null) {
-                if (!state.file_dialog_open) {
+                // Don't open the dialog while a load/conversion is in flight: its
+                // callback writes file_selected_buf that the worker thread is still
+                // reading, and would queue a load that resets the shared arena out
+                // from under that worker. (Drops are gated the same way in dropEventWatch.)
+                const busy = state.load_state.load(.acquire) == .loading or
+                    state.convert_state.load(.acquire) == .converting;
+                if (!state.file_dialog_open and !busy) {
                     state.file_dialog_open = true;
                     SDLBackend.c.SDL_ShowOpenFileDialog(
                         fileHandling.fileDialogCallback,

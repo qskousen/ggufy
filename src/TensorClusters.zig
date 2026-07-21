@@ -158,6 +158,27 @@ pub fn nameSuffixMatch(full_name: []const u8, stripped: []const u8) bool {
         std.mem.endsWith(u8, full_name, stripped);
 }
 
+/// Among `tensors` (any struct with a `.name: []const u8`), pick the single best source
+/// match for a stripped dest `name`, returning its index or null if none match. An exact
+/// name match wins outright; otherwise the shortest-named dot-suffix match — fewest prefix
+/// chars means the most specific tensor. This disambiguates a stripped dest that
+/// suffix-matches several sources: e.g. Anima strips the "net." prefix, so
+/// "blocks.N.cross_attn.q_norm.weight" matches both the trunk
+/// "net.blocks.N.cross_attn.q_norm.weight" and the adapter twin
+/// "net.llm_adapter.blocks.N.cross_attn.q_norm.weight"; the shorter trunk name is correct
+/// (the adapter tensor has its own "llm_adapter."-prefixed dest). Picking the first match
+/// in iteration order instead would depend on file layout and could load/write the wrong
+/// tensor — or, in the plain write path, write both and corrupt every later offset.
+pub fn bestSourceMatch(tensors: anytype, name: []const u8) ?usize {
+    var best: ?usize = null;
+    for (tensors, 0..) |t, i| {
+        if (std.mem.eql(u8, t.name, name)) return i;
+        if (!nameSuffixMatch(t.name, name)) continue;
+        if (best == null or t.name.len < tensors[best.?].name.len) best = i;
+    }
+    return best;
+}
+
 /// Read a source tensor's raw bytes into a freshly-allocated buffer (caller owns).
 fn readTensorBytes(source: anytype, tensor: types.Tensor, allocator: std.mem.Allocator) ![]u8 {
     const file = try source.openFileForTensor(tensor.name);
@@ -1463,9 +1484,10 @@ pub fn loadMatchingSourceAsF32(
     n_elements: u64,
     pool: *thread_pool_mod.ThreadPool,
 ) !?struct { data: []f32, source_type: []const u8 } {
-    for (source.tensors.items) |source_tensor| {
-        if (!nameSuffixMatch(source_tensor.name, name)) continue;
-
+    // A stripped dest `name` can suffix-match more than one source; `bestSourceMatch`
+    // picks the single correct one (exact, else shortest/most-specific suffix match).
+    if (bestSourceMatch(source.tensors.items, name)) |idx| {
+        const source_tensor = source.tensors.items[idx];
         const source_dtype = try types.DataType.fromString(source_tensor.type);
         const source_size: usize = @intCast(source_dtype.calcSizeInBytes(n_elements));
         const src_bytes = try readTensorBytesSized(source, source_tensor, allocator, source_size);
@@ -1577,6 +1599,35 @@ pub fn writeClusterData(
 // =============================================================================
 
 const testing = std.testing;
+
+test "bestSourceMatch disambiguates stripped dest across trunk and adapter twins" {
+    const Named = struct { name: []const u8 };
+    // Anima-shaped source: "net." trunk plus a deeper "net.llm_adapter." twin. A stripped
+    // dest suffix-matches both; the shorter trunk name must win, and be chosen exactly once.
+    const sources = [_]Named{
+        .{ .name = "net.blocks.1.cross_attn.q_norm.weight" },
+        .{ .name = "net.llm_adapter.blocks.1.cross_attn.q_norm.weight" },
+    };
+    try testing.expectEqual(@as(?usize, 0), bestSourceMatch(&sources, "blocks.1.cross_attn.q_norm.weight"));
+    // The adapter dest (its own stripped name) resolves to the twin, not the trunk.
+    try testing.expectEqual(@as(?usize, 1), bestSourceMatch(&sources, "llm_adapter.blocks.1.cross_attn.q_norm.weight"));
+
+    // Order-independence: shortest suffix match wins regardless of iteration order.
+    const reversed = [_]Named{ sources[1], sources[0] };
+    try testing.expectEqual(@as(?usize, 1), bestSourceMatch(&reversed, "blocks.1.cross_attn.q_norm.weight"));
+
+    // Exact match wins outright even when a suffix match is present.
+    const with_exact = [_]Named{
+        .{ .name = "net.blocks.1.cross_attn.q_norm.weight" },
+        .{ .name = "blocks.1.cross_attn.q_norm.weight" },
+    };
+    try testing.expectEqual(@as(?usize, 1), bestSourceMatch(&with_exact, "blocks.1.cross_attn.q_norm.weight"));
+
+    // No match returns null (and a bare substring that isn't a dot-suffix must not match).
+    try testing.expectEqual(@as(?usize, null), bestSourceMatch(&sources, "blocks.9.cross_attn.q_norm.weight"));
+    const substr = [_]Named{.{ .name = "xblocks.1.cross_attn.q_norm.weight" }};
+    try testing.expectEqual(@as(?usize, null), bestSourceMatch(&substr, "blocks.1.cross_attn.q_norm.weight"));
+}
 
 const fixture_dir = "src/test_fixtures";
 
@@ -1711,6 +1762,8 @@ test "resolveClusterBase: ambiguous prefix-less key matching multiple tensors re
     // A prefix-less key that suffix-matches more than one `.weight` tensor is ambiguous; rather
     // than silently binding to whichever comes first, resolveClusterBase returns null so the
     // caller skips the layer (warned). A fully-qualified key still resolves unambiguously.
+    // The skip logs an expected warning; silence it so a passing test writes nothing to stderr.
+    testing.log_level = .err;
     const T = types.Tensor;
     var dims = [_]usize{};
     var tensors = [_]T{
@@ -1738,6 +1791,9 @@ test "groupFromQuantMetadata: routes every supported header scheme to its cluste
     // layer to {format, ...}, and each supported scheme must land in its own cluster list with a
     // null comfy_quant (no per-tensor marker in this layout). Grouping reads only tensor metadata
     // (names/dims/size), so a lightweight mock source suffices — no file IO.
+    // One fixture layer uses an unsupported scheme and is skipped with an expected warning;
+    // silence it so a passing test writes nothing to stderr.
+    testing.log_level = .err;
     const T = types.Tensor;
     const alloc = std.testing.allocator;
 

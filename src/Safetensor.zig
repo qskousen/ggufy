@@ -948,43 +948,48 @@ pub fn saveWithSTData(self: Safetensors, source: anytype, threads: usize, callba
         }
 
         if (!matched) {
-            // Normal single-tensor path
-            for (source.tensors.items) |source_tensor| {
-                if (std.mem.eql(u8, source_tensor.name, t.name) or
-                    (source_tensor.name.len > t.name.len and
-                        source_tensor.name[source_tensor.name.len - t.name.len - 1] == '.' and
-                        std.mem.endsWith(u8, source_tensor.name, t.name)))
-                    {
-                        matched = true;
-                        std.log.info("Writing tensor data for tensor {}/{} {s} - {s} to {s}, {} elements", .{
-                            count,
-                            total_tensors,
-                            t.name,
-                            source_tensor.type,
-                            t.type,
-                            elements,
-                        });
-                        const source_dtype = try types.DataType.fromString(source_tensor.type);
-                        var n_elements_st: u64 = 1;
-                        for (t.dims) |d| n_elements_st *= d;
-                        const source_size_st: usize = switch (source_dtype.formatType()) {
-                            .safetensors => blk: {
-                                const stype = try Safetensors.DType.fromString(@tagName(source_dtype));
-                                break :blk stype.calcSizeInBytes(n_elements_st);
-                            },
-                            .gguf => blk: {
-                                const stype = try gguf.GgmlType.fromString(@tagName(source_dtype));
-                                break :blk stype.calcSizeInBytes(n_elements_st);
-                            },
-                        };
-                        const source_file_st = try source.openFileForTensor(source_tensor.name);
-                        const src_bytes_st = try self.allocator.alloc(u8, source_size_st);
-                        defer self.allocator.free(src_bytes_st);
-                        _ = try source_file_st.readPositionalAll(source.io, src_bytes_st, source_tensor.offset + source.current_data_begin);
-                        try self.writeTensorData(t, source_dtype, src_bytes_st, &writer.interface, &pool);
-                        callbacks.reportProgress(count, total_tensors, t.name, source_tensor.type, t.type, @intCast(elements));
-                        count += 1;
-                    }
+            // Normal single-tensor path. A dest name may suffix-match more than one
+            // source: e.g. Anima strips the "net." prefix, so dest
+            // "blocks.N.cross_attn.q_norm.weight" suffix-matches both the trunk
+            // "net.blocks.N.cross_attn.q_norm.weight" AND the adapter twin
+            // "net.llm_adapter.blocks.N.cross_attn.q_norm.weight". Select exactly ONE
+            // source — an exact name match wins outright, otherwise the shortest-named
+            // suffix match (fewest prefix chars = most specific, i.e. the trunk tensor
+            // rather than a deeper-namespaced twin) — and write it once. Writing every
+            // match (the previous behavior) duplicated the tensor's bytes and shifted
+            // every subsequent tensor's on-disk offset, corrupting the file.
+            const best_idx = TensorClusters.bestSourceMatch(source.tensors.items, t.name);
+            if (best_idx) |idx| {
+                const source_tensor = source.tensors.items[idx];
+                matched = true;
+                std.log.info("Writing tensor data for tensor {}/{} {s} - {s} to {s}, {} elements", .{
+                    count,
+                    total_tensors,
+                    t.name,
+                    source_tensor.type,
+                    t.type,
+                    elements,
+                });
+                const source_dtype = try types.DataType.fromString(source_tensor.type);
+                var n_elements_st: u64 = 1;
+                for (t.dims) |d| n_elements_st *= d;
+                const source_size_st: usize = switch (source_dtype.formatType()) {
+                    .safetensors => blk: {
+                        const stype = try Safetensors.DType.fromString(@tagName(source_dtype));
+                        break :blk stype.calcSizeInBytes(n_elements_st);
+                    },
+                    .gguf => blk: {
+                        const stype = try gguf.GgmlType.fromString(@tagName(source_dtype));
+                        break :blk stype.calcSizeInBytes(n_elements_st);
+                    },
+                };
+                const source_file_st = try source.openFileForTensor(source_tensor.name);
+                const src_bytes_st = try self.allocator.alloc(u8, source_size_st);
+                defer self.allocator.free(src_bytes_st);
+                _ = try source_file_st.readPositionalAll(source.io, src_bytes_st, source_tensor.offset + source.current_data_begin);
+                try self.writeTensorData(t, source_dtype, src_bytes_st, &writer.interface, &pool);
+                callbacks.reportProgress(count, total_tensors, t.name, source_tensor.type, t.type, @intCast(elements));
+                count += 1;
             }
         }
 
