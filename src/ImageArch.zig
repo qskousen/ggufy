@@ -1,6 +1,20 @@
 const std = @import("std");
 const types = @import("types.zig");
 
+/// A single dimension constraint, used to tell apart architectures whose tensor
+/// *names* are identical (Mage-Flow vs Qwen-Image). Mirrors what ComfyUI's
+/// model_detection.py does in the same situation: read one dimension of one
+/// named tensor and compare it against a known constant.
+pub const ShapeRule = struct {
+    /// Tensor name with any state-dict prefix already stripped (see stripPrefix).
+    key: []const u8,
+    /// Index into `Tensor.dims`, which is always outermost-first (PyTorch order)
+    /// regardless of whether the source was SafeTensors or GGUF.
+    dim: usize,
+    /// Required extent of that dimension.
+    extent: usize,
+};
+
 /// Represents a model architecture with its detection keys and configuration
 pub const Arch = struct {
     /// String describing architecture name
@@ -12,6 +26,11 @@ pub const Arch = struct {
     keys_detect: []const []const []const u8,
     /// Keys that mark model as invalid for conversion (e.g., wrong format)
     keys_banned: []const []const u8 = &.{},
+    /// Dimension constraints that must ALL hold in addition to `keys_detect`.
+    /// Only usable when tensor shapes are available, so an architecture that
+    /// declares these can only be detected via the tensor-based entry points
+    /// (`detectArchFromTensors*`), never from a bare list of names.
+    shape_detect: []const ShapeRule = &.{},
     /// Keys that need to be kept in fp32/high precision
     keys_hiprec: []const []const u8 = &.{},
     /// Key substrings to ignore when found
@@ -47,6 +66,17 @@ pub const Arch = struct {
             }
         }
         return false;
+    }
+
+    /// Check this architecture's `shape_detect` constraints against a tensor list.
+    /// A missing tensor, a missing dimension, or a mismatched extent all fail.
+    pub fn shapesMatch(self: Arch, tensors: []const types.Tensor) bool {
+        for (self.shape_detect) |rule| {
+            const t = findTensor(tensors, rule.key) orelse return false;
+            if (rule.dim >= t.dims.len) return false;
+            if (t.dims[rule.dim] != rule.extent) return false;
+        }
+        return true;
     }
 
     /// Check if a key should be kept in high precision
@@ -125,6 +155,13 @@ fn containsKey(tensor_names: []const []const u8, key: []const u8) bool {
         }
     }
     return false;
+}
+
+fn findTensor(tensors: []const types.Tensor, key: []const u8) ?*const types.Tensor {
+    for (tensors) |*t| {
+        if (std.mem.eql(u8, stripPrefix(t.name), key)) return t;
+    }
+    return null;
 }
 
 /// Check if tensors contain any banned keys for a specific architecture
@@ -444,6 +481,65 @@ pub const qwen = Arch{
     },
 };
 
+// Mage-Flow (microsoft/Mage) is a 12-layer native-resolution MMDiT that reuses
+// Qwen-Image's double-stream block verbatim. Its state dict has *exactly* the
+// same set of tensor names as Qwen-Image — only the dimensions differ — so name
+// matching alone cannot tell the two apart. ComfyUI's model_detection.py
+// disambiguates purely by shape (txt_norm/proj_out are 2560/128 here vs
+// 3584/64 for Qwen-Image), and so do we, via `shape_detect`.
+//
+// Must be listed BEFORE `qwen` in arch_list: Qwen-Image's key set matches
+// Mage-Flow's file exactly, so qwen would otherwise win.
+//
+// `mage_flow` is the `image_model` string ComfyUI itself assigns, so we use it
+// verbatim as `general.architecture`.
+pub const mageflow = Arch{
+    .name = "mage_flow",
+    .keys_detect = &.{
+        &.{
+            "time_text_embed.timestep_embedder.linear_2.weight",
+            "transformer_blocks.0.attn.norm_added_q.weight",
+            "transformer_blocks.0.img_mlp.net.0.proj.weight",
+            "txt_norm.weight",
+            "proj_out.weight",
+        },
+    },
+    // The exact pair ComfyUI reads to separate Mage-Flow from Qwen-Image.
+    .shape_detect = &.{
+        .{ .key = "txt_norm.weight", .dim = 0, .extent = 2560 },
+        .{ .key = "proj_out.weight", .dim = 0, .extent = 128 },
+    },
+    .shape_fix = true,
+    .threshhold = null,
+    // Only 12 blocks and 4.1B params, so the conditioning/IO path is under 1%
+    // of the weights (~38M params) while carrying most of the quantization
+    // risk. It lands as F32 in GGUF output, which costs ~144 MiB — about 6% of
+    // a Q4_K build. Same trade-off the krea2/ltx2 entries above make.
+    //   - txt_norm.weight: also load-bearing for detection. It is 1-D, which
+    //     already protects it in GGUF output, but the SafeTensors cluster
+    //     formats (MXFP4/MXFP8) would otherwise nibble-pack it and halve the
+    //     2560 that ComfyUI matches on.
+    //   - img_in / txt_in / proj_out: patch embed/unembed and text input proj.
+    //   - norm_out.linear: final AdaLN modulation.
+    //   - time_text_embed: timestep embedding MLP.
+    .keys_hiprec = &.{
+        "txt_norm.weight",
+        "img_in.",
+        "txt_in.",
+        "proj_out.",
+        "norm_out.linear",
+        "time_text_embed",
+    },
+    // RMSNorm scales, as for Qwen-Image (shared block implementation).
+    .upcast_from_bf16 = &.{
+        "txt_norm.weight",
+        ".norm_k.weight",
+        ".norm_q.weight",
+        ".norm_added_k.weight",
+        ".norm_added_q.weight",
+    },
+};
+
 pub const ernie = Arch{
     .name = "ernie",
     .keys_detect = &.{
@@ -511,20 +607,37 @@ pub const arch_list = [_]*const Arch{
     &sdxl,
     &sd1,
     &lumina2,
+    &mageflow,
     &qwen,
     &ernie,
     &krea2,
 };
 
-/// Detect architecture from a list of tensor names
-/// Returns the matching Arch or null if unknown
-pub fn detectArch(tensor_names: []const []const u8) ?*const Arch {
+/// Core matcher: names must match, and any `shape_detect` rules must hold.
+/// `tensors` is null when only names are known; an architecture that needs
+/// shapes then cannot match, since we have no way to confirm its constraints.
+fn archMatches(arch: *const Arch, names: []const []const u8, tensors: ?[]const types.Tensor) bool {
+    if (!arch.matches(names)) return false;
+    if (arch.shape_detect.len == 0) return true;
+    const ts = tensors orelse return false;
+    return arch.shapesMatch(ts);
+}
+
+fn detectImpl(names: []const []const u8, tensors: ?[]const types.Tensor) ?*const Arch {
     for (arch_list) |arch| {
-        if (arch.matches(tensor_names)) {
-            return arch;
-        }
+        if (archMatches(arch, names, tensors)) return arch;
     }
     return null;
+}
+
+/// Detect architecture from a list of tensor names.
+/// Returns the matching Arch or null if unknown.
+///
+/// Names alone cannot distinguish architectures that share a tensor-name set
+/// (e.g. Mage-Flow vs Qwen-Image); those declare `shape_detect` and are only
+/// reachable through `detectArchFromTensors`/`detectArchFromTensorsOrError`.
+pub fn detectArch(tensor_names: []const []const u8) ?*const Arch {
+    return detectImpl(tensor_names, null);
 }
 
 /// Detect architecture from a tensor list using an allocator for large models
@@ -535,17 +648,12 @@ pub fn detectArchFromTensors(tensors: []const types.Tensor, allocator: std.mem.A
     for (tensors, 0..) |t, i| {
         names[i] = t.name;
     }
-    return detectArch(names);
+    return detectImpl(names, tensors);
 }
 
 /// Detect architecture and return error if not found or invalid
 pub fn detectArchOrError(tensor_names: []const []const u8) ArchError!*const Arch {
-    for (arch_list) |arch| {
-        if (arch.matches(tensor_names)) {
-            return arch;
-        }
-    }
-    return ArchError.UnknownArchitecture;
+    return detectImpl(tensor_names, null) orelse ArchError.UnknownArchitecture;
 }
 
 /// Detect architecture from tensors and return error if not found or invalid
@@ -557,12 +665,7 @@ pub fn detectArchFromTensorsOrError(tensors: []const types.Tensor, allocator: st
         names[i] = t.name;
     }
 
-    for (arch_list) |arch| {
-        if (arch.matches(names)) {
-            return arch;
-        }
-    }
-    return ArchError.UnknownArchitecture;
+    return detectImpl(names, tensors) orelse ArchError.UnknownArchitecture;
 }
 
 /// Error type for architecture validation
@@ -777,6 +880,85 @@ test "detect ltx2 architecture" {
     try std.testing.expectEqualStrings("ltxv", arch.?.name);
     // But it must resolve to the ltx2 constant, not ltxv, to get the correct hiprec list.
     try std.testing.expectEqual(&ltx2, arch.?);
+}
+
+// Mage-Flow and Qwen-Image share an identical tensor-name set, so the only
+// thing separating them is txt_norm.weight[0] (2560 vs 3584) and
+// proj_out.weight[0] (128 vs 64) — the same pair ComfyUI keys off.
+// The dim arrays live in per-instantiation static storage: `Tensor.dims` is a
+// slice, so function-local arrays would dangle once the helper returns.
+fn mmditTensors(comptime txt_norm_dim: usize, comptime proj_out_rows: usize) [5]types.Tensor {
+    const dims = struct {
+        var img_mlp = [_]usize{ 12288, 3072 };
+        var linear2 = [_]usize{ 3072, 3072 };
+        var norm_added_q = [_]usize{128};
+        var txt_norm = [_]usize{txt_norm_dim};
+        var proj_out = [_]usize{ proj_out_rows, 3072 };
+    };
+    return .{
+        .{ .name = "time_text_embed.timestep_embedder.linear_2.weight", .type = "BF16", .dims = &dims.linear2, .size = 0, .offset = 0 },
+        .{ .name = "transformer_blocks.0.attn.norm_added_q.weight", .type = "BF16", .dims = &dims.norm_added_q, .size = 0, .offset = 0 },
+        .{ .name = "transformer_blocks.0.img_mlp.net.0.proj.weight", .type = "BF16", .dims = &dims.img_mlp, .size = 0, .offset = 0 },
+        .{ .name = "txt_norm.weight", .type = "BF16", .dims = &dims.txt_norm, .size = 0, .offset = 0 },
+        .{ .name = "proj_out.weight", .type = "BF16", .dims = &dims.proj_out, .size = 0, .offset = 0 },
+    };
+}
+
+test "mage_flow vs qwen-image disambiguation is by shape only" {
+    const allocator = std.testing.allocator;
+
+    var mage = mmditTensors(2560, 128);
+    try std.testing.expectEqualStrings("mage_flow", (try detectArchFromTensors(&mage, allocator)).?.name);
+
+    // Qwen-Image: same names, different dims — must not be claimed by mage_flow.
+    var qwen_image = mmditTensors(3584, 64);
+    try std.testing.expectEqualStrings("qwen", (try detectArchFromTensors(&qwen_image, allocator)).?.name);
+
+    // One matching dimension is not enough; both rules must hold.
+    var half_match = mmditTensors(2560, 64);
+    try std.testing.expectEqualStrings("qwen", (try detectArchFromTensors(&half_match, allocator)).?.name);
+}
+
+test "shape rules reject tensors with missing or too-few dims" {
+    var no_dims = [_]usize{};
+    var proj_out_dims = [_]usize{ 128, 3072 };
+    const tensors = [_]types.Tensor{
+        .{ .name = "txt_norm.weight", .type = "BF16", .dims = &no_dims, .size = 0, .offset = 0 },
+        .{ .name = "proj_out.weight", .type = "BF16", .dims = &proj_out_dims, .size = 0, .offset = 0 },
+    };
+    try std.testing.expect(!mageflow.shapesMatch(&tensors));
+
+    // Absent tensor also fails, rather than silently passing.
+    try std.testing.expect(!mageflow.shapesMatch(tensors[1..]));
+}
+
+test "mage_flow keeps the conditioning and IO path high-precision" {
+    const protected = [_][]const u8{
+        "txt_norm.weight",
+        "img_in.weight",
+        "txt_in.weight",
+        "proj_out.weight",
+        "norm_out.linear.weight",
+        "time_text_embed.timestep_embedder.linear_1.weight",
+        "model.diffusion_model.proj_out.bias",
+    };
+    for (protected) |k| try std.testing.expect(mageflow.isHighPrecision(k));
+
+    // The 12 double-stream blocks are the quantization target.
+    const backbone = [_][]const u8{
+        "transformer_blocks.0.attn.to_q.weight",
+        "transformer_blocks.11.img_mlp.net.0.proj.weight",
+        "transformer_blocks.5.txt_mod.1.weight",
+        "transformer_blocks.7.attn.add_v_proj.weight",
+    };
+    for (backbone) |k| try std.testing.expect(!mageflow.isHighPrecision(k));
+}
+
+test "mage_flow upcasts rmsnorm scales" {
+    try std.testing.expect(mageflow.shouldUpcast("txt_norm.weight"));
+    try std.testing.expect(mageflow.shouldUpcast("transformer_blocks.0.attn.norm_q.weight"));
+    try std.testing.expect(mageflow.shouldUpcast("transformer_blocks.3.attn.norm_added_k.weight"));
+    try std.testing.expect(!mageflow.shouldUpcast("transformer_blocks.0.attn.to_q.weight"));
 }
 
 test "detect krea2 architecture" {

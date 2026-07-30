@@ -46,6 +46,7 @@ This table lists the architectures that ggufy can convert, and whether they have
 | Qwen               | ✅         | ❌                |
 | ERNIE              | ✅         | ❌                |
 | Krea2              | ✅         | ❌                |
+| Mage-Flow          | ✅         | ❌                |
 
 I initially intended to have this all in pure zig, but now it includes ggml c/c++ code for quantization. I did actually get a working q8_0 implementation in zig (you can find it if you look back through the commits) but got stuck on figuring out q5_0 and decided to just pull in ggml and use that.
 

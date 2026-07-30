@@ -49,6 +49,32 @@ fn reportPredictedSize(
     try stdout.flush();
 }
 
+/// Dump the tensor list as a JSON test fixture. With `with_shapes`, each entry
+/// becomes {"name":…,"shape":[…]} — required by architectures that are only
+/// separable by dimension (see `Arch.shape_detect` in ImageArch.zig).
+fn dumpNames(
+    tensors: []const types.Tensor,
+    with_shapes: bool,
+    allocator: std.mem.Allocator,
+    stdout: *std.Io.Writer,
+) !void {
+    const json = if (with_shapes) blk: {
+        const Entry = struct { name: []const u8, shape: []const usize };
+        const entries = try allocator.alloc(Entry, tensors.len);
+        defer allocator.free(entries);
+        for (tensors, 0..) |t, i| entries[i] = .{ .name = t.name, .shape = t.dims };
+        break :blk try std.json.Stringify.valueAlloc(allocator, entries, .{ .whitespace = .indent_1 });
+    } else blk: {
+        const names = try allocator.alloc([]const u8, tensors.len);
+        defer allocator.free(names);
+        for (tensors, 0..) |t, i| names[i] = t.name;
+        break :blk try std.json.Stringify.valueAlloc(allocator, names, .{ .whitespace = .indent_2 });
+    };
+    defer allocator.free(json);
+    try stdout.writeAll(json);
+    try stdout.writeByte('\n');
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const start_ts = std.Io.Clock.Timestamp.now(io, .awake);
@@ -72,6 +98,7 @@ pub fn main(init: std.process.Init) !void {
         \\-A, --arch <NAME>              Set the architecture name written to the GGUF metadata (GGUF output only). Free-form; does not affect conversion behaviour.
         \\-R, --stochastic-rounding <SEED> Seed for INT4_CONVROT_SR stochastic rounding. Omit for the built-in default seed; pass 0 to disable (deterministic, for comparison). Ignored by other types.
         \\-c, --calculate-size           With convert: compute and print the exact final output size without writing any file.
+        \\-S, --shapes                   With names: emit {"name":…,"shape":[…]} objects instead of bare names, for architectures detected by shape.
         \\<COMMAND>    Specify a command: header, tree, metadata, convert, template, version
         \\<FILENAME>   The file to use for input (not required for the version command)
     );
@@ -120,7 +147,7 @@ pub fn main(init: std.process.Init) !void {
         try stdout.print("  metadata       Shows metadata information for the specified file\n", .{});
         try stdout.print("  convert        Convert the specified file into a different format or datatype\n", .{});
         try stdout.print("  template       Creates a json template from the specified file\n", .{});
-        try stdout.print("  names          Dump tensor names as a JSON array (for test fixtures)\n", .{});
+        try stdout.print("  names          Dump tensor names as a JSON array (for test fixtures; -S to include shapes)\n", .{});
         try stdout.print("  sensitivities  Generate a sensitivities JSON template from the specified file\n", .{});
         try stdout.print("  version        Print version information\n\n", .{});
         try stdout.print("Options:\n", .{});
@@ -271,15 +298,7 @@ pub fn main(init: std.process.Init) !void {
                     try writer.flush();
                     std.log.info("Sensitivities exported to {s}", .{out_path});
                 },
-                .names => {
-                    const name_list = try allocator.alloc([]const u8, f.tensors.items.len);
-                    defer allocator.free(name_list);
-                    for (f.tensors.items, 0..) |t, i| name_list[i] = t.name;
-                    const json = try std.json.Stringify.valueAlloc(allocator, name_list, .{ .whitespace = .indent_2 });
-                    defer allocator.free(json);
-                    try stdout.writeAll(json);
-                    try stdout.writeByte('\n');
-                },
+                .names => try dumpNames(f.tensors.items, res.args.shapes != 0, allocator, stdout),
                 .version => unreachable,
             }
         },
@@ -310,15 +329,7 @@ pub fn main(init: std.process.Init) !void {
                         return err;
                     };
                 },
-                .names => {
-                    const name_list = try allocator.alloc([]const u8, f.tensors.items.len);
-                    defer allocator.free(name_list);
-                    for (f.tensors.items, 0..) |t, i| name_list[i] = t.name;
-                    const json = try std.json.Stringify.valueAlloc(allocator, name_list, .{ .whitespace = .indent_2 });
-                    defer allocator.free(json);
-                    try stdout.writeAll(json);
-                    try stdout.writeByte('\n');
-                },
+                .names => try dumpNames(f.tensors.items, res.args.shapes != 0, allocator, stdout),
                 .template => {
                     const out_path = if (output_name) |n|
                         try std.fmt.allocPrint(arena_alloc, "{s}.json", .{n})
