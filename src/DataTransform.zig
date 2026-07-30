@@ -1,7 +1,7 @@
 const std = @import("std");
 const gguf = @import("Gguf.zig");
 const types = @import("types.zig");
-const ggml = @import("ggml.h");
+const tp = @import("tp_core");
 const thread_pool_mod = @import("ThreadPool.zig");
 
 pub const Quantizer = struct {
@@ -68,13 +68,11 @@ pub const Quantizer = struct {
             },
             .BF16, .bf16 => {
                 if (input_bytes.len / 2 != output_f32.len) return error.InputSizeMismatch;
-                const in_ptr: [*]const ggml.ggml_bf16_t = @ptrCast(@alignCast(input_bytes.ptr));
-                ggml.ggml_bf16_to_fp32_row(in_ptr, output_f32.ptr, @intCast(output_f32.len));
+                tp.dtype.bf16ToF32Row(input_bytes, output_f32, 1.0);
             },
             .F16, .f16 => {
                 if (input_bytes.len / 2 != output_f32.len) return error.InputSizeMismatch;
-                const in_ptr: [*]const ggml.ggml_fp16_t = @ptrCast(@alignCast(input_bytes.ptr));
-                ggml.ggml_fp16_to_fp32_row(in_ptr, output_f32.ptr, @intCast(output_f32.len));
+                tp.dtype.f16ToF32Row(input_bytes, output_f32, 1.0);
             },
             .F32, .f32 => {
                 const input_vals = std.mem.bytesAsSlice(f32, input_bytes);
@@ -92,11 +90,18 @@ pub const Quantizer = struct {
                     return error.UnsupportedSourceType;
                 const expected_size: usize = @intCast(src_type.calcSizeInBytes(@intCast(output_f32.len)));
                 if (input_bytes.len != expected_size) return error.InputSizeMismatch;
-                const traits = ggml.ggml_get_type_traits(
-                    @as(ggml.enum_ggml_type, @intCast(@intFromEnum(gguf_type))),
-                );
-                const to_float_fn = traits.*.to_float orelse return error.UnsupportedSourceType;
-                to_float_fn(input_bytes.ptr, output_f32.ptr, @intCast(output_f32.len));
+                tp.quants.raw.dequantRow(
+                    @intFromEnum(gguf_type),
+                    input_bytes,
+                    output_f32.len,
+                    output_f32,
+                ) catch |err| return switch (err) {
+                    // Keep this function's error surface as it was: callers
+                    // (precision_realdata, the converter) match on these names.
+                    error.UnknownGgmlType, error.UnsupportedGgmlType => error.UnsupportedSourceType,
+                    error.NotBlockAligned, error.BufferSizeMismatch => error.InputSizeMismatch,
+                    else => err,
+                };
             },
         }
     }
@@ -113,12 +118,12 @@ pub const Quantizer = struct {
                 @memcpy(out_slice, input_f32);
             },
             .BF16, .bf16 => {
-                const out_ptr: [*]ggml.ggml_bf16_t = @ptrCast(@alignCast(output_bytes.ptr));
-                ggml.ggml_fp32_to_bf16_row(input_f32.ptr, out_ptr, @intCast(input_f32.len));
+                if (output_bytes.len < input_f32.len * 2) return error.OutputBufferSizeMismatch;
+                tp.dtype.f32ToBf16Row(input_f32, output_bytes[0 .. input_f32.len * 2]);
             },
             .f16, .F16 => {
-                const out_ptr: [*]ggml.ggml_fp16_t = @ptrCast(@alignCast(output_bytes.ptr));
-                ggml.ggml_fp32_to_fp16_row(input_f32.ptr, out_ptr, @intCast(input_f32.len));
+                if (output_bytes.len < input_f32.len * 2) return error.OutputBufferSizeMismatch;
+                tp.dtype.f32ToF16Row(input_f32, output_bytes[0 .. input_f32.len * 2]);
             },
             .F8_E4M3, .F8_E5M2 => {
                 if (output_bytes.len != input_f32.len)
@@ -171,6 +176,15 @@ pub const Quantizer = struct {
         const leftover = block_count - (blocks_per_thread * threads_u64);
 
         var wg: thread_pool_mod.WaitGroup = .{};
+        // The workers cannot return an error through spawnWg, so they flag failure
+        // here and we surface it after the join.
+        var failed = std.atomic.Value(bool).init(false);
+
+        // Build this type's quantization tables once, on this thread, before the
+        // fan-out. ggml documents init as thread-safe (and it is a no-op for every
+        // type we emit), but doing it up front keeps it off the hot path.
+        tp.quants.raw.ensureQuantizeInit(@intFromEnum(q_type)) catch
+            return error.UnsupportedDestinationType;
 
         var i: u64 = 0;
         while (i < threads_u64) : (i += 1) {
@@ -180,29 +194,45 @@ pub const Quantizer = struct {
                 end += leftover;
             }
             //std.log.debug("Spawning a task for blocks {} - {} of {}", .{ start, end, block_count });
-            pool.spawnWg(&wg, processBlocks, .{ input_f32, output_bytes, start, end, block_elements, block_size, q_type });
+            pool.spawnWg(&wg, processBlocks, .{ input_f32, output_bytes, start, end, block_elements, block_size, q_type, &failed });
         }
         wg.wait();
+        if (failed.load(.acquire)) return error.QuantizationFailed;
     }
 
-    fn processBlocks(input_f32: []const f32, output_bytes: []u8, start: u64, end: u64, block_elements: u64, block_size: u64, q_type: gguf.GgmlType) void {
-        const size = end - start;
-        const src_offset: usize = @intCast(start * block_elements);
-        const dst_offset: usize = @intCast(start * block_size);
+    fn processBlocks(
+        input_f32: []const f32,
+        output_bytes: []u8,
+        start: u64,
+        end: u64,
+        block_elements: u64,
+        block_size: u64,
+        q_type: gguf.GgmlType,
+        failed: *std.atomic.Value(bool),
+    ) void {
+        const blocks = end - start;
         const block_elements_usize: usize = @intCast(block_elements);
         const block_size_usize: usize = @intCast(block_size);
-        const src_block = input_f32[src_offset .. src_offset + block_elements_usize];
-        const dst_block = output_bytes[dst_offset .. dst_offset + block_size_usize];
+        const src_offset: usize = @intCast(start * block_elements);
+        const dst_offset: usize = @intCast(start * block_size);
+        // This worker owns `blocks` whole blocks, not one — the slices must span all
+        // of them. (They used to be cut to a single block's length while ggml was
+        // told to write `blocks` of them: correct output, because the parent buffers
+        // are contiguous and ggml works off the raw pointer, but the slice bounds
+        // were a lie and any bounds-checked API would have rejected them.)
+        const src_block = input_f32[src_offset..][0 .. blocks * block_elements_usize];
+        const dst_block = output_bytes[dst_offset..][0 .. blocks * block_size_usize];
 
-        _ = ggml.ggml_quantize_chunk(
-            @as(ggml.enum_ggml_type, @intCast(@intFromEnum(q_type))),
-            src_block.ptr,
-            dst_block.ptr,
-            0,
-            @intCast(size),
-            @intCast(block_elements),
-            null,
-        );
+        _ = tp.quants.raw.quantizeChunk(
+            @intFromEnum(q_type),
+            src_block,
+            dst_block,
+            @intCast(blocks),
+            block_elements_usize,
+            null, // imatrix: activation-aware weighting goes here (plan §8A)
+        ) catch {
+            failed.store(true, .release);
+        };
     }
 
     fn convertTypeSimple(
@@ -1498,6 +1528,150 @@ test "transform f16 to q8_0" {
     // Compare the results
     try std.testing.expectEqual(expected_data.len, q8_0_data.len);
     try std.testing.expectEqualSlices(u8, expected_data, q8_0_data);
+}
+
+// ============================================================================
+// GGML block-quant golden bytes
+// ============================================================================
+//
+// The ggml block-quant encoders are the one part of the pipeline whose output we
+// never pinned: every other format has a fixture, but q4_K et al. were only ever
+// checked by round-trip error. That makes any change to the ggml backend — a
+// version bump, a build-flag change, moving to a different vendored copy —
+// invisible until a model renders wrong. (One such difference was already there:
+// q6_k/q5_k/q2_k encode differently at different ggml optimization levels.)
+//
+// These fixtures are the pin: a fixed input (generated by an explicit xorshift so
+// it does not depend on std's PRNG staying put) encoded to every ggml type the
+// converter emits, byte for byte. Regenerate them ONLY on a deliberate, reviewed
+// ggml change (flip the GENERATE test below), and record it in CLAUDE.md — a diff
+// here means every GGUF we write from then on differs from every one written
+// before it.
+
+/// Deterministic, self-contained test input: xorshift64 noise at a realistic
+/// trained-weight scale, with a periodic outlier so block scale selection is
+/// actually exercised. Reproducible across Zig versions and platforms.
+fn fillDeterministicWeights(dst: []f32) void {
+    var s: u64 = 0x243F6A8885A308D3; // pi digits, as good a seed as any
+    for (dst, 0..) |*v, i| {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        const bits24: f32 = @floatFromInt(s >> 40);
+        const x = bits24 / 8388608.0 - 1.0; // [-1, 1)
+        v.* = x * 0.05 + (if (i % 512 == 0) @as(f32, 1.0) else 0.0);
+    }
+}
+
+/// Every ggml type `quantizeFromF32` routes through `ggml_quantize_chunk`.
+const ggml_golden_types = [_]types.DataType{
+    .q8_0, .q5_0, .q4_0, .q5_1, .q4_1, .q6_k, .q5_k, .q4_k, .q3_k, .q2_k, .mxfp4,
+};
+
+const ggml_golden_elems: u64 = 4096; // 16 k-quant super-blocks / 128 legacy blocks
+
+fn quantizeGolden(allocator: std.mem.Allocator, dst_type: types.DataType) ![]u8 {
+    const input = try allocator.alloc(f32, @intCast(ggml_golden_elems));
+    defer allocator.free(input);
+    fillDeterministicWeights(input);
+
+    var pool: thread_pool_mod.ThreadPool = undefined;
+    try pool.init(.{ .allocator = allocator, .n_jobs = 1 });
+    defer pool.deinit();
+
+    return Quantizer.convertTensorData(
+        allocator,
+        std.mem.sliceAsBytes(input),
+        .F32,
+        dst_type,
+        ggml_golden_elems,
+        &pool,
+    );
+}
+
+test "ggml block-quant encoders produce the pinned golden bytes" {
+    const allocator = std.testing.allocator;
+    var missing: usize = 0;
+    var failed: usize = 0;
+    // Check every type before failing: which types diverge is the diagnostic, and
+    // stopping at the first one hides the rest.
+    for (ggml_golden_types) |dst_type| {
+        var name_buf: [64]u8 = undefined;
+        const fixture_name = try std.fmt.bufPrint(&name_buf, "ggml_{s}.bin", .{@tagName(dst_type)});
+
+        const expected = try loadFixture(allocator, fixture_name) orelse {
+            missing += 1;
+            continue;
+        };
+        defer allocator.free(expected);
+
+        const got = try quantizeGolden(allocator, dst_type);
+        defer allocator.free(got);
+
+        if (expected.len != got.len) {
+            std.debug.print("{t}: size changed, {d} -> {d} bytes\n", .{ dst_type, expected.len, got.len });
+            failed += 1;
+            continue;
+        }
+        var diff_bytes: usize = 0;
+        var first_diff: usize = 0;
+        for (expected, got, 0..) |e, g, i| {
+            if (e == g) continue;
+            if (diff_bytes == 0) first_diff = i;
+            diff_bytes += 1;
+        }
+        if (diff_bytes != 0) {
+            std.debug.print("{t}: {d}/{d} bytes differ (first at {d}: 0x{X:0>2} -> 0x{X:0>2})\n", .{
+                dst_type, diff_bytes, expected.len, first_diff, expected[first_diff], got[first_diff],
+            });
+            failed += 1;
+        }
+    }
+    if (failed != 0) return error.GgmlGoldenBytesChanged;
+    // All fixtures absent is a fresh checkout (they are committed, so this means
+    // the working dir is wrong); a PARTIAL set means someone deleted one, which
+    // would silently stop pinning that type.
+    if (missing != 0 and missing != ggml_golden_types.len) {
+        std.debug.print("{d} of {d} ggml golden fixtures missing\n", .{ missing, ggml_golden_types.len });
+        return error.IncompleteFixtureSet;
+    }
+    if (missing != 0) return error.SkipZigTest;
+}
+
+test "ggufy's block-size tables agree with ggml's own layout" {
+    // ggufy sizes output buffers from `GgmlType.getBlockSize`/`getBytesPerBlock`
+    // (its own table, also used to write GGUF headers) while ggml writes according
+    // to its internal layout. A disagreement is a buffer overrun or a corrupt file,
+    // not a test failure — so pin the two against each other now that ggml's answer
+    // is reachable directly.
+    for (ggml_golden_types) |dst_type| {
+        const gt = try gguf.GgmlType.fromString(@tagName(dst_type));
+        const id: u32 = @intFromEnum(gt);
+
+        errdefer std.debug.print("block-layout disagreement for {t} (ggml id {d})\n", .{ dst_type, id });
+        try std.testing.expectEqual(try tp.quants.raw.blockElems(id), @as(usize, @intCast(gt.getBlockSize())));
+        try std.testing.expectEqual(try tp.quants.raw.blockBytes(id), @as(usize, @intCast(gt.getBytesPerBlock())));
+        // And the size ggufy predicts for a whole tensor must match ggml's row size.
+        const elems: usize = @intCast(gt.getBlockSize() * 4);
+        try std.testing.expectEqual(
+            try tp.quants.raw.rowBytes(id, elems),
+            @as(usize, @intCast(dst_type.calcSizeInBytes(elems))),
+        );
+    }
+}
+
+test "GENERATE ggml golden fixtures" {
+    if (true) return error.SkipZigTest; // flip to run; see the comment above
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    for (ggml_golden_types) |dst_type| {
+        const got = try quantizeGolden(allocator, dst_type);
+        defer allocator.free(got);
+        var path_buf: [256]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "{s}/ggml_{s}.bin", .{ fixture_dir, @tagName(dst_type) });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = got });
+        std.debug.print("wrote {s} ({d} bytes)\n", .{ path, got.len });
+    }
 }
 
 // ============================================================================

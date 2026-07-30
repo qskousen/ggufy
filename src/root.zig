@@ -10,3 +10,7 @@ pub const safetensor = @import("Safetensor.zig");
 pub const types = @import("types.zig");
 pub const fileLoader = @import("FileLoader.zig");
 pub const callbacks = @import("callbacks.zig");
+
+/// Activation-aware quantization support (see ACTIVATION_AWARE_PLAN.md). Needs the
+/// TensorPencil umbrella (inference), unlike everything above.
+pub const activations = @import("Activations.zig");

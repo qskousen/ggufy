@@ -32,6 +32,9 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
+        .TensorPencil = .{
+            .path = "../../../../dump/projects/zig/TensorPencil",
+        },
         .clap = .{
             .url = "https://github.com/Hejsil/zig-clap/archive/refs/tags/0.12.0.tar.gz",
             .hash = "clap-0.12.0-oBajB7foAQDqlSwaSG5g0yq7xGbQARUsBk5T64gAOqP5",

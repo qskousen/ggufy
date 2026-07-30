@@ -1,5 +1,4 @@
 const std = @import("std");
-const ggml = @import("build_ggml.zig");
 const cimgui = @import("cimgui");
 
 pub fn build(b: *std.Build) void {
@@ -16,18 +15,39 @@ pub fn build(b: *std.Build) void {
 
     // --- Shared modules ---
 
-    const ggml_h_module = b.addModule("ggml.h", .{
-        .root_source_file = b.path("src/ggml_bindings.zig"),
+    // ggml comes from TensorPencil, not a local vendored copy: quantize/dequantize
+    // kernels are inference-side concerns and live there (see ACTIVATION_AWARE_PLAN.md
+    // §2). `tp_core` is the bottom layer — dtypes, ggml quant/dequant, safetensors and
+    // GGUF parsing — with no GPU, models or pipeline, so it stays a cheap dependency.
+    // It links the ggml static lib (always built ReleaseFast) into every artifact that
+    // imports it.
+    const tp_dep = b.dependency("TensorPencil", .{
         .target = target,
         .optimize = optimize,
     });
-    ggml_h_module.addIncludePath(b.path("vendor/ggml/include"));
+    const tp_core = tp_dep.module("tp_core");
+
+    // The umbrella module adds what `tp_core` deliberately leaves out: the CPU/GPU
+    // GEMMs, the architectures, and the diffusion pipeline. Activation capture and
+    // sensitivity measurement are user-facing features that run from both the CLI and
+    // the GUI, and CPU-only would make them unusably slow (minutes on a GPU vs many
+    // hours), so the backends have to be reachable from the shipping binaries — see
+    // ACTIVATION_AWARE_PLAN.md §2.4 and §6.
+    //
+    // This does NOT add a hard runtime dependency on a GPU: TensorPencil `dlopen`s
+    // libvulkan / libcuda, embeds its SPIR-V kernels at compile time, and falls back
+    // to CPU with a log line when device init fails. It does cost build time and
+    // binary size, both measured and recorded in the plan.
+    const tp = tp_dep.module("TensorPencil");
 
     const mod = b.addModule("ggufy", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .imports = &.{
-            .{ .name = "ggml.h", .module = ggml_h_module },
+            .{ .name = "tp_core", .module = tp_core },
+            // The inference-backed measurement code (activation capture, sensitivity)
+            // lives in this library so the CLI and the GUI share one implementation.
+            .{ .name = "TensorPencil", .module = tp },
             .{ .name = "build_options", .module = options_mod },
         },
     });
@@ -42,7 +62,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "ggufy",  .module = mod },
-                .{ .name = "ggml.h", .module = ggml_h_module },
+                .{ .name = "tp_core", .module = tp_core },
             },
         }),
     });
@@ -54,7 +74,6 @@ pub fn build(b: *std.Build) void {
     cli.root_module.addImport("clap", clap.module("clap"));
     cli.root_module.addImport("build_options", options_mod);
 
-    ggml.link(b, cli, target, optimize);
 
     const cli_install = b.addInstallArtifact(cli, .{});
     const cli_step = b.step("cli", "Build the CLI");
@@ -75,12 +94,11 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "ggufy",  .module = mod },
-                .{ .name = "ggml.h", .module = ggml_h_module },
+                .{ .name = "tp_core", .module = tp_core },
             },
         }),
     });
 
-    ggml.link(b, gui, target, optimize);
 
     const dvui_dep = b.dependency("dvui", .{ .target = target, .optimize = optimize, .backend = .sdl3, .@"tree-sitter" = false });
     gui.root_module.addImport("dvui", dvui_dep.module("dvui_sdl3"));
@@ -119,11 +137,10 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = .ReleaseFast,
             .imports = &.{
-                .{ .name = "ggml.h", .module = ggml_h_module },
+                .{ .name = "tp_core", .module = tp_core },
             },
         }),
     });
-    ggml.link(b, bench, target, .ReleaseFast);
     const run_bench = b.addRunArtifact(bench);
     b.step("bench", "Run F8 benchmarks").dependOn(&run_bench.step);
 
@@ -136,11 +153,10 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "ggml.h", .module = ggml_h_module },
+                .{ .name = "tp_core", .module = tp_core },
             },
         }),
     });
-    ggml.link(b, precision, target, optimize);
     const run_precision = b.addRunArtifact(precision);
     if (b.args) |args| run_precision.addArgs(args);
     b.step("precision", "Run the quantization precision report").dependOn(&run_precision.step);
@@ -152,11 +168,10 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = .ReleaseFast,
             .imports = &.{
-                .{ .name = "ggml.h", .module = ggml_h_module },
+                .{ .name = "tp_core", .module = tp_core },
             },
         }),
     });
-    ggml.link(b, bench_eff, target, .ReleaseFast);
     const run_bench_eff = b.addRunArtifact(bench_eff);
     b.step("bench-efficiency", "Run quantization efficiency benchmarks").dependOn(&run_bench_eff.step);
 
@@ -172,11 +187,10 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "ggml.h", .module = ggml_h_module },
+                .{ .name = "tp_core", .module = tp_core },
             },
         }),
     });
-    ggml.link(b, arch_detect_test, target, optimize);
     test_step.dependOn(&b.addRunArtifact(arch_detect_test).step);
 
     const data_transform_test = b.addTest(.{
@@ -185,11 +199,10 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "ggml.h", .module = ggml_h_module },
+                .{ .name = "tp_core", .module = tp_core },
             },
         }),
     });
-    ggml.link(b, data_transform_test, target, optimize);
     test_step.dependOn(&b.addRunArtifact(data_transform_test).step);
 
     const tensor_clusters_test = b.addTest(.{
@@ -198,12 +211,25 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "ggml.h", .module = ggml_h_module },
+                .{ .name = "tp_core", .module = tp_core },
             },
         })
     });
-    ggml.link(b, tensor_clusters_test, target, optimize);
     test_step.dependOn(&b.addRunArtifact(tensor_clusters_test).step);
+
+    // Activation capture: runs real GEMMs through TensorPencil's matmul probe, so it
+    // needs the umbrella (not just tp_core).
+    const activations_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/Activations.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "TensorPencil", .module = tp },
+            },
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(activations_test).step);
 
     const convert_test = b.addTest(.{
         .root_module = b.createModule(.{
@@ -211,7 +237,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "ggml.h", .module = ggml_h_module },
+                .{ .name = "tp_core", .module = tp_core },
                 // Convert.zig imports build_options (stampConverterProvenance uses the version
                 // string); the standalone test module must provide it too, or a test that
                 // exercises the write path fails to compile with "no module named build_options".
@@ -219,7 +245,6 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    ggml.link(b, convert_test, target, optimize);
     test_step.dependOn(&b.addRunArtifact(convert_test).step);
 
     const precision_test = b.addTest(.{
@@ -228,11 +253,10 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "ggml.h", .module = ggml_h_module },
+                .{ .name = "tp_core", .module = tp_core },
             },
         }),
     });
-    ggml.link(b, precision_test, target, optimize);
     test_step.dependOn(&b.addRunArtifact(precision_test).step);
 
     const precision_metrics_test = b.addTest(.{

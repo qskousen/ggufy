@@ -1,3 +1,0 @@
-[submodule "vendor/ggml"]
-	path = vendor/ggml
-	url = https://github.com/ggml-org/ggml.git
