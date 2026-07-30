@@ -36,6 +36,26 @@ pub const FileType = enum {
     }
 };
 
+/// How a write path asks for a tensor's per-column importance weights (ggml's
+/// `imatrix`; see `Imatrix.zig` and ACTIVATION_AWARE_PLAN.md §8A).
+///
+/// It is an indirection rather than a concrete type on purpose: the weights come
+/// from a calibration cache, which is read through TensorPencil, and neither
+/// `Gguf.zig` nor `Safetensor.zig` has any business importing an inference engine
+/// to write a file. They call this; the converter supplies it.
+///
+/// `get` returns null for any tensor that should be quantized unweighted — that
+/// is the normal answer for most tensors, not an error. Weights, when returned,
+/// are one per column, i.e. exactly `dims[dims.len - 1]` of them.
+pub const ImatrixLookup = struct {
+    ctx: *const anyopaque,
+    get: *const fn (ctx: *const anyopaque, t: Tensor) ?[]const f32,
+
+    pub fn forTensor(self: ImatrixLookup, t: Tensor) ?[]const f32 {
+        return self.get(self.ctx, t);
+    }
+};
+
 pub const Tensor = struct {
     name: []const u8,
     type: []const u8,

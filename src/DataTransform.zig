@@ -14,7 +14,31 @@ pub const Quantizer = struct {
         element_count: u64,
         pool: *thread_pool_mod.ThreadPool,
     ) ![]u8 {
-        // Optimization: Direct copy if types match
+        return convertTensorDataWeighted(allocator, src_data, src_type, dst_type, element_count, pool, null);
+    }
+
+    /// `convertTensorData` with ggml's activation-aware hook wired up.
+    ///
+    /// `imatrix`, when given, is one importance weight per **column** of the
+    /// tensor — so its length is the row width, and `element_count` must be a
+    /// whole number of those rows. The k-quant and legacy qX_0/qX_1 encoders
+    /// minimize the weighted squared error instead of the plain one; every other
+    /// destination type ignores it. Callers are expected to have checked
+    /// applicability already (`Imatrix.decide`); a weight vector that does not
+    /// fit the data is an error here rather than something to quietly drop, since
+    /// silently reverting to unweighted quantization would make an
+    /// activation-aware run indistinguishable from a plain one.
+    pub fn convertTensorDataWeighted(
+        allocator: std.mem.Allocator,
+        src_data: []const u8,
+        src_type: types.DataType,
+        dst_type: types.DataType,
+        element_count: u64,
+        pool: *thread_pool_mod.ThreadPool,
+        imatrix: ?[]const f32,
+    ) ![]u8 {
+        // Optimization: Direct copy if types match. Nothing is being quantized,
+        // so there is no scale search for an imatrix to steer.
         if (src_type.equivalentType(@tagName(dst_type))) {
             const out = try allocator.alloc(u8, src_data.len);
             @memcpy(out, src_data);
@@ -33,7 +57,7 @@ pub const Quantizer = struct {
         const out_buffer = try allocator.alloc(u8, out_size);
         errdefer allocator.free(out_buffer); // Free on error, otherwise return ownership
 
-        try quantizeFromF32(f32_buffer, out_buffer, dst_type, pool);
+        try quantizeFromF32(f32_buffer, out_buffer, dst_type, pool, imatrix);
 
         return out_buffer;
     }
@@ -111,6 +135,7 @@ pub const Quantizer = struct {
         output_bytes: []u8,
         dst_type: types.DataType,
         pool: *thread_pool_mod.ThreadPool,
+        imatrix: ?[]const f32,
     ) !void {
         switch (dst_type) {
             .f32, .F32 => {
@@ -150,6 +175,7 @@ pub const Quantizer = struct {
                     gguf_type,
                     block_elements,
                     block_size,
+                    imatrix,
                 );
             },
             else => return error.UnsupportedDestinationType,
@@ -163,17 +189,41 @@ pub const Quantizer = struct {
         q_type: gguf.GgmlType,
         block_elements: u64,
         block_size: u64,
+        imatrix: ?[]const f32,
     ) !void {
         const element_count: u64 = @intCast(input_f32.len);
         const block_count = @divExact(element_count, block_elements);
-        const threads_u64: u64 = @intCast(pool.threads.len);
+
+        // The work is split into equal "units", each handed to ggml as one call.
+        //
+        //   - Unweighted: a unit is a single block. Blocks are quantized
+        //     independently, so this is free to ignore the tensor's real row
+        //     structure — which matters, because ggufy quantizes over the flat
+        //     element count and some tensors' rows are not a whole number of
+        //     blocks.
+        //   - Weighted: a unit is a whole **row**. ggml indexes `quant_weights`
+        //     by position within the row it was handed (`quant_weights + QK_K*i +
+        //     32*j`), so the weights only line up if it is told the true row
+        //     width. Getting this wrong would not fail — it would apply column
+        //     0's importance to every 256th weight and quietly produce a worse
+        //     model than no imatrix at all.
+        const unit_elems: u64 = if (imatrix) |im| im.len else block_elements;
+        if (unit_elems == 0) return error.InvalidImatrix;
+        if (imatrix != null) {
+            if (unit_elems % block_elements != 0) return error.ImatrixNotBlockAligned;
+            if (element_count % unit_elems != 0) return error.ImatrixWidthMismatch;
+        }
+        const unit_bytes: u64 = (unit_elems / block_elements) * block_size;
+        const units = @divExact(element_count, unit_elems);
 
         // Ensure output buffer is large enough
         if (output_bytes.len < block_count * block_size) return error.OutputBufferTooSmall;
 
-        // divide blocks up for threads
-        const blocks_per_thread = @divTrunc(block_count, threads_u64);
-        const leftover = block_count - (blocks_per_thread * threads_u64);
+        const threads_u64: u64 = @intCast(pool.threads.len);
+
+        // divide units up for threads
+        const units_per_thread = @divTrunc(units, threads_u64);
+        const leftover = units - (units_per_thread * threads_u64);
 
         var wg: thread_pool_mod.WaitGroup = .{};
         // The workers cannot return an error through spawnWg, so they flag failure
@@ -188,13 +238,12 @@ pub const Quantizer = struct {
 
         var i: u64 = 0;
         while (i < threads_u64) : (i += 1) {
-            const start = i * blocks_per_thread;
-            var end = start + blocks_per_thread;
+            const start = i * units_per_thread;
+            var end = start + units_per_thread;
             if (i == threads_u64 - 1) {
                 end += leftover;
             }
-            //std.log.debug("Spawning a task for blocks {} - {} of {}", .{ start, end, block_count });
-            pool.spawnWg(&wg, processBlocks, .{ input_f32, output_bytes, start, end, block_elements, block_size, q_type, &failed });
+            pool.spawnWg(&wg, processBlocks, .{ input_f32, output_bytes, start, end, unit_elems, unit_bytes, q_type, imatrix, &failed });
         }
         wg.wait();
         if (failed.load(.acquire)) return error.QuantizationFailed;
@@ -205,31 +254,34 @@ pub const Quantizer = struct {
         output_bytes: []u8,
         start: u64,
         end: u64,
-        block_elements: u64,
-        block_size: u64,
+        unit_elems: u64,
+        unit_bytes: u64,
         q_type: gguf.GgmlType,
+        imatrix: ?[]const f32,
         failed: *std.atomic.Value(bool),
     ) void {
-        const blocks = end - start;
-        const block_elements_usize: usize = @intCast(block_elements);
-        const block_size_usize: usize = @intCast(block_size);
-        const src_offset: usize = @intCast(start * block_elements);
-        const dst_offset: usize = @intCast(start * block_size);
-        // This worker owns `blocks` whole blocks, not one — the slices must span all
+        const units = end - start;
+        const unit_elems_usize: usize = @intCast(unit_elems);
+        const unit_bytes_usize: usize = @intCast(unit_bytes);
+        const src_offset: usize = @intCast(start * unit_elems);
+        const dst_offset: usize = @intCast(start * unit_bytes);
+        // This worker owns `units` whole units, not one — the slices must span all
         // of them. (They used to be cut to a single block's length while ggml was
         // told to write `blocks` of them: correct output, because the parent buffers
         // are contiguous and ggml works off the raw pointer, but the slice bounds
         // were a lie and any bounds-checked API would have rejected them.)
-        const src_block = input_f32[src_offset..][0 .. blocks * block_elements_usize];
-        const dst_block = output_bytes[dst_offset..][0 .. blocks * block_size_usize];
+        const src_block = input_f32[src_offset..][0 .. units * unit_elems_usize];
+        const dst_block = output_bytes[dst_offset..][0 .. units * unit_bytes_usize];
 
+        // Every unit in this call has the same width, so one imatrix serves all
+        // of them — which is exactly ggml's own contract for `quant_weights`.
         _ = tp.quants.raw.quantizeChunk(
             @intFromEnum(q_type),
             src_block,
             dst_block,
-            @intCast(blocks),
-            block_elements_usize,
-            null, // imatrix: activation-aware weighting goes here (plan §8A)
+            @intCast(units),
+            unit_elems_usize,
+            imatrix,
         ) catch {
             failed.store(true, .release);
         };
@@ -1184,7 +1236,8 @@ pub const Quantizer = struct {
         // Quantize via GGML to get GGUF mxfp4 blocks: [E8M0 byte][16 × packed nibbles]
         const gguf_buf = try allocator.alloc(u8, n_blocks * 17);
         defer allocator.free(gguf_buf);
-        try convertTypeGguf(input, gguf_buf, pool, .mxfp4, 32, 17);
+        // mxfp4's encoder discards quant_weights, so there is nothing to pass.
+        try convertTypeGguf(input, gguf_buf, pool, .mxfp4, 32, 17, null);
 
         const weight = try allocator.alloc(u8, n / 2);
         errdefer allocator.free(weight);
@@ -2041,4 +2094,316 @@ test "MXFP8 toBlockedMxfp8: matches Python to_blocked reference" {
         try std.testing.expectEqual(expected_bytes.len, got.len);
         try std.testing.expectEqualSlices(u8, expected_bytes, got);
     }
+}
+
+// ============================================================================
+// Activation-aware quantization (ggml imatrix) — plan §8A
+// ============================================================================
+
+/// Quantize `w` to `dst_type` and dequantize straight back, so the caller can
+/// measure what the format cost. `imatrix` steers the scale search where the
+/// encoder honours it.
+fn roundtripWeighted(
+    allocator: std.mem.Allocator,
+    w: []const f32,
+    dst_type: types.DataType,
+    pool: *thread_pool_mod.ThreadPool,
+    imatrix: ?[]const f32,
+) ![]f32 {
+    const q = try Quantizer.convertTensorDataWeighted(
+        allocator,
+        std.mem.sliceAsBytes(w),
+        .F32,
+        dst_type,
+        w.len,
+        pool,
+        imatrix,
+    );
+    defer allocator.free(q);
+
+    const back = try Quantizer.convertTensorData(allocator, q, dst_type, .F32, w.len, pool);
+    defer allocator.free(back);
+    const as_f32: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, back));
+    return allocator.dupe(f32, as_f32);
+}
+
+/// Σ_j w_j · (a_j − b_j)² summed over every row, with the per-column weights
+/// cycling with `cols`. This is exactly the objective ggml's weighted scale
+/// search minimizes, which is what makes it the right yardstick.
+fn weightedSqErr(a: []const f32, b: []const f32, weights: []const f32) f64 {
+    var acc: f64 = 0;
+    for (a, b, 0..) |x, y, i| {
+        const d: f64 = @as(f64, x) - @as(f64, y);
+        acc += @as(f64, weights[i % weights.len]) * d * d;
+    }
+    return acc;
+}
+
+test "row-major decomposition is a pure regrouping: same bytes as block-at-a-time" {
+    // The imatrix path hands ggml whole rows instead of single blocks, because
+    // that is the only way `quant_weights` lines up with the data. Without
+    // weights the two groupings must produce identical bytes — otherwise any
+    // difference measured later could be the regrouping rather than the
+    // weighting, and the experiment would prove nothing.
+    const allocator = std.testing.allocator;
+    const rows = 8;
+    const cols = 512; // two q4_k blocks per row
+    const n = rows * cols;
+
+    const w = try allocator.alloc(f32, n);
+    defer allocator.free(w);
+    fillDeterministicWeights(w);
+
+    const block_elems: u64 = 256;
+    const block_bytes: u64 = 144; // q4_k
+    const out_flat = try allocator.alloc(u8, (n / block_elems) * block_bytes);
+    defer allocator.free(out_flat);
+    const out_rows = try allocator.alloc(u8, out_flat.len);
+    defer allocator.free(out_rows);
+
+    try tp.quants.raw.ensureQuantizeInit(@intFromEnum(gguf.GgmlType.q4_k));
+    var failed = std.atomic.Value(bool).init(false);
+
+    // One block per unit — what the unweighted path does.
+    Quantizer.processBlocks(w, out_flat, 0, n / block_elems, block_elems, block_bytes, .q4_k, null, &failed);
+    // One row per unit — what the weighted path does.
+    Quantizer.processBlocks(w, out_rows, 0, rows, cols, (cols / block_elems) * block_bytes, .q4_k, null, &failed);
+
+    try std.testing.expect(!failed.load(.acquire));
+    try std.testing.expectEqualSlices(u8, out_flat, out_rows);
+}
+
+/// Per-channel importance shaped like real activation energy: lognormal with a
+/// few heavy outliers, normalized to mean 1.0 exactly as `Imatrix.fromCache`
+/// does. `sigma` sets the spread — the variable q2_k turns out to be sensitive to.
+fn fillLognormalImportance(dst: []f32, sigma: f32) void {
+    var s: u64 = 0xDEADBEEF12345678;
+    for (dst, 0..) |*v, j| {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        const u: f32 = @as(f32, @floatFromInt(s >> 40)) / 8388608.0 - 1.0; // [-1, 1)
+        v.* = @exp(sigma * u * 2.0) * (if (j % 97 == 0) @as(f32, 30.0) else 1.0);
+    }
+    var mean: f64 = 0;
+    for (dst) |v| mean += v;
+    mean /= @floatFromInt(dst.len);
+    for (dst) |*v| v.* = @floatCast(@as(f64, v.*) / mean);
+}
+
+test "an imatrix lowers the weighted error it is given to minimize" {
+    // The receipt that the weights actually reach ggml's scale search, measured
+    // on ggml's own objective — Σ w_j (W−Ŵ)² — because that is precisely what an
+    // imatrix promises to improve. (It makes the *plain* squared error worse by
+    // construction; that trade is the entire point.)
+    //
+    // q2_k is deliberately absent: it is the one type that gets *worse* on this
+    // objective. That is a real property of ggml's q2_K encoder, pinned by the
+    // test below — but it is emphatically **not** a reason to withhold an imatrix
+    // from q2_k, because on real activations q2_k benefits more than anything
+    // else. See `Imatrix.usesImatrix` for what that gap means.
+    const allocator = std.testing.allocator;
+    const rows = 16;
+    const cols = 512;
+    const n = rows * cols;
+
+    const w = try allocator.alloc(f32, n);
+    defer allocator.free(w);
+    fillDeterministicWeights(w);
+
+    const imat = try allocator.alloc(f32, cols);
+    defer allocator.free(imat);
+
+    var pool: thread_pool_mod.ThreadPool = undefined;
+    try pool.init(.{ .allocator = allocator, .n_jobs = 1 });
+    defer pool.deinit();
+
+    // Two spreads, because the benefit is spread-dependent and a single point
+    // would not show that.
+    for ([_]f32{ 1.0, 2.0 }) |sigma| {
+        fillLognormalImportance(imat, sigma);
+        for ([_]types.DataType{ .q3_k, .q4_k, .q5_k, .q6_k, .q4_0, .q4_1, .q5_0, .q5_1 }) |dt| {
+            const plain = try roundtripWeighted(allocator, w, dt, &pool, null);
+            defer allocator.free(plain);
+            const weighted = try roundtripWeighted(allocator, w, dt, &pool, imat);
+            defer allocator.free(weighted);
+
+            const e_plain = weightedSqErr(w, plain, imat);
+            const e_weighted = weightedSqErr(w, weighted, imat);
+
+            if (!(e_weighted < e_plain)) {
+                std.debug.print(
+                    "sigma {d}: {s}: imatrix did not reduce the weighted error: plain {e:.6} weighted {e:.6}\n",
+                    .{ sigma, @tagName(dt), e_plain, e_weighted },
+                );
+                return error.ImatrixNoBenefit;
+            }
+        }
+    }
+}
+
+test "q2_k is where the weighted-weight-error proxy disagrees with real output error" {
+    // A pinned counterexample, kept because it is instructive rather than because
+    // it drives any decision.
+    //
+    // Every other ggml type improves on the objective its own scale search
+    // minimizes; q2_k does not, and gets worse the wider the importance spread.
+    // On that evidence alone we withheld the imatrix from q2_k — and level 1 on
+    // real krea2 activations immediately overturned it: measured on actual output
+    // error, q2_k gains *more* than any other format. So the exclusion is gone and
+    // `Imatrix.usesImatrix` weights everything ggml will weight.
+    //
+    // What survives is the gap itself. The weighted weight error is a proxy; it
+    // ignores channel covariance that a real GEMM sees, and here it pointed the
+    // wrong way. If a future ggml makes q2_k agree with the other types, this test
+    // fails and the note above should be revisited rather than silently kept.
+    const allocator = std.testing.allocator;
+    const rows = 16;
+    const cols = 512;
+    const n = rows * cols;
+
+    const w = try allocator.alloc(f32, n);
+    defer allocator.free(w);
+    fillDeterministicWeights(w);
+
+    const imat = try allocator.alloc(f32, cols);
+    defer allocator.free(imat);
+    fillLognormalImportance(imat, 2.0); // heavy tail: the realistic regime
+
+    var pool: thread_pool_mod.ThreadPool = undefined;
+    try pool.init(.{ .allocator = allocator, .n_jobs = 1 });
+    defer pool.deinit();
+
+    const plain = try roundtripWeighted(allocator, w, .q2_k, &pool, null);
+    defer allocator.free(plain);
+    const weighted = try roundtripWeighted(allocator, w, .q2_k, &pool, imat);
+    defer allocator.free(weighted);
+
+    const ratio = weightedSqErr(w, weighted, imat) / weightedSqErr(w, plain, imat);
+    if (ratio <= 1.0) {
+        std.debug.print(
+            "q2_k now improves on the weighted-weight-error proxy too (ratio {d:.4}); the\n" ++
+                "documented proxy-vs-level-1 disagreement in Imatrix.usesImatrix is stale\n",
+            .{ratio},
+        );
+        return error.Q2KProxyNoteStale;
+    }
+}
+
+test "an imatrix changes the bytes, and only for encoders that read it" {
+    // Two claims at once: the weights are not being silently dropped for the
+    // types that honour them, and they are not being wrongly applied to the ones
+    // that document quant_weights as unused (q8_0, mxfp4).
+    //
+    // This is the ggml-level fact, so q2_k belongs in `honours` here even though
+    // policy never sends it one — that choice lives in `Imatrix.usesImatrix`, and
+    // this layer quantizes with whatever it is handed.
+    const allocator = std.testing.allocator;
+    const rows = 4;
+    const cols = 512;
+    const n = rows * cols;
+
+    const w = try allocator.alloc(f32, n);
+    defer allocator.free(w);
+    fillDeterministicWeights(w);
+
+    const imat = try allocator.alloc(f32, cols);
+    defer allocator.free(imat);
+    for (imat, 0..) |*v, j| v.* = if (j % 32 < 4) 200.0 else 0.02;
+
+    var pool: thread_pool_mod.ThreadPool = undefined;
+    try pool.init(.{ .allocator = allocator, .n_jobs = 1 });
+    defer pool.deinit();
+
+    const honours = [_]types.DataType{ .q2_k, .q3_k, .q4_k, .q5_k, .q6_k, .q4_0, .q4_1, .q5_0, .q5_1 };
+    const ignores = [_]types.DataType{ .q8_0, .mxfp4 };
+
+    inline for (honours ++ ignores) |dt| {
+        const plain = try Quantizer.convertTensorData(allocator, std.mem.sliceAsBytes(w), .F32, dt, n, &pool);
+        defer allocator.free(plain);
+        const weighted = try Quantizer.convertTensorDataWeighted(
+            allocator, std.mem.sliceAsBytes(w), .F32, dt, n, &pool, imat,
+        );
+        defer allocator.free(weighted);
+
+        const same = std.mem.eql(u8, plain, weighted);
+        const should_differ = comptime for (honours) |h| {
+            if (h == dt) break true;
+        } else false;
+
+        if (should_differ and same) {
+            std.debug.print("{s}: imatrix was accepted but changed nothing\n", .{@tagName(dt)});
+            return error.ImatrixIgnored;
+        }
+        if (!should_differ and !same) {
+            std.debug.print("{s}: imatrix changed bytes for a type that documents it as unused\n", .{@tagName(dt)});
+            return error.ImatrixMisapplied;
+        }
+    }
+}
+
+test "weighted quantization is thread-count invariant" {
+    // The row split hands each worker a different number of rows depending on the
+    // pool size; every one of them gets the whole imatrix. If the weights were
+    // ever sliced per worker instead, this is what would catch it.
+    const allocator = std.testing.allocator;
+    const rows = 12;
+    const cols = 512;
+    const n = rows * cols;
+
+    const w = try allocator.alloc(f32, n);
+    defer allocator.free(w);
+    fillDeterministicWeights(w);
+
+    const imat = try allocator.alloc(f32, cols);
+    defer allocator.free(imat);
+    for (imat, 0..) |*v, j| v.* = @as(f32, @floatFromInt(j % 17)) + 0.5;
+
+    var first: ?[]u8 = null;
+    defer if (first) |b| allocator.free(b);
+
+    for ([_]usize{ 1, 3, 5, 8 }) |n_jobs| {
+        var pool: thread_pool_mod.ThreadPool = undefined;
+        try pool.init(.{ .allocator = allocator, .n_jobs = n_jobs });
+        defer pool.deinit();
+
+        const out = try Quantizer.convertTensorDataWeighted(
+            allocator, std.mem.sliceAsBytes(w), .F32, .q4_k, n, &pool, imat,
+        );
+        if (first) |b| {
+            defer allocator.free(out);
+            try std.testing.expectEqualSlices(u8, b, out);
+        } else {
+            first = out;
+        }
+    }
+}
+
+test "an imatrix that does not fit the tensor is refused, not ignored" {
+    // Reverting to unweighted quantization on a bad fit would make an
+    // activation-aware run indistinguishable from a plain one — the failure mode
+    // that is impossible to notice from the output file.
+    const allocator = std.testing.allocator;
+    const n = 4 * 512;
+    const w = try allocator.alloc(f32, n);
+    defer allocator.free(w);
+    fillDeterministicWeights(w);
+
+    var pool: thread_pool_mod.ThreadPool = undefined;
+    try pool.init(.{ .allocator = allocator, .n_jobs = 2 });
+    defer pool.deinit();
+
+    const bad_align = try allocator.alloc(f32, 300); // not a whole number of q4_k blocks
+    defer allocator.free(bad_align);
+    @memset(bad_align, 1.0);
+    try std.testing.expectError(error.ImatrixNotBlockAligned, Quantizer.convertTensorDataWeighted(
+        allocator, std.mem.sliceAsBytes(w), .F32, .q4_k, n, &pool, bad_align,
+    ));
+
+    const bad_width = try allocator.alloc(f32, 768); // block-aligned, but 2048 % 768 != 0
+    defer allocator.free(bad_width);
+    @memset(bad_width, 1.0);
+    try std.testing.expectError(error.ImatrixWidthMismatch, Quantizer.convertTensorDataWeighted(
+        allocator, std.mem.sliceAsBytes(w), .F32, .q4_k, n, &pool, bad_width,
+    ));
 }

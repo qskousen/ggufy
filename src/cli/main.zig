@@ -6,6 +6,8 @@ const gguf = ggufy.gguf;
 const clap = @import("clap");
 const imagearch = ggufy.imageArch;
 const conv = ggufy.convert;
+const calib = ggufy.calibrate;
+const sens = ggufy.sensitivity;
 
 const build_options = @import("build_options");
 
@@ -17,6 +19,8 @@ const Command = enum {
     template,
     names,
     sensitivities,
+    calibrate,
+    sensitivity,
     version,
 };
 
@@ -75,6 +79,193 @@ fn dumpNames(
     try stdout.writeByte('\n');
 }
 
+/// Human-readable duration, for the capture summary.
+fn formatDuration(ns: u64, buf: []u8) []const u8 {
+    const s = @as(f64, @floatFromInt(ns)) / std.time.ns_per_s;
+    if (s < 90) return std.fmt.bufPrint(buf, "{d:.1}s", .{s}) catch buf[0..0];
+    if (s < 5400) return std.fmt.bufPrint(buf, "{d:.1}m", .{s / 60}) catch buf[0..0];
+    return std.fmt.bufPrint(buf, "{d:.2}h", .{s / 3600}) catch buf[0..0];
+}
+
+/// `ggufy calibrate <dit> -e <text-encoder> -v <vae> [...]` — run the prompt set
+/// through real diffusion forwards and write the calibration cache.
+fn runCalibrate(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    arena_alloc: std.mem.Allocator,
+    path: []const u8,
+    args: anytype,
+    stdout: *std.Io.Writer,
+) !void {
+    const text_encoder = args.@"text-encoder" orelse {
+        std.log.err("calibrate needs the text encoder checkpoint: -e/--text-encoder <path>", .{});
+        return error.MissingArgument;
+    };
+    const vae = args.vae orelse {
+        std.log.err("calibrate needs the VAE checkpoint: -v/--vae <path>", .{});
+        return error.MissingArgument;
+    };
+
+    const backend_name = args.backend orelse "cpu";
+    const backend = calib.Backend.fromStr(backend_name) orelse {
+        std.log.err("Unknown backend '{s}'. Use one of: cpu, vulkan, zig-cuda, cuda", .{backend_name});
+        return error.InvalidArgument;
+    };
+
+    // The prompt set is part of the measurement, so a user-supplied one is held
+    // to the same shape as the built-in and carries its own id into the cache.
+    const prompt_json = if (args.prompts) |p|
+        try std.Io.Dir.cwd().readFileAlloc(io, p, arena_alloc, .unlimited)
+    else
+        calib.default_prompts_json;
+    var set = calib.parsePromptSet(allocator, prompt_json) catch |err| {
+        std.log.err("Could not read the prompt set: {t}. Expected {{\"id\": …, \"prompts\": [ … ]}}", .{err});
+        return err;
+    };
+    defer set.deinit();
+
+    const stem = std.fs.path.stem(path);
+    const out_name = if (args.@"output-name") |n|
+        try std.fmt.allocPrint(arena_alloc, "{s}.safetensors", .{n})
+    else
+        try std.fmt.allocPrint(arena_alloc, "{s}.calib.safetensors", .{stem});
+    const out_path = if (args.@"output-dir") |d|
+        try std.fs.path.join(arena_alloc, &.{ d, out_name })
+    else
+        out_name;
+
+    // TensorPencil's load/step notes go to stdout as they happen: a CPU capture
+    // is long enough that silence would be indistinguishable from a hang.
+    const opts = calib.Options{
+        .dit_path = path,
+        .text_encoder_path = text_encoder,
+        .vae_path = vae,
+        .output_path = out_path,
+        .backend = backend,
+        .resolution = args.resolution orelse 512,
+        .steps = args.steps orelse 4,
+        .seed = args.seed orelse 0,
+        .sample_rows = args.rows orelse 64,
+        .buckets = args.buckets orelse 3,
+        .arch = args.arch orelse "",
+        .producer = try std.fmt.allocPrint(arena_alloc, "ggufy {s}", .{build_options.version}),
+        .log = stdout,
+    };
+
+    try stdout.print(
+        "capture: {d} prompts x {d} steps at {d}^2 on {s}, {d} rows x {d} buckets\n",
+        .{ set.prompts.len, opts.steps, opts.resolution, @tagName(backend), opts.sample_rows, opts.buckets },
+    );
+    try stdout.flush();
+
+    const summary = try calib.run(allocator, io, opts, set);
+
+    var tbuf: [32]u8 = undefined;
+    var sbuf: [32]u8 = undefined;
+    try stdout.print(
+        "\ncaptured {d} layers, {d} tokens, in {s}\nwrote {s} ({s})\n",
+        .{
+            summary.layers,
+            summary.tokens,
+            formatDuration(summary.elapsed_ns, &tbuf),
+            out_path,
+            formatBytes(summary.cache_bytes, &sbuf),
+        },
+    );
+    if (summary.untagged > 0) {
+        // Not fatal — a caller may run its own untagged GEMMs — but a large count
+        // means the loader is not tagging and the cache is thinner than it looks.
+        try stdout.print("note: {d} GEMMs had no tensor tag and were not recorded\n", .{summary.untagged});
+    }
+}
+
+/// `ggufy sensitivity <model> -C <cache> [...]` — level 1: measure per-layer
+/// output error on the captured activations and write a measured sensitivities
+/// JSON the converter can route on.
+fn runSensitivity(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    arena_alloc: std.mem.Allocator,
+    path: []const u8,
+    args: anytype,
+    threads: usize,
+    stdout: *std.Io.Writer,
+) !void {
+    const calib_path = args.calib orelse {
+        std.log.err("sensitivity needs a calibration cache: -C/--calib <path> (produce one with `ggufy calibrate`)", .{});
+        return error.MissingArgument;
+    };
+
+    const formats: []const sens.Format = if (args.formats) |spec|
+        sens.parseFormats(arena_alloc, spec) catch |err| {
+            std.log.err("Bad --formats value '{s}': {t}", .{ spec, err });
+            return err;
+        }
+    else
+        &sens.default_formats;
+
+    const opts = sens.Options{
+        .model_path = path,
+        .calib_path = calib_path,
+        .formats = formats,
+        .bucket = args.bucket,
+        .kernel_arm = args.@"no-kernel-arm" == 0,
+        .imatrix_arm = args.@"no-imatrix-arm" == 0,
+        .max_layers = args.@"max-layers",
+        .threads = threads,
+        .log = stdout,
+    };
+
+    var report = try sens.run(allocator, io, opts);
+    defer report.deinit();
+
+    try stdout.writeByte('\n');
+    try sens.writeMarkdown(&report, stdout, args.top orelse 25);
+
+    // The hand-authored file, when given, is the thing being checked — this is
+    // the first real audit of scores nobody ever measured.
+    if (args.sensitivities) |heur_path| {
+        const text = try std.Io.Dir.cwd().readFileAlloc(io, heur_path, arena_alloc, .unlimited);
+        const parsed = try std.json.parseFromSlice(std.json.Value, arena_alloc, text, .{});
+        defer parsed.deinit();
+        try sens.writeHeuristicDiff(&report, &parsed.value, stdout, args.top orelse 25);
+    }
+    try stdout.flush();
+
+    const stem = if (args.@"output-name") |n|
+        n
+    else if (report.arch.len > 0)
+        report.arch
+    else
+        std.fs.path.stem(path);
+
+    const json_path = try joinOut(arena_alloc, args.@"output-dir", stem, ".json");
+    try writeReportFile(io, json_path, &report, sens.writeSensitivitiesJson);
+    const csv_path = try joinOut(arena_alloc, args.@"output-dir", stem, ".csv");
+    try writeReportFile(io, csv_path, &report, sens.writeCsv);
+
+    try stdout.print("\nwrote {s} ({d} layers) and {s}\n", .{ json_path, report.layers.len, csv_path });
+}
+
+fn joinOut(arena_alloc: std.mem.Allocator, dir: ?[]const u8, stem: []const u8, ext: []const u8) ![]const u8 {
+    const name = try std.fmt.allocPrint(arena_alloc, "{s}{s}", .{ stem, ext });
+    return if (dir) |d| std.fs.path.join(arena_alloc, &.{ d, name }) else name;
+}
+
+fn writeReportFile(
+    io: std.Io,
+    out_path: []const u8,
+    report: *const sens.Report,
+    emit: *const fn (*const sens.Report, *std.Io.Writer) anyerror!void,
+) !void {
+    const file = try std.Io.Dir.cwd().createFile(io, out_path, .{ .truncate = true });
+    defer file.close(io);
+    var buf: [1 << 16]u8 = undefined;
+    var fw = file.writer(io, &buf);
+    try emit(report, &fw.interface);
+    try fw.interface.flush();
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const start_ts = std.Io.Clock.Timestamp.now(io, .awake);
@@ -99,7 +290,23 @@ pub fn main(init: std.process.Init) !void {
         \\-R, --stochastic-rounding <SEED> Seed for INT4_CONVROT_SR stochastic rounding. Omit for the built-in default seed; pass 0 to disable (deterministic, for comparison). Ignored by other types.
         \\-c, --calculate-size           With convert: compute and print the exact final output size without writing any file.
         \\-S, --shapes                   With names: emit {"name":…,"shape":[…]} objects instead of bare names, for architectures detected by shape.
-        \\<COMMAND>    Specify a command: header, tree, metadata, convert, template, version
+        \\-b, --backend <BACKEND>        With calibrate: compute backend (cpu, vulkan, zig-cuda, cuda). Default cpu.
+        \\-e, --text-encoder <FILENAME>  With calibrate: path to the text encoder checkpoint (required).
+        \\-v, --vae <FILENAME>           With calibrate: path to the VAE checkpoint (required).
+        \\-r, --resolution <INT>         With calibrate: square capture resolution in pixels, multiple of 16. Default 512.
+        \\-p, --prompts <FILENAME>       With calibrate: prompt-set JSON ({"id":…,"prompts":[…]}). Default: the built-in set.
+        \\    --steps <INT>              With calibrate: denoising steps per prompt. Default 4.
+        \\    --rows <INT>               With calibrate: token rows retained per layer per bucket. Default 64.
+        \\    --buckets <INT>            With calibrate: schedule buckets to keep separate statistics for. Default 3.
+        \\    --seed <SEED>              With calibrate: sampler seed. Default 0.
+        \\-C, --calib <FILENAME>         The calibration cache written by calibrate. Required by sensitivity; optional for convert, where it makes k-quant scale searches activation-aware (GGUF output only).
+        \\-F, --formats <NAME>           With sensitivity: comma-separated formats to measure (e.g. "q4_k,nvfp4,int4_convrot"). Default: all.
+        \\    --bucket <INT>             With sensitivity: measure only this schedule bucket. Default: all buckets together.
+        \\    --top <INT>                With sensitivity: how many layers to list in the report. Default 25.
+        \\    --max-layers <INT>         With sensitivity: stop after this many layers (a quick look, not a trustworthy ranking).
+        \\    --no-kernel-arm            With sensitivity: skip the native-kernel arm and measure format loss only.
+        \\    --no-imatrix-arm           With sensitivity: skip the activation-weighted (imatrix) arm.
+        \\<COMMAND>    Specify a command: header, tree, metadata, convert, template, calibrate, sensitivity, version
         \\<FILENAME>   The file to use for input (not required for the version command)
     );
 
@@ -113,6 +320,7 @@ pub fn main(init: std.process.Init) !void {
         .QTYPES = clap.parsers.string,
         .NAME = clap.parsers.string,
         .SEED = clap.parsers.int(u64, 10),
+        .BACKEND = clap.parsers.string,
     };
 
     // Initialize our diagnostics, which can be used for reporting useful errors.
@@ -149,6 +357,8 @@ pub fn main(init: std.process.Init) !void {
         try stdout.print("  template       Creates a json template from the specified file\n", .{});
         try stdout.print("  names          Dump tensor names as a JSON array (for test fixtures; -S to include shapes)\n", .{});
         try stdout.print("  sensitivities  Generate a sensitivities JSON template from the specified file\n", .{});
+        try stdout.print("  calibrate      Run diffusion forwards on the specified model and record a calibration cache\n", .{});
+        try stdout.print("  sensitivity    Measure per-layer sensitivity from a calibration cache and write a measured sensitivities JSON\n", .{});
         try stdout.print("  version        Print version information\n\n", .{});
         try stdout.print("Options:\n", .{});
         try stdout.flush();
@@ -208,6 +418,7 @@ pub fn main(init: std.process.Init) !void {
         .skip_sensitivity = skip_sensitivity,
         .quantization_aggressiveness = quantization_aggressiveness,
         .sensitivities_path = sensitivities_path,
+        .calibration_path = res.args.calib,
         .allowed_quant_families = allowed_quant_families,
         .model_only = model_only,
         .allow_unknown_arch = allow_unknown_arch,
@@ -216,14 +427,27 @@ pub fn main(init: std.process.Init) !void {
         .stochastic_rounding = res.args.@"stochastic-rounding",
     };
 
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    // Capture drives inference rather than reading the file as a converter
+    // input, so it is handled before file-type detection.
+    if (command == .calibrate) {
+        try runCalibrate(io, allocator, arena_alloc, path, res.args, stdout);
+        try stdout.flush();
+        return;
+    }
+    if (command == .sensitivity) {
+        try runSensitivity(io, allocator, arena_alloc, path, res.args, threads, stdout);
+        try stdout.flush();
+        return;
+    }
+
     const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
 
     var read_buffer: [8]u8 = undefined;
     var reader = file.reader(io, &read_buffer);
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const arena_alloc = arena.allocator();
 
     const file_type = types.FileType.detect_from_file(&reader.interface, allocator) catch types.FileType.safetensors;
     file.close(io);
@@ -299,7 +523,8 @@ pub fn main(init: std.process.Init) !void {
                     std.log.info("Sensitivities exported to {s}", .{out_path});
                 },
                 .names => try dumpNames(f.tensors.items, res.args.shapes != 0, allocator, stdout),
-                .version => unreachable,
+                // All three are dispatched before file-type detection.
+                .calibrate, .sensitivity, .version => unreachable,
             }
         },
         .gguf => {
@@ -366,7 +591,8 @@ pub fn main(init: std.process.Init) !void {
                     try writer.flush();
                     std.log.info("Sensitivities exported to {s}", .{out_path});
                 },
-                .version => unreachable,
+                // All three are dispatched before file-type detection.
+                .calibrate, .sensitivity, .version => unreachable,
             }
         },
     }

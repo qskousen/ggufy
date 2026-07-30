@@ -24,6 +24,12 @@ data_offset: u64 = 0,
 current_data_begin: u64 = 0,
 file_size: u64 = 0,
 
+/// Optional per-column importance weights for the quantizer's scale search
+/// (plan §8A). Supplied by the converter when `--calib` is in play; null means
+/// every tensor is quantized unweighted, which is the historical behaviour and
+/// the default.
+imatrix: ?types.ImatrixLookup = null,
+
 pub const formatType = types.FileType.gguf;
 
 const Gguf = @This();
@@ -433,13 +439,14 @@ pub fn saveWithSTData(self: Gguf, source: anytype, threads: usize, callbacks: cb
             std.log.info("Writing tensor data for tensor {}/{} {s} - nvfp4/fp8 to {s}, {} elements", .{
                 count, total_tensors, t.name, t.type, elements,
             });
-            const out = try DataTransform.Quantizer.convertTensorData(
+            const out = try DataTransform.Quantizer.convertTensorDataWeighted(
                 self.allocator,
                 std.mem.sliceAsBytes(f32_buf),
                 .F32,
                 target_dtype,
                 f32_buf.len,
                 &pool,
+                if (self.imatrix) |im| im.forTensor(t) else null,
             );
             defer self.allocator.free(out);
             try (&writer.interface).writeAll(out);
@@ -541,13 +548,14 @@ pub fn writeTensorData(
     } else {
         // Use DataTransform to convert the data
         std.log.debug("Converting data from {s} to {s}.", .{@tagName(source_dtype), @tagName(target_dtype)});
-        const converted_data = try DataTransform.Quantizer.convertTensorData(
+        const converted_data = try DataTransform.Quantizer.convertTensorDataWeighted(
             self.allocator,
             source_data,
             source_dtype,
             target_dtype,
             n_elements,
             pool,
+            if (self.imatrix) |im| im.forTensor(t) else null,
         );
         defer self.allocator.free(converted_data);
 

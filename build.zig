@@ -231,6 +231,66 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(activations_test).step);
 
+    // Calibration cache: reads/writes the safetensors container and drives the same
+    // matmul probe, so it needs the umbrella too.
+    const calib_cache_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/CalibrationCache.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "TensorPencil", .module = tp },
+            },
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(calib_cache_test).step);
+
+    // Capture driver: the `run` path needs real checkpoints and is exercised by
+    // hand, but the prompt-set parsing and the model identity hash are testable
+    // here and both decide whether a cache is usable.
+    const calibrate_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/Calibrate.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "TensorPencil", .module = tp },
+            },
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(calibrate_test).step);
+
+    // Level-1 sensitivity harness: needs the umbrella (it runs GEMMs) and
+    // build_options (it pulls in Convert.zig's provenance stamp transitively).
+    const sensitivity_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/Sensitivity.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "TensorPencil", .module = tp },
+                .{ .name = "tp_core", .module = tp_core },
+                .{ .name = "build_options", .module = options_mod },
+            },
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(sensitivity_test).step);
+
+    // Activation-aware weighting: builds ggml's imatrix from a calibration cache,
+    // so it needs the umbrella (the cache reader and the probe both live there).
+    const imatrix_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/Imatrix.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "TensorPencil", .module = tp },
+                .{ .name = "tp_core", .module = tp_core },
+            },
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(imatrix_test).step);
+
     const convert_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/Convert.zig"),
@@ -238,6 +298,10 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "tp_core", .module = tp_core },
+                // Convert.zig now reaches a calibration cache (--calib), which is
+                // read through TensorPencil — so this standalone module needs the
+                // umbrella as well as tp_core.
+                .{ .name = "TensorPencil", .module = tp },
                 // Convert.zig imports build_options (stampConverterProvenance uses the version
                 // string); the standalone test module must provide it too, or a test that
                 // exercises the write path fails to compile with "no module named build_options".

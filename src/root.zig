@@ -14,3 +14,7 @@ pub const callbacks = @import("callbacks.zig");
 /// Activation-aware quantization support (see ACTIVATION_AWARE_PLAN.md). Needs the
 /// TensorPencil umbrella (inference), unlike everything above.
 pub const activations = @import("Activations.zig");
+pub const calibrationCache = @import("CalibrationCache.zig");
+pub const calibrate = @import("Calibrate.zig");
+pub const sensitivity = @import("Sensitivity.zig");
+pub const imatrix = @import("Imatrix.zig");

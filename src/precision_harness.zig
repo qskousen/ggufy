@@ -87,7 +87,9 @@ pub const formats = [_]FormatSpec{
 
 /// The GGUF datatype used for each byte-based format's round-trip.
 /// Returns null for the scale-tensor cluster formats, which take a bespoke path.
-fn ggufDstType(fmt: Format) ?types.DataType {
+/// Public because the level-1 harness needs the same mapping to decide which
+/// formats can take an imatrix.
+pub fn ggufDstType(fmt: Format) ?types.DataType {
     return switch (fmt) {
         .f16 => .f16,
         .bf16 => .bf16,

@@ -10,6 +10,8 @@ const imagearch = @import("ImageArch.zig");
 const cb = @import("callbacks.zig");
 const TensorClusters = @import("TensorClusters.zig");
 const DataTransform = @import("DataTransform.zig");
+const CalibrationCache = @import("CalibrationCache.zig");
+const Imatrix = @import("Imatrix.zig");
 const build_options = @import("build_options");
 
 // Cluster identity blobs + layout now live in TensorClusters (the shared source of truth).
@@ -54,6 +56,13 @@ pub const ConvertOptions = struct {
     /// stochastic rounding (making SR output identical to plain INT4_CONVROT — the
     /// deterministic path used for bit-for-bit comparison). Ignored by all other types.
     stochastic_rounding: ?u64 = null,
+    /// Path to a calibration cache (`ggufy calibrate` output). When set, the
+    /// per-channel activation energy it holds is passed to the quantizer as
+    /// ggml's `imatrix`, so k-quant scale searches minimize activation-weighted
+    /// error instead of plain weight error (plan §8A). Output layout is
+    /// unchanged — only which representable values get chosen. GGUF output only:
+    /// nothing on the safetensors side goes through a ggml encoder.
+    calibration_path: ?[]const u8 = null,
     /// Optional GUI progress/cancel hooks.  No-ops when null.
     callbacks: cb.ConvertCallbacks = .{},
 };
@@ -281,6 +290,13 @@ pub fn convert(
     }
 
     var prep = try prepareConversion(f, opts, allocator, arena_alloc);
+
+    // Only the GGUF path runs tensors through a ggml encoder, so an imatrix has
+    // nowhere to act on a safetensors output. Say so rather than accept the flag
+    // and silently do nothing with it.
+    if (opts.calibration_path != null and opts.filetype != .gguf) {
+        std.log.warn("--calib has no effect on safetensors output: only the GGUF block-quant encoders take an imatrix", .{});
+    }
 
     // --- Write output ---------------------------------------------------------
     switch (opts.filetype) {
@@ -900,6 +916,11 @@ fn applySensitivityQuantization(
     families: QuantizationFamilies,
     sensitivities: *const std.json.Parsed(std.json.Value),
 ) !void {
+    // `t.name` is already prefix-stripped here — `filterAndStripTensors` does it
+    // for every tensor before conversion — so a sensitivities file must be keyed
+    // on the canonical unprefixed name. `Sensitivity.zig` emits that form for
+    // exactly this reason; a file keyed on `model.diffusion_model.*` would match
+    // nothing, silently, since the miss below is a warning rather than an error.
     const sens_value = sensitivities.value.object.get(t.name);
     if (sens_value) |sv| {
         const sens: f32 = switch (sv) {
@@ -1134,6 +1155,85 @@ fn buildGgufMetadata(
     }
 }
 
+/// Open the calibration cache named by `opts` and turn it into per-column
+/// weights, reporting how much of the model it actually covers.
+///
+/// The coverage report is the point of doing this here rather than lazily at the
+/// first tensor: "I passed --calib" and "the weighting reached the layers that
+/// matter" are different facts, and a cache captured from a sibling checkpoint
+/// (or before a shape change) can produce the first without the second. The
+/// sanity gate runs first for the same reason — a stale cache that quietly
+/// produces plausible numbers is this subsystem's worst failure mode.
+fn loadImatrix(
+    opts: ConvertOptions,
+    allocator: std.mem.Allocator,
+    tensors: []const types.Tensor,
+) !?Imatrix.Imatrix {
+    const path = opts.calibration_path orelse return null;
+
+    var cache = CalibrationCache.Cache.open(allocator, opts.io, path) catch |err| {
+        std.log.err("Could not read calibration cache {s}: {s}", .{ path, @errorName(err) });
+        return err;
+    };
+    defer cache.deinit();
+
+    // No model hash to check against here: the converter's source may legitimately
+    // be a different checkpoint from the one captured (a finetune of the same
+    // architecture), and the measured ranking was shown to transfer across
+    // finetunes. The per-tensor width check below is the real guard.
+    var diag: CalibrationCache.Diagnostic = .{};
+    CalibrationCache.validate(&cache, .{}, &diag) catch |err| {
+        std.log.err("Calibration cache {s} failed its sanity check: {s} ({s})", .{
+            path, diag.msg, @errorName(err),
+        });
+        return err;
+    };
+
+    var im = try Imatrix.fromCache(allocator, &cache);
+    errdefer im.deinit();
+
+    const s = im.summarize(tensors);
+    std.log.info(
+        "Activation-aware quantization from {s} (arch {s}, {d} steps, {d} buckets, prompt set {s}): " ++
+        "{d} tensors weighted, {d} unweighted format, {d} no calibration data, " ++
+        "{d} width mismatch, {d} block misaligned",
+        .{
+            path, cache.prov.arch, cache.prov.steps, cache.prov.buckets, cache.prov.prompt_set,
+            s.use, s.unweighted_type, s.no_data, s.width_mismatch, s.block_misaligned,
+        },
+    );
+    if (im.stats.channels > 0) {
+        std.log.info("Imatrix covers {d} layers, {d}/{d} channels floored as unobserved", .{
+            im.stats.layers, im.stats.floored, im.stats.channels,
+        });
+    }
+    if (im.stats.ambiguous > 0) {
+        std.log.warn("{d} cache layers dropped: their names collide once the container prefix is stripped", .{im.stats.ambiguous});
+    }
+    if (s.width_mismatch > 0) {
+        std.log.warn(
+            "{d} tensors have a row width the cache disagrees with and were quantized unweighted " ++
+            "(expected for shape-fixed tensors; unexpected in bulk, which would mean the cache " ++
+            "belongs to a differently shaped model)",
+            .{s.width_mismatch},
+        );
+    }
+    if (s.use == 0) {
+        std.log.warn("No tensor was activation-weighted — this conversion is identical to one without --calib", .{});
+    }
+
+    return im;
+}
+
+fn imatrixGet(ctx: *const anyopaque, t: types.Tensor) ?[]const f32 {
+    const im: *const Imatrix.Imatrix = @alignCast(@ptrCast(ctx));
+    return im.forTensor(t);
+}
+
+fn imatrixLookup(im: *const Imatrix.Imatrix) types.ImatrixLookup {
+    return .{ .ctx = im, .get = imatrixGet };
+}
+
 fn writeGguf(
     f: anytype,
     model_tensors: std.ArrayList(types.Tensor),
@@ -1166,6 +1266,13 @@ fn writeGguf(
     var out_gguf = try gguf.init(out_filename, opts.io, allocator, arena_alloc, true);
     defer out_gguf.deinit();
     out_gguf.tensors = model_tensors;
+
+    // --- Activation-aware weighting (plan §8A) --------------------------------
+    // Built after the tensor list is final, so the coverage report describes the
+    // tensors that will actually be written — shape fix and all.
+    var imatrix = try loadImatrix(opts, allocator, model_tensors.items);
+    defer if (imatrix) |*im| im.deinit();
+    if (imatrix) |*im| out_gguf.imatrix = imatrixLookup(im);
 
     try buildGgufMetadata(&out_gguf.metadata, f, arch, template_metadata, extra_metadata, opts, arena_alloc);
 

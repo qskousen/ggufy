@@ -1,0 +1,22 @@
+{
+  "id": "ggufy-calib-v1",
+  "note": "Default activation-capture prompt set (rung 1, 16 prompts). Chosen for coverage of the content where quantization damage shows up first — text rendering, fine repeating texture, faces and hands, high-frequency detail — not for prettiness. See ACTIVATION_AWARE.md. Changing this list changes every cache captured with it, so bump `id` rather than editing in place.",
+  "prompts": [
+    "a weathered enamel shop sign reading \"NORTHGATE BAKERY, EST. 1928\" in hand-painted serif letters",
+    "a close-up of a paperback book cover, the title \"The Long Afternoon\" in crisp typography",
+    "a chalkboard menu in a cafe listing espresso, cortado, and flat white with prices",
+    "a portrait of an elderly fisherman, deep wrinkles, grey stubble, direct eye contact, overcast light",
+    "a young woman laughing, freckles, wind-blown hair, shallow depth of field",
+    "two hands carefully tying a fishing knot, close macro, visible skin texture",
+    "a herringbone tweed jacket photographed close enough to resolve individual threads",
+    "an aerial view of a terracotta rooftop district, thousands of overlapping tiles",
+    "a chain-link fence in front of a brick wall, strong moire-prone repeating pattern",
+    "a peacock feather laid flat on black velvet, iridescent barbs in sharp focus",
+    "a bowl of pomegranate seeds glistening under hard directional light",
+    "an intricate wrought-iron gate casting thin shadows on pale stone",
+    "a rain-soaked city street at night, neon reflections in the puddles, long exposure",
+    "a snow-covered pine forest under flat white overcast, almost no colour",
+    "a still life of clear glass bottles on a mirrored surface, caustics and refraction",
+    "a technical line drawing of a bicycle derailleur, thin uniform strokes on white"
+  ]
+}

@@ -28,6 +28,10 @@ const tp = @import("TensorPencil");
 const Weight = tp.ops.matmul.Weight;
 
 pub const Options = struct {
+    /// Default `seed`, named so a driver can record it in a cache's provenance
+    /// without hardcoding the literal a second time.
+    pub const default_seed: u64 = 0x9E3779B97F4A7C15;
+
     /// Token rows to retain per layer per bucket (the `r` of the row sample).
     /// Uniform over every token seen, via reservoir sampling — so this is a memory
     /// bound, not a "first r tokens" truncation.
@@ -36,7 +40,7 @@ pub const Options = struct {
     buckets: usize = 3,
     /// Base seed for the row sampling. Fixed by default: the same run must select
     /// the same tokens, or two formats cannot be compared on equal footing.
-    seed: u64 = 0x9E3779B97F4A7C15,
+    seed: u64 = default_seed,
 };
 
 /// Per-layer, per-bucket accumulator.
