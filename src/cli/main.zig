@@ -210,7 +210,7 @@ fn runSensitivity(
         .formats = formats,
         .bucket = args.bucket,
         .kernel_arm = args.@"no-kernel-arm" == 0,
-        .imatrix_arm = args.@"no-imatrix-arm" == 0,
+        .weighted_arm = args.@"no-weighted-arm" == 0,
         .max_layers = args.@"max-layers",
         .threads = threads,
         .log = stdout,
@@ -305,7 +305,7 @@ pub fn main(init: std.process.Init) !void {
         \\    --top <INT>                With sensitivity: how many layers to list in the report. Default 25.
         \\    --max-layers <INT>         With sensitivity: stop after this many layers (a quick look, not a trustworthy ranking).
         \\    --no-kernel-arm            With sensitivity: skip the native-kernel arm and measure format loss only.
-        \\    --no-imatrix-arm           With sensitivity: skip the activation-weighted (imatrix) arm.
+        \\    --no-weighted-arm          With sensitivity: skip the activation-weighted arm (imatrix + clipping search).
         \\<COMMAND>    Specify a command: header, tree, metadata, convert, template, calibrate, sensitivity, version
         \\<FILENAME>   The file to use for input (not required for the version command)
     );

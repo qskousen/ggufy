@@ -813,11 +813,37 @@ pub const Quantizer = struct {
         input: []const f32,
         pool: *thread_pool_mod.ThreadPool,
     ) !ComfyFp8Data {
+        return quantizeToComfyFp8Weighted(allocator, input, pool, null, 0);
+    }
+
+    /// `quantizeToComfyFp8` with the activation-weighted clipping search.
+    ///
+    /// The scale here is a single scalar over the whole tensor, so the search is
+    /// one-dimensional and the weighting is the tensor's per-column energy tiled
+    /// across rows. `weights` is per input column (length `cols`); null
+    /// reproduces `quantizeToComfyFp8` exactly.
+    ///
+    /// Note this searches against the *rounded fp8 grid*, not a uniform one — the
+    /// error model is `f32 → e4m3 → f32`, which is what the format actually does.
+    pub fn quantizeToComfyFp8Weighted(
+        allocator: std.mem.Allocator,
+        input: []const f32,
+        pool: *thread_pool_mod.ThreadPool,
+        weights: ?[]const f32,
+        cols: usize,
+    ) !ComfyFp8Data {
         var amax: f32 = 0.0;
         for (input) |v| amax = @max(amax, @abs(v));
 
         const fp8_max: f32 = 448.0;
-        const scale: f32 = if (amax > 0.0) amax / fp8_max else 1.0;
+        var scale: f32 = if (amax > 0.0) amax / fp8_max else 1.0;
+        if (weights) |w| {
+            if (cols == 0 or w.len != cols or input.len % cols != 0) return error.WeightsWidthMismatch;
+            const chunks = @max(1, @min(fp8_search_chunks, input.len));
+            const partials = try allocator.alloc(f64, chunks * clip_ratios.len);
+            defer allocator.free(partials);
+            scale = searchFp8Scale(input, w, cols, amax, pool, partials);
+        }
         const inv_scale = 1.0 / scale;
 
         // Pre-scale so that the F8 conversion round-trips correctly via *scale
@@ -830,6 +856,90 @@ pub const Quantizer = struct {
         try convertTypeSimple(scaled, weight, pool, .F8_E4M3);
 
         return .{ .weight = weight, .scale = scale };
+    }
+
+    /// One-dimensional clip search for the FP8 cluster's single global scale.
+    /// Separate from `searchScale` because the reconstruction is an fp8 round-trip
+    /// rather than a uniform grid, so the error has to be evaluated through the
+    /// actual e4m3 encoder.
+    ///
+    /// Element ranges the fp8 error reduction is split into.
+    ///
+    /// **Fixed, not derived from the pool size.** The reduction is a global sum of
+    /// f64 partials, so its result depends on the partition; deriving the
+    /// partition from the thread count would make a tensor quantize differently
+    /// on an 8-core machine than on a 16-core one. A constant chunk count keeps
+    /// both the summation order and the answer identical everywhere, and the pool
+    /// simply schedules however many chunks it can at a time.
+    const fp8_search_chunks: usize = 64;
+
+    /// Threaded over element ranges rather than over candidate scales: each chunk
+    /// evaluates every candidate on its own slice and the partials are summed in
+    /// chunk order afterwards. Splitting by candidate instead would leave most
+    /// threads idle once the grid is shorter than the core count.
+    fn searchFp8Scale(
+        input: []const f32,
+        w: []const f32,
+        cols: usize,
+        amax: f32,
+        pool: *thread_pool_mod.ThreadPool,
+        partials: []f64,
+    ) f32 {
+        if (amax <= 0.0) return 1.0;
+        const fp8_max: f32 = 448.0;
+
+        const chunks = @max(1, @min(fp8_search_chunks, input.len));
+        @memset(partials, 0);
+
+        var wg: thread_pool_mod.WaitGroup = .{};
+        const per = input.len / chunks;
+        for (0..chunks) |i| {
+            const start = i * per;
+            const end = if (i == chunks - 1) input.len else start + per;
+            pool.spawnWg(&wg, fp8ScaleErrors, .{
+                input, w, cols, amax, start, end, partials[i * clip_ratios.len ..][0..clip_ratios.len],
+            });
+        }
+        wg.wait();
+
+        var best_s: f32 = amax / fp8_max;
+        var best_e: f64 = std.math.inf(f64);
+        for (clip_ratios, 0..) |alpha, k| {
+            var acc: f64 = 0;
+            for (0..chunks) |i| acc += partials[i * clip_ratios.len + k];
+            if (acc < best_e) {
+                best_e = acc;
+                best_s = alpha * amax / fp8_max;
+            }
+        }
+        return best_s;
+    }
+
+    fn fp8ScaleErrors(
+        input: []const f32,
+        w: []const f32,
+        cols: usize,
+        amax: f32,
+        start: usize,
+        end: usize,
+        out: []f64,
+    ) void {
+        const fp8_max: f32 = 448.0;
+        for (clip_ratios, 0..) |alpha, k| {
+            const s: f32 = alpha * amax / fp8_max;
+            if (s <= 0.0) {
+                out[k] = std.math.inf(f64);
+                continue;
+            }
+            var acc: f64 = 0;
+            for (input[start..end], start..) |v, i| {
+                if (std.math.isNan(v) or std.math.isInf(v)) continue;
+                const back = fp8_e4m3_to_f32(f32_to_fp8_e4m3(v / s)) * s;
+                const d: f64 = @as(f64, v) - @as(f64, back);
+                acc += @as(f64, w[i % cols]) * d * d;
+            }
+            out[k] = acc;
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -992,6 +1102,205 @@ pub const Quantizer = struct {
         return @as(f32, @floatFromInt(h >> 40)) * 0x1p-24;
     }
 
+    // -------------------------------------------------------------------------
+    // Activation-weighted clipping search (plan §8A.2)
+    //
+    // Every symmetric-integer format here picks its scale as `amax / qmax`: the
+    // smallest scale that clips nothing. That is the right answer when all
+    // weights matter equally, and the wrong one when they do not — a single
+    // outlier channel the network barely reads stretches the grid for every
+    // channel it does read. Clipping it costs one large error on a column with
+    // low activation energy and buys finer resolution everywhere else.
+    //
+    // So: search a clipping ratio α over `scale = α · amax / qmax`, and keep the
+    // α that minimizes Σ_i w_i (x_i − ŝ·q_i)², where w is per-element activation
+    // energy from a calibration cache.
+    //
+    // **The default is untouched.** With no weights the search does not run at
+    // all, so `ggufy convert` without `--calib` still produces the ComfyUI-
+    // bit-exact bytes the fixtures pin. This is opt-in precisely because those
+    // fixtures are the correctness contract for these formats.
+    // -------------------------------------------------------------------------
+
+    /// Clipping ratios searched, from "clip nothing" down to "clip hard". α = 1.0
+    /// is first so it is the incumbent: the search uses a strict improvement test,
+    /// so it can never return a scale worse than the default *on its own
+    /// objective*, and ties keep the default.
+    ///
+    /// The range reaches **0.10**, not the 0.5 the plan first sketched. A row's
+    /// scale is set by its largest element, so clipping an outlier of magnitude
+    /// k× the bulk down to the bulk needs α ≈ 1/k — and activation-outlier
+    /// channels in transformers routinely sit 10–100× above the median. A grid
+    /// stopping at 0.5 can only ever halve the range, which is nowhere near
+    /// enough to act on the very rows the search exists for. (Measured: on a row
+    /// with a 100× low-importance outlier, a [0.5, 1.0] grid could not improve
+    /// the weighted error at all.) Widening is safe because the search only moves
+    /// on a strict improvement.
+    ///
+    /// Resolution is fine near 1.0, where well-behaved rows land, and coarser
+    /// below, where the decision is "clip this outlier or not" rather than a
+    /// precise ratio.
+    pub const clip_ratios = blk: {
+        const fine = 21; // 1.000 … 0.500 in 0.025 steps
+        const coarse = 8; // 0.450 … 0.100 in 0.050 steps
+        var out: [fine + coarse]f32 = undefined;
+        for (0..fine) |i| out[i] = 1.0 - 0.025 * @as(f32, @floatFromInt(i));
+        for (0..coarse) |i| out[fine + i] = 0.45 - 0.05 * @as(f32, @floatFromInt(i));
+        break :blk out;
+    };
+
+    /// Weighted squared error of quantizing `vals` at scale `s`.
+    /// Lanes the clipping-error evaluation is vectorized over.
+    ///
+    /// Fixed at comptime, so the f64 accumulation order is the same on every
+    /// machine — a search whose answer depended on the vector width would
+    /// quantize differently per host, the same reproducibility trap
+    /// `fp8_search_chunks` avoids.
+    const clip_lanes = 8;
+
+    /// Round half to even, elementwise. Same rule as `roundHalfToEven` — the
+    /// search has to score candidates under the rounding the quantizer will
+    /// actually apply, or it optimizes for a quantization that never happens.
+    ///
+    /// `fl - 2·⌊fl/2⌋` is the parity test; it agrees with the scalar's
+    /// `@mod(fl, 2)` on negatives too, since both land in [0, 2).
+    fn roundHalfToEvenVec(x: @Vector(clip_lanes, f32)) @Vector(clip_lanes, f32) {
+        const zero: @Vector(clip_lanes, f32) = @splat(0.0);
+        const one: @Vector(clip_lanes, f32) = @splat(1.0);
+        const two: @Vector(clip_lanes, f32) = @splat(2.0);
+        const half: @Vector(clip_lanes, f32) = @splat(0.5);
+
+        const fl = @floor(x);
+        const diff = x - fl;
+        const odd = (fl - two * @floor(fl / two)) != zero;
+        const tie = @select(f32, odd, one, zero);
+        return fl + @select(f32, diff > half, one, @select(f32, diff < half, zero, tie));
+    }
+
+    /// Weighted squared error of quantizing `vals` at scale `s`.
+    ///
+    /// This is the hot loop of the whole clipping search — every candidate ratio
+    /// walks every element of every row — so it is vectorized. Note the f64
+    /// accumulation is per lane and reduced at the end, which is a different
+    /// summation order from a scalar loop; the value can differ in the last bits.
+    /// That is fine because it is deterministic and only ever used to *rank*
+    /// candidates, but it does mean this is not bit-identical to a naive scalar
+    /// implementation of the same formula.
+    fn clipError(vals: []const f32, w: []const f32, s: f32, qlo: f32, qhi: f32) f64 {
+        const sv: @Vector(clip_lanes, f32) = @splat(s);
+        const lo: @Vector(clip_lanes, f32) = @splat(qlo);
+        const hi: @Vector(clip_lanes, f32) = @splat(qhi);
+        var acc: @Vector(clip_lanes, f64) = @splat(0.0);
+
+        var i: usize = 0;
+        while (i + clip_lanes <= vals.len) : (i += clip_lanes) {
+            const v: @Vector(clip_lanes, f32) = vals[i..][0..clip_lanes].*;
+            const wi: @Vector(clip_lanes, f32) = w[i..][0..clip_lanes].*;
+            const q = @min(@max(roundHalfToEvenVec(v / sv), lo), hi);
+            // Widen before the subtraction, exactly as the scalar path does, so
+            // only the accumulation order differs between the two.
+            const vd: @Vector(clip_lanes, f64) = @floatCast(v);
+            const qd: @Vector(clip_lanes, f64) = @floatCast(q);
+            const sd: @Vector(clip_lanes, f64) = @splat(@as(f64, s));
+            const d = vd - sd * qd;
+            // A non-finite input contributes nothing, matching the scalar guard.
+            // One comparison covers both cases: NaN fails every comparison, and
+            // `inf < inf` is false.
+            const finite = @abs(v) < @as(@Vector(clip_lanes, f32), @splat(std.math.inf(f32)));
+            const term = @as(@Vector(clip_lanes, f64), @floatCast(wi)) * d * d;
+            acc += @select(f64, finite, term, @as(@Vector(clip_lanes, f64), @splat(0.0)));
+        }
+
+        var total = @reduce(.Add, acc);
+        while (i < vals.len) : (i += 1) {
+            const v = vals[i];
+            if (std.math.isNan(v) or std.math.isInf(v)) continue;
+            const q = std.math.clamp(roundHalfToEven(v / s), qlo, qhi);
+            const d: f64 = @as(f64, v) - @as(f64, s) * @as(f64, q);
+            total += @as(f64, w[i]) * d * d;
+        }
+        return total;
+    }
+
+    /// Pick the scale for one symmetric-integer group. `w` is per-element
+    /// importance in the same basis as `vals`; null falls back to the plain
+    /// `amax / qmax` the reference implementations use.
+    ///
+    /// `qdiv` is the divisor the format's default uses (127 for int8, 7 for
+    /// int4); `qlo`/`qhi` are the clamp bounds, which are not always symmetric
+    /// with it (int8 clamps to [-128, 127]).
+    fn searchScale(vals: []const f32, w: ?[]const f32, qdiv: f32, qlo: f32, qhi: f32) f32 {
+        var amax: f32 = 0.0;
+        for (vals) |v| {
+            if (!std.math.isNan(v) and !std.math.isInf(v)) amax = @max(amax, @abs(v));
+        }
+        const base: f32 = @max(amax / qdiv, 1e-30);
+        const weights = w orelse return base;
+
+        var best_s = base;
+        var best_e = clipError(vals, weights, base, qlo, qhi);
+        // Skip index 0: α = 1.0 is `base`, already the incumbent.
+        for (clip_ratios[1..]) |alpha| {
+            const s: f32 = @max(alpha * amax / qdiv, 1e-30);
+            const e = clipError(vals, weights, s, qlo, qhi);
+            if (e < best_e) {
+                best_e = e;
+                best_s = s;
+            }
+        }
+        return best_s;
+    }
+
+    /// Per-element importance in the basis the quantizer actually rounds in.
+    ///
+    /// Without rotation that is just the per-column activation energy. With
+    /// ConvRot the quantizer rounds `H·x` group-wise, so the objective `eᵀDe`
+    /// becomes `εᵀ(HᵀDH)ε`. Every entry of the normalized regular Hadamard has
+    /// magnitude `1/√g`, so
+    ///
+    ///     diag(HᵀDH)_k = Σ_j d_j·H[j,k]² = (1/g)·Σ_j d_j
+    ///
+    /// — **the same value for every k in the group**. The rotated importance is
+    /// therefore piecewise constant: one weight per group, equal to that group's
+    /// mean energy. That is weaker than per-channel weighting (96 distinct values
+    /// per row at g=64, cols=6144, not 6144) but it is the correct diagonal
+    /// treatment, and it is what lets a row's scale be set by the groups the
+    /// network actually reads.
+    ///
+    /// The off-diagonal terms are dropped. Keeping them is what §8C's GPTQ solve
+    /// is for; a per-row scalar scale cannot exploit them anyway.
+    ///
+    /// Returns null when there is nothing to do (no weights), so callers keep the
+    /// reference path. Caller owns the result.
+    pub fn rotatedWeights(
+        allocator: std.mem.Allocator,
+        weights: ?[]const f32,
+        cols: usize,
+        convrot: bool,
+        group_size: usize,
+    ) !?[]f32 {
+        const w = weights orelse return null;
+        if (w.len != cols) return error.WeightsWidthMismatch;
+
+        const out = try allocator.alloc(f32, cols);
+        errdefer allocator.free(out);
+        if (!convrot) {
+            @memcpy(out, w);
+            return out;
+        }
+        if (group_size == 0 or cols % group_size != 0) return error.ColsNotDivisibleByGroupSize;
+
+        const inv_g = 1.0 / @as(f64, @floatFromInt(group_size));
+        var g: usize = 0;
+        while (g < cols) : (g += group_size) {
+            var sum: f64 = 0;
+            for (w[g .. g + group_size]) |v| sum += v;
+            const mean: f32 = @floatCast(sum * inv_g);
+            @memset(out[g .. g + group_size], mean);
+        }
+        return out;
+    }
+
     pub const ConvrotInt8Data = struct {
         weight: []u8, // int8 bit patterns, [rows*cols]
         scale: []f32, // per-row scale, [rows]
@@ -1012,7 +1321,26 @@ pub const Quantizer = struct {
         group_size: usize,
         pool: *thread_pool_mod.ThreadPool,
     ) !ConvrotInt8Data {
+        return quantizeToInt8Weighted(allocator, input, rows, cols, convrot, group_size, pool, null);
+    }
+
+    /// `quantizeToInt8` with the activation-weighted clipping search enabled.
+    /// `weights` is per **input column** (length `cols`); null reproduces
+    /// `quantizeToInt8` exactly, including its reference-bit-exact scales.
+    pub fn quantizeToInt8Weighted(
+        allocator: std.mem.Allocator,
+        input: []const f32,
+        rows: usize,
+        cols: usize,
+        convrot: bool,
+        group_size: usize,
+        pool: *thread_pool_mod.ThreadPool,
+        weights: ?[]const f32,
+    ) !ConvrotInt8Data {
         if (input.len != rows * cols) return error.InputSizeMismatch;
+
+        const rot_w = try rotatedWeights(allocator, weights, cols, convrot, group_size);
+        defer if (rot_w) |rw| allocator.free(rw);
 
         // Rotation is in-place, so it needs a mutable copy; plain int8 reads the input directly.
         var rotated: []f32 = &.{};
@@ -1042,7 +1370,7 @@ pub const Quantizer = struct {
             var end = start + rows_per_thread;
             if (i == threads_u64 - 1) end += leftover;
             if (start == end) continue;
-            pool.spawnWg(&wg, quantizeInt8Rows, .{ work, weight, scale, cols, @as(usize, @intCast(start)), @as(usize, @intCast(end)) });
+            pool.spawnWg(&wg, quantizeInt8Rows, .{ work, weight, scale, cols, rot_w, @as(usize, @intCast(start)), @as(usize, @intCast(end)) });
         }
         wg.wait();
 
@@ -1054,16 +1382,13 @@ pub const Quantizer = struct {
         weight: []u8,
         scale: []f32,
         cols: usize,
+        rot_w: ?[]const f32,
         start_row: usize,
         end_row: usize,
     ) void {
         for (start_row..end_row) |r| {
             const row = work[r * cols .. r * cols + cols];
-            var amax: f32 = 0.0;
-            for (row) |v| {
-                if (!std.math.isNan(v) and !std.math.isInf(v)) amax = @max(amax, @abs(v));
-            }
-            const s: f32 = @max(amax / 127.0, 1e-30);
+            const s = searchScale(row, rot_w, 127.0, -128.0, 127.0);
             scale[r] = s;
             for (row, 0..) |v, c| {
                 // True division (not multiply-by-reciprocal) to match torch's x/scale bit-for-bit.
@@ -1120,8 +1445,35 @@ pub const Quantizer = struct {
         stochastic_rounding: u64,
         pool: *thread_pool_mod.ThreadPool,
     ) !Int4Data {
+        return quantizeToInt4Weighted(allocator, input, rows, cols, convrot, group_size, stochastic_rounding, pool, null);
+    }
+
+    /// `quantizeToInt4` with the activation-weighted clipping search enabled.
+    /// `weights` is per **input column** (length `cols`); null reproduces
+    /// `quantizeToInt4` exactly.
+    ///
+    /// The search always evaluates candidates under deterministic rounding, even
+    /// when `stochastic_rounding` is nonzero. The two are separable: the search
+    /// picks where to put the grid, SR then dithers within it, and SR's expected
+    /// error at a fixed scale tracks the deterministic error closely enough that
+    /// the argmin over α does not move. Searching under a random rounding would
+    /// also make the chosen scale depend on the dither, which is worse.
+    pub fn quantizeToInt4Weighted(
+        allocator: std.mem.Allocator,
+        input: []const f32,
+        rows: usize,
+        cols: usize,
+        convrot: bool,
+        group_size: usize,
+        stochastic_rounding: u64,
+        pool: *thread_pool_mod.ThreadPool,
+        weights: ?[]const f32,
+    ) !Int4Data {
         if (input.len != rows * cols) return error.InputSizeMismatch;
         if (cols % 2 != 0) return error.ColsNotEven;
+
+        const rot_w = try rotatedWeights(allocator, weights, cols, convrot, group_size);
+        defer if (rot_w) |rw| allocator.free(rw);
 
         // Rotation is in-place, so it needs a mutable copy; plain int4 reads the input directly.
         var rotated: []f32 = &.{};
@@ -1151,7 +1503,7 @@ pub const Quantizer = struct {
             var end = start + rows_per_thread;
             if (i == threads_u64 - 1) end += leftover;
             if (start == end) continue;
-            pool.spawnWg(&wg, quantizeInt4Rows, .{ work, weight, scale, cols, stochastic_rounding, @as(usize, @intCast(start)), @as(usize, @intCast(end)) });
+            pool.spawnWg(&wg, quantizeInt4Rows, .{ work, weight, scale, cols, stochastic_rounding, rot_w, @as(usize, @intCast(start)), @as(usize, @intCast(end)) });
         }
         wg.wait();
 
@@ -1164,17 +1516,14 @@ pub const Quantizer = struct {
         scale: []f32,
         cols: usize,
         stochastic_rounding: u64,
+        rot_w: ?[]const f32,
         start_row: usize,
         end_row: usize,
     ) void {
         const packed_cols = cols / 2;
         for (start_row..end_row) |r| {
             const row = work[r * cols .. r * cols + cols];
-            var amax: f32 = 0.0;
-            for (row) |v| {
-                if (!std.math.isNan(v) and !std.math.isInf(v)) amax = @max(amax, @abs(v));
-            }
-            const s: f32 = @max(amax / 7.0, 1e-30);
+            const s = searchScale(row, rot_w, 7.0, -7.0, 7.0);
             scale[r] = s;
             const row_base = r * cols; // flat element index of column 0, for the per-element RNG
             for (0..packed_cols) |pc| {
@@ -2201,7 +2550,7 @@ test "an imatrix lowers the weighted error it is given to minimize" {
     // objective. That is a real property of ggml's q2_K encoder, pinned by the
     // test below — but it is emphatically **not** a reason to withhold an imatrix
     // from q2_k, because on real activations q2_k benefits more than anything
-    // else. See `Imatrix.usesImatrix` for what that gap means.
+    // else. See `Imatrix.shipsWeighted` for what that gap means.
     const allocator = std.testing.allocator;
     const rows = 16;
     const cols = 512;
@@ -2251,7 +2600,7 @@ test "q2_k is where the weighted-weight-error proxy disagrees with real output e
     // On that evidence alone we withheld the imatrix from q2_k — and level 1 on
     // real krea2 activations immediately overturned it: measured on actual output
     // error, q2_k gains *more* than any other format. So the exclusion is gone and
-    // `Imatrix.usesImatrix` weights everything ggml will weight.
+    // `Imatrix.shipsWeighted` weights everything ggml will weight.
     //
     // What survives is the gap itself. The weighted weight error is a proxy; it
     // ignores channel covariance that a real GEMM sees, and here it pointed the
@@ -2283,7 +2632,7 @@ test "q2_k is where the weighted-weight-error proxy disagrees with real output e
     if (ratio <= 1.0) {
         std.debug.print(
             "q2_k now improves on the weighted-weight-error proxy too (ratio {d:.4}); the\n" ++
-                "documented proxy-vs-level-1 disagreement in Imatrix.usesImatrix is stale\n",
+                "documented proxy-vs-level-1 disagreement in Imatrix.shipsWeighted is stale\n",
             .{ratio},
         );
         return error.Q2KProxyNoteStale;
@@ -2295,9 +2644,9 @@ test "an imatrix changes the bytes, and only for encoders that read it" {
     // types that honour them, and they are not being wrongly applied to the ones
     // that document quant_weights as unused (q8_0, mxfp4).
     //
-    // This is the ggml-level fact, so q2_k belongs in `honours` here even though
-    // policy never sends it one — that choice lives in `Imatrix.usesImatrix`, and
-    // this layer quantizes with whatever it is handed.
+    // This is the ggml-level fact, independent of which formats we choose to send
+    // weights to — that lives in `Imatrix.shipsWeighted`. This layer quantizes
+    // with whatever it is handed.
     const allocator = std.testing.allocator;
     const rows = 4;
     const cols = 512;
@@ -2406,4 +2755,285 @@ test "an imatrix that does not fit the tensor is refused, not ignored" {
     try std.testing.expectError(error.ImatrixWidthMismatch, Quantizer.convertTensorDataWeighted(
         allocator, std.mem.sliceAsBytes(w), .F32, .q4_k, n, &pool, bad_width,
     ));
+}
+
+// ============================================================================
+// Activation-weighted clipping search (plan §8A.2)
+// ============================================================================
+
+test "the clipping search never loses to amax on its own objective" {
+    // Guaranteed by construction — α = 1.0 is the incumbent and improvement is
+    // strict — but it is the property the whole feature rests on, so it is pinned
+    // rather than assumed. If the grid ever stops including 1.0, this fails.
+    const gpa = std.testing.allocator;
+    const cols = 256;
+    const vals = try gpa.alloc(f32, cols);
+    defer gpa.free(vals);
+    const w = try gpa.alloc(f32, cols);
+    defer gpa.free(w);
+
+    fillDeterministicWeights(vals);
+    fillLognormalImportance(w, 1.5);
+
+    inline for (.{ .{ 127.0, -128.0, 127.0 }, .{ 7.0, -7.0, 7.0 } }) |cfg| {
+        var amax: f32 = 0;
+        for (vals) |v| amax = @max(amax, @abs(v));
+        const base: f32 = @max(amax / cfg[0], 1e-30);
+        const s = Quantizer.searchScale(vals, w, cfg[0], cfg[1], cfg[2]);
+        const e_base = Quantizer.clipError(vals, w, base, cfg[1], cfg[2]);
+        const e_found = Quantizer.clipError(vals, w, s, cfg[1], cfg[2]);
+        try std.testing.expect(e_found <= e_base);
+    }
+}
+
+test "an outlier the network never reads gets clipped away" {
+    // The case the search exists for: one column carries a value 50x everything
+    // else and almost no activation energy. Keeping it costs every other column
+    // resolution; clipping it costs one large error nobody reads.
+    const gpa = std.testing.allocator;
+    const cols = 256;
+    const vals = try gpa.alloc(f32, cols);
+    defer gpa.free(vals);
+    const w = try gpa.alloc(f32, cols);
+    defer gpa.free(w);
+
+    fillDeterministicWeights(vals);
+    for (vals) |*v| v.* = @mod(v.*, 0.05);
+    @memset(w, 1.0);
+    vals[7] = 1.0; // ~20x the bulk — a realistic outlier channel
+    w[7] = 1e-3; // and effectively unread
+
+    var amax: f32 = 0;
+    for (vals) |v| amax = @max(amax, @abs(v));
+    const base = amax / 7.0;
+    const s = Quantizer.searchScale(vals, w, 7.0, -7.0, 7.0);
+
+    // The search must actually clip, not just tie.
+    try std.testing.expect(s < base);
+    const e_base = Quantizer.clipError(vals, w, base, -7.0, 7.0);
+    const e_found = Quantizer.clipError(vals, w, s, -7.0, 7.0);
+    if (!(e_found < e_base * 0.5)) {
+        std.debug.print("clip search barely helped: base {e:.4} found {e:.4}\n", .{ e_base, e_found });
+        return error.ClipSearchIneffective;
+    }
+}
+
+test "rotated importance is the group mean, because Hadamard entries are all ±1/√g" {
+    // eᵀDe becomes εᵀ(HᵀDH)ε under the rotation, and every |H[j,k]| = 1/√g makes
+    // diag(HᵀDH) constant within a group. Anything else here would mean the
+    // weights are being applied in the wrong basis — which would look like a
+    // working feature while steering on noise.
+    const gpa = std.testing.allocator;
+    const cols = 8;
+    const g = 4;
+    const w = [_]f32{ 1, 3, 0, 4, 10, 10, 10, 10 };
+
+    const rot = (try Quantizer.rotatedWeights(gpa, &w, cols, true, g)).?;
+    defer gpa.free(rot);
+    // Group 0 mean = (1+3+0+4)/4 = 2; group 1 mean = 10.
+    for (rot[0..4]) |v| try std.testing.expectApproxEqAbs(@as(f32, 2.0), v, 1e-6);
+    for (rot[4..8]) |v| try std.testing.expectApproxEqAbs(@as(f32, 10.0), v, 1e-6);
+
+    // Without rotation the weights pass through untouched.
+    const plain = (try Quantizer.rotatedWeights(gpa, &w, cols, false, g)).?;
+    defer gpa.free(plain);
+    try std.testing.expectEqualSlices(f32, &w, plain);
+
+    // No weights means no work, so the caller keeps the reference path.
+    try std.testing.expect((try Quantizer.rotatedWeights(gpa, null, cols, true, g)) == null);
+    // A width that disagrees is an error, never a silent reinterpretation.
+    try std.testing.expectError(error.WeightsWidthMismatch, Quantizer.rotatedWeights(gpa, &w, cols + 1, false, g));
+    try std.testing.expectError(error.ColsNotDivisibleByGroupSize, Quantizer.rotatedWeights(gpa, &w, cols, true, 3));
+}
+
+test "passing no weights reproduces the reference quantizers byte for byte" {
+    // The ComfyUI-pinned fixtures elsewhere in this file are the real contract;
+    // this asserts the weighted entry points cannot drift from them by taking a
+    // different code path when handed null.
+    const gpa = std.testing.allocator;
+    const rows = 8;
+    const cols = 256;
+    const w = try gpa.alloc(f32, rows * cols);
+    defer gpa.free(w);
+    fillDeterministicWeights(w);
+
+    var pool: thread_pool_mod.ThreadPool = undefined;
+    try pool.init(.{ .allocator = gpa, .n_jobs = 2 });
+    defer pool.deinit();
+
+    inline for (.{ true, false }) |convrot| {
+        const a = try Quantizer.quantizeToInt8(gpa, w, rows, cols, convrot, 64, &pool);
+        defer gpa.free(a.weight);
+        defer gpa.free(a.scale);
+        const b = try Quantizer.quantizeToInt8Weighted(gpa, w, rows, cols, convrot, 64, &pool, null);
+        defer gpa.free(b.weight);
+        defer gpa.free(b.scale);
+        try std.testing.expectEqualSlices(u8, a.weight, b.weight);
+        try std.testing.expectEqualSlices(f32, a.scale, b.scale);
+    }
+
+    const c = try Quantizer.quantizeToInt4(gpa, w, rows, cols, true, 64, 0, &pool);
+    defer gpa.free(c.weight);
+    defer gpa.free(c.scale);
+    const d = try Quantizer.quantizeToInt4Weighted(gpa, w, rows, cols, true, 64, 0, &pool, null);
+    defer gpa.free(d.weight);
+    defer gpa.free(d.scale);
+    try std.testing.expectEqualSlices(u8, c.weight, d.weight);
+    try std.testing.expectEqualSlices(f32, c.scale, d.scale);
+
+    const e = try Quantizer.quantizeToComfyFp8(gpa, w, &pool);
+    defer gpa.free(e.weight);
+    const f = try Quantizer.quantizeToComfyFp8Weighted(gpa, w, &pool, null, 0);
+    defer gpa.free(f.weight);
+    try std.testing.expectEqualSlices(u8, e.weight, f.weight);
+    try std.testing.expectEqual(e.scale, f.scale);
+}
+
+test "weighted quantization moves the scales it is supposed to move" {
+    // End to end through the real entry points: with a heavy-tailed importance
+    // vector the per-row scales must actually change, and change downward (the
+    // search only ever clips). A no-op here would mean the weights are reaching
+    // the quantizer and being ignored.
+    const gpa = std.testing.allocator;
+    const rows = 8;
+    const cols = 256;
+    const w = try gpa.alloc(f32, rows * cols);
+    defer gpa.free(w);
+    fillDeterministicWeights(w);
+
+    const imp = try gpa.alloc(f32, cols);
+    defer gpa.free(imp);
+    fillLognormalImportance(imp, 2.0);
+
+    var pool: thread_pool_mod.ThreadPool = undefined;
+    try pool.init(.{ .allocator = gpa, .n_jobs = 2 });
+    defer pool.deinit();
+
+    const plain = try Quantizer.quantizeToInt4(gpa, w, rows, cols, false, 64, 0, &pool);
+    defer gpa.free(plain.weight);
+    defer gpa.free(plain.scale);
+    const weighted = try Quantizer.quantizeToInt4Weighted(gpa, w, rows, cols, false, 64, 0, &pool, imp);
+    defer gpa.free(weighted.weight);
+    defer gpa.free(weighted.scale);
+
+    var moved: usize = 0;
+    for (plain.scale, weighted.scale) |p, q| {
+        try std.testing.expect(q <= p * 1.0001); // clipping only ever shrinks
+        if (q < p * 0.9999) moved += 1;
+    }
+    if (moved == 0) {
+        std.debug.print("no row scale changed under a heavy-tailed imatrix\n", .{});
+        return error.WeightsIgnored;
+    }
+}
+
+test "the weighted fp8 global scale is thread-count invariant" {
+    // The fp8 search reduces a global f64 sum, so its answer depends on how the
+    // elements are partitioned. Partitioning by pool size would make the same
+    // tensor quantize differently on machines with different core counts — a
+    // reproducibility failure nobody would notice until two people compared
+    // checksums. `fp8_search_chunks` is fixed for exactly this reason.
+    const gpa = std.testing.allocator;
+    const rows = 12;
+    const cols = 256;
+    const w = try gpa.alloc(f32, rows * cols);
+    defer gpa.free(w);
+    fillDeterministicWeights(w);
+
+    const imp = try gpa.alloc(f32, cols);
+    defer gpa.free(imp);
+    fillLognormalImportance(imp, 2.0);
+
+    var first: ?f32 = null;
+    for ([_]usize{ 1, 3, 8 }) |n_jobs| {
+        var pool: thread_pool_mod.ThreadPool = undefined;
+        try pool.init(.{ .allocator = gpa, .n_jobs = n_jobs });
+        defer pool.deinit();
+
+        const enc = try Quantizer.quantizeToComfyFp8Weighted(gpa, w, &pool, imp, cols);
+        defer gpa.free(enc.weight);
+        if (first) |f| {
+            try std.testing.expectEqual(f, enc.scale);
+        } else {
+            first = enc.scale;
+        }
+    }
+}
+
+test "the vectorized clip error agrees with a scalar reference" {
+    // `clipError` is SIMD and accumulates per lane, so it is not bit-identical to
+    // a naive scalar loop. It must still agree to well within any margin that
+    // could flip a candidate ranking, and it must handle the tail, the tie case
+    // of round-half-to-even, and non-finite inputs identically.
+    const gpa = std.testing.allocator;
+
+    // 1003 is deliberately not a multiple of the lane count, so the scalar tail runs.
+    const n = 1003;
+    const vals = try gpa.alloc(f32, n);
+    defer gpa.free(vals);
+    const w = try gpa.alloc(f32, n);
+    defer gpa.free(w);
+    fillDeterministicWeights(vals);
+    fillLognormalImportance(w, 1.5);
+
+    // Exact .5 ties in v/s exercise the round-half-to-even branch, which is the
+    // one place a vectorized rounding is easy to get subtly wrong.
+    for (0..24) |k| vals[k] = @as(f32, @floatFromInt(@as(i32, @intCast(k)) - 12)) * 0.5 + 0.25;
+    // ...and a NaN and an Inf, which must contribute nothing.
+    vals[100] = std.math.nan(f32);
+    vals[101] = std.math.inf(f32);
+    vals[102] = -std.math.inf(f32);
+
+    const Scalar = struct {
+        fn err(v: []const f32, ws: []const f32, s: f32, qlo: f32, qhi: f32) f64 {
+            var acc: f64 = 0;
+            for (v, ws) |x, wi| {
+                if (std.math.isNan(x) or std.math.isInf(x)) continue;
+                const q = std.math.clamp(Quantizer.roundHalfToEven(x / s), qlo, qhi);
+                const d: f64 = @as(f64, x) - @as(f64, s) * @as(f64, q);
+                acc += @as(f64, wi) * d * d;
+            }
+            return acc;
+        }
+    };
+
+    for ([_]f32{ 0.5, 0.125, 0.03, 0.007 }) |s| {
+        inline for (.{ .{ -128.0, 127.0 }, .{ -7.0, 7.0 } }) |cl| {
+            const got = Quantizer.clipError(vals, w, s, cl[0], cl[1]);
+            const want = Scalar.err(vals, w, s, cl[0], cl[1]);
+            try std.testing.expect(std.math.isFinite(got));
+            // Relative agreement: the two differ only by summation order.
+            const denom = @max(@abs(want), 1e-12);
+            if (@abs(got - want) / denom > 1e-12) {
+                std.debug.print("s={d}: vector {e:.17} scalar {e:.17}\n", .{ s, got, want });
+                return error.VectorScalarMismatch;
+            }
+        }
+    }
+}
+
+test "vectorized rounding matches the scalar rule element for element" {
+    // Pinned separately from the error sum, because a rounding bug there would
+    // show up only as a slightly different scale rather than as a wrong number,
+    // and would be invisible in the aggregate.
+    var x: [Quantizer.clip_lanes]f32 = undefined;
+    const cases = [_]f32{ -3.5, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 3.5 };
+    @memcpy(&x, &cases);
+    const v: @Vector(Quantizer.clip_lanes, f32) = x;
+    const got: [Quantizer.clip_lanes]f32 = Quantizer.roundHalfToEvenVec(v);
+    for (got, cases) |g, c| try std.testing.expectEqual(Quantizer.roundHalfToEven(c), g);
+
+    // And away from ties, over a spread that crosses zero in both directions.
+    var s: u64 = 0x1234_5678_9ABC_DEF0;
+    for (0..64) |_| {
+        for (&x) |*e| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            e.* = (@as(f32, @floatFromInt(s >> 40)) / 8388608.0 - 1.0) * 40.0;
+        }
+        const vv: @Vector(Quantizer.clip_lanes, f32) = x;
+        const gg: [Quantizer.clip_lanes]f32 = Quantizer.roundHalfToEvenVec(vv);
+        for (gg, x) |g, e| try std.testing.expectEqual(Quantizer.roundHalfToEven(e), g);
+    }
 }

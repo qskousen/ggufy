@@ -25,7 +25,7 @@ const Q = DataTransform.Quantizer;
 
 /// Hadamard rotation group size for the ConvRot INT formats. Must be a power
 /// of 4 that divides the column count; 64 divides the harness's 256 cols.
-const convrot_group_size: usize = 64;
+pub const convrot_group_size: usize = 64;
 
 // ---------------------------------------------------------------------------
 // Formats
@@ -108,6 +108,20 @@ pub fn ggufDstType(fmt: Format) ?types.DataType {
     };
 }
 
+/// The ggufy `DataType` a cluster format writes, for the formats `ggufDstType`
+/// returns null for. Together the two cover every `Format`.
+pub fn clusterDstType(fmt: Format) ?types.DataType {
+    return switch (fmt) {
+        .scaled_f8_e4m3 => .SCALED_F8_E4M3,
+        .mxfp8 => .MXFP8_E4M3,
+        .nvfp4 => .NVFP4,
+        .int8 => .INT8,
+        .int8_convrot => .INT8_CONVROT,
+        .int4, .int4_convrot => .INT4_CONVROT,
+        else => null,
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Round-trip: quantize then dequantize, returning an owned []f32.
 // ---------------------------------------------------------------------------
@@ -170,6 +184,72 @@ pub fn roundtrip(
             break :blk try TC.dequantizeInt4Raw(enc.weight, enc.scale, rows, cols, cr, convrot_group_size, allocator, pool);
         },
         else => unreachable, // byte-based formats handled above
+    };
+}
+
+/// `roundtrip` with activation weighting applied wherever the format has a
+/// weighted entry point (plan §8A): ggml's `imatrix` for the byte types, the
+/// clipping search for scaled-fp8 and the int8/int4 clusters.
+///
+/// Deliberately mechanical — it applies the weights and lets each quantizer
+/// decide what to do with them. Which formats it is *worth* calling for is a
+/// policy question, and lives in `Imatrix.weightKind` rather than here, so this
+/// module stays free of the calibration-cache dependency.
+///
+/// `weights` is per input column, length `cols`.
+pub fn roundtripWeighted(
+    fmt: Format,
+    allocator: std.mem.Allocator,
+    input: []const f32,
+    rows: usize,
+    cols: usize,
+    pool: *ThreadPool,
+    weights: []const f32,
+) ![]f32 {
+    std.debug.assert(input.len == rows * cols);
+    if (weights.len != cols) return error.WeightsWidthMismatch;
+
+    if (ggufDstType(fmt)) |dst| {
+        const n: u64 = @intCast(input.len);
+        const quantized = try Q.convertTensorDataWeighted(
+            allocator, std.mem.sliceAsBytes(input), .F32, dst, n, pool, weights,
+        );
+        defer allocator.free(quantized);
+        const back = try Q.convertTensorData(allocator, quantized, dst, .F32, n, pool);
+        defer allocator.free(back);
+        const out = try allocator.alloc(f32, input.len);
+        for (0..input.len) |i| out[i] = readF32(back, i);
+        return out;
+    }
+
+    return switch (fmt) {
+        .scaled_f8_e4m3 => blk: {
+            const enc = try Q.quantizeToComfyFp8Weighted(allocator, input, pool, weights, cols);
+            defer allocator.free(enc.weight);
+            const deq = try Q.convertTensorData(allocator, enc.weight, .F8_E4M3, .F32, input.len, pool);
+            defer allocator.free(deq);
+            const out = try allocator.alloc(f32, input.len);
+            for (0..input.len) |i| out[i] = readF32(deq, i) * enc.scale;
+            break :blk out;
+        },
+        .int8, .int8_convrot => blk: {
+            const cr = fmt == .int8_convrot;
+            const enc = try Q.quantizeToInt8Weighted(allocator, input, rows, cols, cr, convrot_group_size, pool, weights);
+            defer allocator.free(enc.weight);
+            defer allocator.free(enc.scale);
+            break :blk try TC.dequantizeInt8ConvrotRaw(enc.weight, enc.scale, rows, cols, cr, convrot_group_size, allocator, pool);
+        },
+        .int4, .int4_convrot => blk: {
+            const cr = fmt == .int4_convrot;
+            const enc = try Q.quantizeToInt4Weighted(allocator, input, rows, cols, cr, convrot_group_size, 0, pool, weights);
+            defer allocator.free(enc.weight);
+            defer allocator.free(enc.scale);
+            break :blk try TC.dequantizeInt4Raw(enc.weight, enc.scale, rows, cols, cr, convrot_group_size, allocator, pool);
+        },
+        // MXFP8 and NVFP4 have no weighted path yet (their block scales are a
+        // constrained encoding, not a free scalar), so this is the unweighted
+        // result — which is the honest answer, not a silent zero.
+        else => try roundtrip(fmt, allocator, input, rows, cols, pool),
     };
 }
 

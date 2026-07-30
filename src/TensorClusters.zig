@@ -1525,6 +1525,27 @@ pub fn writeClusterData(
     stochastic_rounding: u64,
     pool: *thread_pool_mod.ThreadPool,
 ) !void {
+    return writeClusterDataWeighted(writer, allocator, dtype, f32_data, dims, stochastic_rounding, pool, null);
+}
+
+/// `writeClusterData` with the activation-weighted clipping search (plan §8A.2).
+///
+/// `weights` is per input column, length `cols`; null reproduces
+/// `writeClusterData` byte for byte, which is what keeps the ComfyUI-pinned
+/// fixtures the correctness contract for these formats. Only the symmetric-
+/// integer and scaled-fp8 paths consume it — the MX/NVFP4 block scales are a
+/// constrained encoding (power-of-two E8M0, fp8 per-block) and are not searched
+/// yet.
+pub fn writeClusterDataWeighted(
+    writer: *std.Io.Writer,
+    allocator: std.mem.Allocator,
+    dtype: types.DataType,
+    f32_data: []const f32,
+    dims: []const usize,
+    stochastic_rounding: u64,
+    pool: *thread_pool_mod.ThreadPool,
+    weights: ?[]const f32,
+) !void {
     const rc = rowsCols(dims);
     const rows = rc.rows;
     const cols = rc.cols;
@@ -1532,7 +1553,7 @@ pub fn writeClusterData(
     const Q = DataTransform.Quantizer;
     switch (dtype) {
         .SCALED_F8_E4M3 => {
-            const cluster = try Q.quantizeToComfyFp8(allocator, f32_data, pool);
+            const cluster = try Q.quantizeToComfyFp8Weighted(allocator, f32_data, pool, weights, cols);
             defer allocator.free(cluster.weight);
             var scale_buf: [4]u8 = undefined;
             std.mem.writeInt(u32, &scale_buf, @bitCast(cluster.scale), .little);
@@ -1572,7 +1593,7 @@ pub fn writeClusterData(
         },
         .INT8, .INT8_CONVROT => {
             const is_convrot = dtype == .INT8_CONVROT;
-            const cluster = try Q.quantizeToInt8(allocator, f32_data, @intCast(rows), @intCast(cols), is_convrot, @intCast(int8_convrot_group_size), pool);
+            const cluster = try Q.quantizeToInt8Weighted(allocator, f32_data, @intCast(rows), @intCast(cols), is_convrot, @intCast(int8_convrot_group_size), pool, weights);
             defer allocator.free(cluster.weight);
             defer allocator.free(cluster.scale);
             try writer.writeAll(cluster.weight);
@@ -1583,7 +1604,7 @@ pub fn writeClusterData(
             // Both write the same convrot_w4a4 layout; SR differs only by rounding the weights
             // stochastically (nonzero seed). Non-SR always quantizes deterministically (seed 0).
             const seed: u64 = if (dtype == .INT4_CONVROT_SR) stochastic_rounding else 0;
-            const cluster = try Q.quantizeToInt4(allocator, f32_data, @intCast(rows), @intCast(cols), true, @intCast(int4_convrot_group_size), seed, pool);
+            const cluster = try Q.quantizeToInt4Weighted(allocator, f32_data, @intCast(rows), @intCast(cols), true, @intCast(int4_convrot_group_size), seed, pool, weights);
             defer allocator.free(cluster.weight);
             defer allocator.free(cluster.scale);
             try writer.writeAll(cluster.weight);

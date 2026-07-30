@@ -8,9 +8,11 @@
 //!     Y   = X · Wᵀ        the layer's real output on captured activations
 //!     Ŷ_f = X · Ŵᵀ        FORMAT arm — dequantize, then the f32 reference GEMM
 //!     Ŷ_k = X ⊛ q(W)      KERNEL arm — the native quantized GEMM, where one exists
-//!     Ŷ_i = X · Ŵ_iᵀ      IMATRIX arm — as the format arm, but quantized with the
-//!                         layer's own activation energy steering ggml's scale
-//!                         search (plan §8A)
+//!     Ŷ_w = X · Ŵ_wᵀ      WEIGHTED arm — as the format arm, but with the layer's
+//!                         own activation energy steering whichever scale search
+//!                         the format has: ggml's `quant_weights` for the
+//!                         block-quant types, the clipping search for scaled-fp8
+//!                         and the int8/int4 clusters (plan §8A)
 //!
 //! and reports how far each Ŷ is from Y. `X` comes from a calibration cache
 //! (`ggufy calibrate`), so this is cheap: one small GEMM per (layer, format,
@@ -39,6 +41,7 @@ const cb = @import("callbacks.zig");
 const imagearch = @import("ImageArch.zig");
 const gguf = @import("Gguf.zig");
 const Imatrix = @import("Imatrix.zig");
+const TensorClusters = @import("TensorClusters.zig");
 
 pub const Format = ph.Format;
 
@@ -189,7 +192,7 @@ pub const FormatResult = struct {
     /// is worth turning on: it is the same quantity as `format_arm` — real output
     /// error on real activations — so the two are directly comparable, unlike the
     /// weighted *weight* error the encoder optimizes internally.
-    imatrix_arm: ?ArmMetrics = null,
+    weighted_arm: ?ArmMetrics = null,
 };
 
 pub const LayerResult = struct {
@@ -234,7 +237,7 @@ pub const Report = struct {
     /// How many (layer, format) pairs got a kernel arm.
     kernel_arms: usize,
     /// How many (layer, format) pairs got an activation-weighted arm.
-    imatrix_arms: usize,
+    weighted_arms: usize,
     /// Layers that got a score — i.e. that had a reference-format measurement.
     scored: usize,
 
@@ -320,7 +323,7 @@ pub const Options = struct {
     /// arm, for every ggml encoder that reads one. On by default: it is the only
     /// evidence that says whether `convert --calib` helps this model, and the
     /// cache it needs is already open.
-    imatrix_arm: bool = true,
+    weighted_arm: bool = true,
     /// Stop after this many layers. For a quick look at a long run, not for a
     /// report anyone should trust — a partial ranking is a partial ranking.
     max_layers: ?usize = null,
@@ -406,11 +409,11 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, opts: Options) !Report {
 
     var ref_dtype: ?tp.DType = null;
     var kernel_arms: usize = 0;
-    var imatrix_arms: usize = 0;
+    var weighted_arms: usize = 0;
 
     // Per-column activation energy, keyed as the converter keys it. Built once;
     // every layer's vector is a view into it.
-    var imat: ?Imatrix.Imatrix = if (opts.imatrix_arm) try Imatrix.fromCache(gpa, &cache) else null;
+    var imat: ?Imatrix.Imatrix = if (opts.weighted_arm) try Imatrix.fromCache(gpa, &cache) else null;
     defer if (imat) |*im| im.deinit();
 
     for (names[0..limit], 0..) |name, li| {
@@ -474,21 +477,21 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, opts: Options) !Report {
                 null;
             if (kernel_arm != null) kernel_arms += 1;
 
-            const imatrix_arm: ?ArmMetrics = if (imat) |*im|
-                imatrixArm(gpa, io, im, name, w, x, y_apx, y_ref, m, rows, cols, fmt, &pool) catch |err| blk: {
-                    std.log.warn("{s} / {s}: imatrix arm failed ({t}); omitted", .{ name, formatName(fmt), err });
+            const weighted_arm: ?ArmMetrics = if (imat) |*im|
+                weightedArm(gpa, io, im, name, x, y_apx, y_ref, w, m, rows, cols, fmt, &pool) catch |err| blk: {
+                    std.log.warn("{s} / {s}: weighted arm failed ({t}); omitted", .{ name, formatName(fmt), err });
                     break :blk null;
                 }
             else
                 null;
-            if (imatrix_arm != null) imatrix_arms += 1;
+            if (weighted_arm != null) weighted_arms += 1;
 
             per_format[kept] = .{
                 .fmt = fmt,
                 .bits = bitsFor(fmt),
                 .format_arm = format_arm,
                 .kernel_arm = kernel_arm,
-                .imatrix_arm = imatrix_arm,
+                .weighted_arm = weighted_arm,
             };
             kept += 1;
         }
@@ -536,68 +539,62 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, opts: Options) !Report {
         .reference_is_quantized = dt != .f32 and dt != .f16 and dt != .bf16,
         .reference_dtype = @tagName(dt),
         .kernel_arms = kernel_arms,
-        .imatrix_arms = imatrix_arms,
+        .weighted_arms = weighted_arms,
         .scored = scored,
     };
 }
 
-/// The format arm re-run with this layer's activation energy as ggml's
-/// `imatrix`. Returns null when there is nothing to measure: an encoder that
-/// ignores the weights, a layer the cache has no usable statistics for, or a row
-/// width that is not a whole number of blocks.
+/// The format arm re-run with this layer's activation energy steering whichever
+/// scale search the format has — ggml's `imatrix` for the block-quant types, the
+/// clipping search for scaled-fp8 and the int8/int4 clusters (plan §8A).
 ///
-/// Deliberately gated on `Imatrix.readsImatrix` (does ggml consume it) rather
-/// than `usesImatrix` (do we ship it): the point of a measurement arm is to be
-/// able to check the policy, and q2_k is currently excluded by that policy on
-/// synthetic evidence. Measuring it here is how that gets confirmed or overturned
-/// on real data.
-fn imatrixArm(
+/// Returns null when there is nothing to measure: a format with no searchable
+/// scale, a layer the cache has no usable statistics for, or a row width the
+/// format's grouping cannot accommodate.
+///
+/// Gated on `Imatrix.weightKind` (what mechanism *exists*), deliberately not on
+/// `Imatrix.shipsWeighted` (what the converter applies). Measuring a format the
+/// converter withholds is the only way a policy call stays checkable — that is
+/// how q2_k's exclusion was overturned and how SCALED_F8's was established.
+fn weightedArm(
     gpa: std.mem.Allocator,
     io: std.Io,
     im: *const Imatrix.Imatrix,
     layer: []const u8,
-    w: []const f32,
     x: []const f32,
     y_scratch: []f32,
     y_ref: []const f32,
+    w: []const f32,
     m: usize,
     rows: usize,
     cols: usize,
     fmt: Format,
     pool: *ThreadPool,
 ) !?ArmMetrics {
-    const dst = ph.ggufDstType(fmt) orelse return null;
-    const gt = gguf.GgmlType.fromString(@tagName(dst)) catch return null;
-    if (!Imatrix.readsImatrix(gt)) return null;
+    const dst = ph.ggufDstType(fmt) orelse ph.clusterDstType(fmt) orelse return null;
+    const kind = Imatrix.weightKind(dst);
+    if (kind == .none) return null;
 
-    // Cache keys carry the checkpoint's container prefix; the map is keyed the
-    // way the converter looks tensors up.
-    const weights = im.get(imagearch.stripPrefix(layer)) orelse return null;
+    // Cache keys carry the checkpoint's container prefix; `get` strips it.
+    const weights = im.get(layer) orelse return null;
     if (weights.len != cols) return null;
-    const block = gt.getBlockSize();
-    if (block == 0 or cols % block != 0) return null;
 
-    const bytes = try DataTransform.Quantizer.convertTensorDataWeighted(
-        gpa,
-        std.mem.sliceAsBytes(w),
-        .f32,
-        dst,
-        @intCast(rows * cols),
-        pool,
-        weights,
-    );
-    defer gpa.free(bytes);
+    switch (kind) {
+        .none => unreachable,
+        .ggml_block => {
+            const gt = gguf.GgmlType.fromString(@tagName(dst)) catch return null;
+            const block = gt.getBlockSize();
+            if (block == 0 or cols % block != 0) return null;
+        },
+        // The harness rotates in groups of `ph.convrot_group_size`, not the
+        // converter's larger production group; both divide every real DiT width.
+        .rotated_int => if (cols % ph.convrot_group_size != 0) return null,
+        .plain_int => if (cols % 2 != 0) return null,
+        .global_fp8 => {},
+    }
 
-    const back = try DataTransform.Quantizer.convertTensorData(
-        gpa,
-        bytes,
-        dst,
-        .f32,
-        @intCast(rows * cols),
-        pool,
-    );
-    defer gpa.free(back);
-    const w_hat: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, back));
+    const w_hat = try ph.roundtripWeighted(fmt, gpa, w, rows, cols, pool, weights);
+    defer gpa.free(w_hat);
 
     try tp.ops.matmul.matmul(io, gpa, y_scratch, x, m, tp.ops.matmul.Weight.fromF32(w_hat, rows, cols), null);
     return armMetrics(y_ref, y_scratch, m, rows);
@@ -733,7 +730,7 @@ pub fn writeCsv(report: *const Report, w: *std.Io.Writer) !void {
         for (l.per_format) |f| {
             try writeCsvRow(w, l, f, "format", f.format_arm);
             if (f.kernel_arm) |k| try writeCsvRow(w, l, f, "kernel", k);
-            if (f.imatrix_arm) |i| try writeCsvRow(w, l, f, "imatrix", i);
+            if (f.weighted_arm) |i| try writeCsvRow(w, l, f, "weighted", i);
         }
     }
 }
@@ -848,7 +845,7 @@ pub fn writeMarkdown(report: *const Report, w: *std.Io.Writer, top_n: usize) !vo
         }
     }
 
-    if (report.imatrix_arms > 0) try writeImatrixSection(w, report);
+    if (report.weighted_arms > 0) try writeWeightedSection(w, report);
 
     try w.print("\n## Most sensitive layers ({s})\n\n", .{formatName(report.reference_format)});
     try w.writeAll("| layer | shape | score | rel-L2 | mean token cos | worst token |\n");
@@ -878,22 +875,25 @@ pub fn writeMarkdown(report: *const Report, w: *std.Io.Writer, top_n: usize) !vo
     }
 }
 
-/// The activation-aware verdict: does feeding ggml the captured per-channel
-/// energy actually reduce real output error, per format?
+/// The activation-aware verdict: does steering the scale search with captured
+/// per-channel energy actually reduce real output error, per format?
 ///
 /// Paired over the layers that have both arms, and reporting how many layers went
 /// each way — a mean that improves while most layers get worse is a different
 /// finding from one that improves everywhere, and only the win/loss counts
 /// separate them.
-fn writeImatrixSection(w: *std.Io.Writer, report: *const Report) !void {
-    try w.writeAll("\n## Activation-aware quantization (imatrix), averaged over layers\n\n");
+fn writeWeightedSection(w: *std.Io.Writer, report: *const Report) !void {
+    try w.writeAll("\n## Activation-aware quantization, averaged over layers\n\n");
     try w.writeAll(
         "Same quantity as the format arm — real output error on captured activations — with the\n" ++
-            "layer's per-channel energy passed to ggml as `quant_weights`. Ratio below 1.0 means the\n" ++
-            "imatrix helped. `convert --calib` applies this to every format marked **shipped**.\n\n",
+            "layer's per-channel energy steering the scale search: ggml's `quant_weights` for the\n" ++
+            "block-quant types, the clipping search for scaled-fp8 and the int8/int4 clusters.\n" ++
+            "Ratio below 1.0 means it helped.\n\n" ++
+            "**shipped** is what `convert --calib` actually applies. A measured-but-not-shipped row is\n" ++
+            "one this table's own numbers argued against; see `Imatrix.shipsWeighted` for the reasoning.\n\n",
     );
-    try w.writeAll("| format | layers | format rel-L2 | imatrix rel-L2 | ratio | layers improved | shipped |\n");
-    try w.writeAll("|---|---:|---:|---:|---:|---:|:--:|\n");
+    try w.writeAll("| format | mechanism | shipped | layers | format rel-L2 | weighted rel-L2 | ratio | layers improved |\n");
+    try w.writeAll("|---|---|:--:|---:|---:|---:|---:|---:|\n");
 
     for (ph.formats) |spec| {
         var n: usize = 0;
@@ -902,7 +902,7 @@ fn writeImatrixSection(w: *std.Io.Writer, report: *const Report) !void {
         var better: usize = 0;
         for (report.layers) |l| {
             const f = l.find(spec.fmt) orelse continue;
-            const im = f.imatrix_arm orelse continue;
+            const im = f.weighted_arm orelse continue;
             n += 1;
             sum_f += f.format_arm.rel_l2;
             sum_i += im.rel_l2;
@@ -912,20 +912,32 @@ fn writeImatrixSection(w: *std.Io.Writer, report: *const Report) !void {
         const fn_: f64 = @floatFromInt(n);
         const mf = sum_f / fn_;
         const mi = sum_i / fn_;
-        const shipped = if (ph.ggufDstType(spec.fmt)) |dst| blk: {
-            const gt = gguf.GgmlType.fromString(@tagName(dst)) catch break :blk false;
-            break :blk Imatrix.usesImatrix(gt);
-        } else false;
-        try w.print("| {s} | {d} | {e:.4} | {e:.4} | {d:.4} | {d}/{d} | {s} |\n", .{
-            spec.name, n, mf, mi, if (mf > 0) mi / mf else 1.0, better, n, if (shipped) "yes" else "no",
+        const dst = ph.ggufDstType(spec.fmt) orelse ph.clusterDstType(spec.fmt);
+        const mech = if (dst) |d| switch (Imatrix.weightKind(d)) {
+            .ggml_block => "imatrix",
+            .rotated_int => "clip (rotated)",
+            .plain_int => "clip",
+            .global_fp8 => "clip (global)",
+            .none => "—",
+        } else "—";
+        const shipped = if (dst) |d| Imatrix.shipsWeighted(d) else false;
+        try w.print("| {s} | {s} | {s} | {d} | {e:.4} | {e:.4} | {d:.4} | {d}/{d} |\n", .{
+            spec.name, mech, if (shipped) "yes" else "no", n, mf, mi, if (mf > 0) mi / mf else 1.0, better, n,
         });
     }
 
     try w.writeAll(
-        "\n> A format measured here but marked **not shipped** is one ggml would accept an imatrix for\n" ++
-            "> while `Imatrix.usesImatrix` withholds it. Today that is Q2_K only, excluded on synthetic\n" ++
-            "> weighted-error evidence; this table is the real-data measurement that should confirm or\n" ++
-            "> overturn that call.\n",
+        "\n> Formats absent from this table have no searchable scale to steer: f16/bf16 and plain fp8\n" ++
+            "> encode elements directly, Q8_0 and MXFP4 discard `quant_weights`, and MXFP8/NVFP4 carry\n" ++
+            "> block scales in a constrained encoding (power-of-two E8M0, per-block fp8) that a clipping\n" ++
+            "> ratio is the wrong search for. Those are unimplemented, not measured-and-useless.\n",
+    );
+    try w.print(
+        "\n> **Caveat on the ConvRot rows.** This harness rotates in groups of {d}; the converter uses\n" ++
+            "> {d}. Both arms here use the same group size, so the *ratio* is a clean comparison — but it\n" ++
+            "> is measured at a different group size than the one `convert` ships, and the rotated\n" ++
+            "> importance is a per-group mean, so the benefit is not guaranteed to transfer unchanged.\n",
+        .{ ph.convrot_group_size, TensorClusters.int4_convrot_group_size },
     );
 }
 
@@ -1138,7 +1150,7 @@ test "a layer with no reference-format measurement is unscored, not ranked lowes
         .reference_is_quantized = false,
         .reference_dtype = "f32",
         .kernel_arms = 0,
-        .imatrix_arms = 0,
+        .weighted_arms = 0,
         .scored = scored,
     };
     defer report.deinit();
@@ -1182,7 +1194,7 @@ test "scores are emitted under the canonical unprefixed tensor name" {
         .reference_is_quantized = false,
         .reference_dtype = "bf16",
         .kernel_arms = 0,
-        .imatrix_arms = 0,
+        .weighted_arms = 0,
         .scored = scored,
     };
     defer report.deinit();

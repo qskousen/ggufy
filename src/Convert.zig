@@ -57,11 +57,13 @@ pub const ConvertOptions = struct {
     /// deterministic path used for bit-for-bit comparison). Ignored by all other types.
     stochastic_rounding: ?u64 = null,
     /// Path to a calibration cache (`ggufy calibrate` output). When set, the
-    /// per-channel activation energy it holds is passed to the quantizer as
-    /// ggml's `imatrix`, so k-quant scale searches minimize activation-weighted
-    /// error instead of plain weight error (plan §8A). Output layout is
-    /// unchanged — only which representable values get chosen. GGUF output only:
-    /// nothing on the safetensors side goes through a ggml encoder.
+    /// per-channel activation energy it holds steers every scale search that can
+    /// use it — ggml's `imatrix` for the block-quant types, the clipping search
+    /// for scaled-fp8 and the int8/int4 clusters (plan §8A). Output layout and
+    /// file size are unchanged; only which representable values get chosen.
+    ///
+    /// Leaving it null keeps every quantizer bit-exact against its reference
+    /// implementation, which is what the golden fixtures pin.
     calibration_path: ?[]const u8 = null,
     /// Optional GUI progress/cancel hooks.  No-ops when null.
     callbacks: cb.ConvertCallbacks = .{},
@@ -290,13 +292,6 @@ pub fn convert(
     }
 
     var prep = try prepareConversion(f, opts, allocator, arena_alloc);
-
-    // Only the GGUF path runs tensors through a ggml encoder, so an imatrix has
-    // nowhere to act on a safetensors output. Say so rather than accept the flag
-    // and silently do nothing with it.
-    if (opts.calibration_path != null and opts.filetype != .gguf) {
-        std.log.warn("--calib has no effect on safetensors output: only the GGUF block-quant encoders take an imatrix", .{});
-    }
 
     // --- Write output ---------------------------------------------------------
     switch (opts.filetype) {
@@ -1362,6 +1357,13 @@ fn writeSafetensors(
     var out_st = try st.init(out_filename, opts.io, allocator, arena_alloc, true, true);
     defer out_st.deinit();
     out_st.tensors = model_tensors;
+
+    // --- Activation-aware weighting (plan §8A) --------------------------------
+    // The cluster formats reach it through the clipping search rather than ggml's
+    // imatrix, but the policy, the guard and the coverage report are the same.
+    var imatrix = try loadImatrix(opts, allocator, model_tensors.items);
+    defer if (imatrix) |*im| im.deinit();
+    if (imatrix) |*im| out_st.imatrix = imatrixLookup(im);
 
     try buildSafetensorsMetadata(&out_st.metadata, f, template_metadata, extra_metadata, arena_alloc);
 

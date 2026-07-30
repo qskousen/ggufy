@@ -21,6 +21,12 @@ current_file_handle: ?std.Io.File = null,
 current_open_path: []const u8 = "",
 current_data_begin: u64 = 0,
 
+/// Optional per-column importance weights for the quantizers' scale search
+/// (plan §8A). Supplied by the converter when `--calib` is in play; null means
+/// every tensor is quantized unweighted, which is the historical behaviour, the
+/// default, and what the ComfyUI-pinned fixtures cover.
+imatrix: ?types.ImatrixLookup = null,
+
 const Safetensors = @This();
 
 /// Opens a safetensors file or directory for reading or writing. `target` indicates the file will be opened for read/write.
@@ -932,7 +938,10 @@ pub fn saveWithSTData(self: Safetensors, source: anytype, threads: usize, callba
             if (src_f32) |data| {
                 defer self.allocator.free(data);
                 if (dest_is_cluster) {
-                    try TensorClusters.writeClusterData(&writer.interface, self.allocator, dt, data, t.dims, stochastic_rounding, &pool);
+                    try TensorClusters.writeClusterDataWeighted(
+                        &writer.interface, self.allocator, dt, data, t.dims, stochastic_rounding, &pool,
+                        if (self.imatrix) |im| im.forTensor(t) else null,
+                    );
                 } else {
                     const out = try DataTransform.Quantizer.convertTensorData(
                         self.allocator, std.mem.sliceAsBytes(data), .F32, dt, data.len, &pool,

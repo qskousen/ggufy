@@ -1,18 +1,36 @@
-//! Imatrix.zig — per-column importance weights for ggml's k-quant scale search.
+//! Imatrix.zig — per-column importance weights for the quantizers' scale search.
 //!
-//! This is plan §8A.1: the cheapest activation-aware quantization available to
-//! us, because ggml already implements it. Its k-quant encoders accept a
-//! `quant_weights` vector — one weight per column of the weight matrix — and
-//! minimize
+//! Plan §8A. Every quantizer here picks a scale by minimizing some squared error
+//! over a group of weights; each one of them is minimizing the *wrong* error,
+//! because it weights every column equally when the network does not. Given
+//! per-channel activation energy from a calibration cache, they can minimize
 //!
 //! ```
 //!     Σ_j  w_j · (W_ij − Ŵ_ij)²        instead of        Σ_j (W_ij − Ŵ_ij)²
 //! ```
 //!
-//! when searching for block scales. Feeding it per-channel activation energy
-//! from a calibration cache makes the scale search spend its precision on the
-//! channels the network actually reads. No format change, no runtime change, no
-//! new kernel: the same bytes in the same layout, chosen better.
+//! instead. No format change, no runtime change, no new kernel: the same bytes in
+//! the same layout, chosen better.
+//!
+//! Two mechanisms, because the formats divide in two:
+//!
+//! - **§8A.1, ggml's `imatrix`** — the k-quant and qX_0/qX_1 encoders already
+//!   accept a `quant_weights` vector and do the weighted search themselves. We
+//!   only have to hand it over (and hand it over *per row*, see
+//!   `DataTransform.convertTypeGguf`).
+//! - **§8A.2, the clipping search** — the formats ggml knows nothing about
+//!   (int8, int8-convrot, int4-convrot) pick `scale = amax/qmax`, which is
+//!   optimal only under equal weighting. `DataTransform.searchScale` searches a
+//!   clipping ratio against the weighted objective instead.
+//!
+//! Which formats each mechanism *could* serve is `weightKind`; which ones we
+//! actually ship it to is `shipsWeighted`. They differ (scaled-fp8 is measurable
+//! but withheld), and keeping them separate is what lets the level-1 harness
+//! audit the policy instead of agreeing with it by construction.
+//!
+//! Both are **opt-in** (`convert --calib`). The unweighted paths stay bit-exact
+//! against their reference implementations, which is what keeps the ComfyUI and
+//! ggml golden fixtures the correctness contract for this repo.
 //!
 //! ### Aggregation
 //!
@@ -39,6 +57,7 @@ const types = @import("types.zig");
 const gguf = @import("Gguf.zig");
 const imagearch = @import("ImageArch.zig");
 const CalibrationCache = @import("CalibrationCache.zig");
+const TensorClusters = @import("TensorClusters.zig");
 
 /// Channels whose calibrated energy falls below this fraction of their layer's
 /// mean are raised to it.
@@ -78,8 +97,11 @@ pub const Stats = struct {
 pub const Decision = union(enum) {
     /// Weighted, with these per-column weights (length == the tensor's row width).
     use: []const f32,
-    /// The destination format ignores an imatrix entirely: q8_0 and mxfp4 take
-    /// the argument and drop it, and f16/bf16/f32 have no scale search at all.
+    /// The destination format is not weighted: it has no scale search to steer
+    /// (f16/bf16/f32, plain fp8), discards the weights (q8_0, mxfp4, nvfp4),
+    /// carries block scales in a constrained encoding a clipping ratio is wrong
+    /// for (MXFP4/MXFP8/NVFP4 clusters), or is deliberately withheld on measured
+    /// evidence (SCALED_F8). `weightKind` says which; `shipsWeighted` decides.
     unweighted_type,
     /// No calibration entry for this tensor. Expected for everything the probe
     /// does not see — norms, biases, embeddings, and (until TP tags them) the
@@ -89,8 +111,10 @@ pub const Decision = union(enum) {
     /// arm that catches shape-fixed tensors, whose dims have been rewritten to
     /// `(N/256, 256)` and no longer describe the GEMM the probe measured.
     width_mismatch,
-    /// The row width is not a whole number of blocks, so ggml cannot quantize it
-    /// row-by-row and the weights cannot line up with the data.
+    /// The row width does not satisfy the format's grouping constraint, so the
+    /// weights cannot be lined up with the data: not a whole number of ggml
+    /// blocks, not a whole number of ConvRot groups, or an odd column count for a
+    /// nibble-packed format.
     block_misaligned,
 };
 
@@ -114,32 +138,73 @@ pub fn readsImatrix(t: gguf.GgmlType) bool {
     };
 }
 
-/// Policy: do we pass an imatrix to this encoder?
+/// How a destination format consumes per-column importance, which decides what
+/// shape constraint applies to it.
+pub const WeightKind = enum {
+    /// Nothing to steer: f16/bf16/f32 have no scale search, q8_0/mxfp4/nvfp4
+    /// discard the argument, and plain F8_E4M3/F8_E5M2 are direct element
+    /// encodings with no scale at all.
+    none,
+    /// A ggml block-quant encoder taking `quant_weights` (§8A.1).
+    ggml_block,
+    /// Symmetric per-row integer with a Hadamard rotation over column groups —
+    /// the clipping search runs in the rotated basis (§8A.2).
+    rotated_int,
+    /// Symmetric per-row integer, no rotation.
+    plain_int,
+    /// One global scale over the whole tensor (the ComfyUI scaled-fp8 cluster).
+    /// Implemented and measurable, but **not shipped** — see `shipsWeighted`.
+    global_fp8,
+};
+
+pub fn weightKind(dt: types.DataType) WeightKind {
+    return switch (dt) {
+        .SCALED_F8_E4M3 => .global_fp8,
+        .INT8_CONVROT, .INT4_CONVROT, .INT4_CONVROT_SR => .rotated_int,
+        .INT8 => .plain_int,
+        // MXFP4/MXFP8/NVFP4 are absent deliberately: their block scales are a
+        // constrained encoding (power-of-two E8M0, per-block fp8) rather than a
+        // free scalar, so a clipping ratio is not the right search for them and
+        // pretending otherwise would report coverage we do not have.
+        else => blk: {
+            const gt = gguf.GgmlType.fromString(@tagName(dt)) catch break :blk .none;
+            break :blk if (readsImatrix(gt)) .ggml_block else .none;
+        },
+    };
+}
+
+/// Policy: do we actually apply the weighting this format *could* take?
 ///
-/// Currently identical to `readsImatrix` — every type ggml will weight, we
-/// weight. The two are kept separate anyway because they answer different
-/// questions, and the one time they diverged is worth recording:
+/// `weightKind` states what mechanism exists; this states what we ship. The two
+/// are separate so the level-1 harness can measure formats the converter
+/// withholds — which is the only way a policy call like this stays checkable.
+/// Both times it mattered, the check paid for itself:
 ///
-/// **q2_k, and why it is *not* excluded (measured 2026-07-30).** On synthetic
-/// weights, an imatrix makes ggml's *own internal* objective — the weighted
-/// weight error Σ_j w_j (W−Ŵ)² — **worse** for q2_k alone, and worse the wider
-/// the importance spread (ratio 0.96 / 1.21 / 1.44 at lognormal σ = 0.5 / 1 / 2,
-/// while every other type improved). That looked like a clear reason to withhold
-/// it, and it was wrong.
+/// **q2_k — measured, and NOT excluded.** On synthetic weights an imatrix makes
+/// ggml's *own internal* objective (the weighted weight error Σ_j w_j (W−Ŵ)²)
+/// worse for q2_k alone, and worse the wider the importance spread — ratio 1.21
+/// and 1.44 at lognormal σ = 1 and 2, while every other type improved. That was
+/// taken as a reason to withhold it, and it was wrong: level 1 on real krea2
+/// activations, measured on **output** error over 263 layers, has q2_k gaining
+/// more than any other format (0.810). The weighted weight error ignores the
+/// channel covariance a real GEMM sees. `DataTransform`'s test still pins that
+/// disagreement so the gap stays visible.
 ///
-/// Level 1 on real krea2 activations says the opposite: measured on **real output
-/// error** ‖X(W−Ŵ)ᵀ‖/‖XWᵀ‖ over 263 layers, q2_k benefits *more* than any other
-/// format. The weighted weight error is not the quantity that matters — it
-/// ignores the covariance between channels that a real GEMM sees, and a synthetic
-/// importance vector uncorrelated with synthetic weights makes it worse still.
-///
-/// This is the plan's whole thesis reproduced in miniature, and the same shape as
-/// the learned-rounding post-mortem: a plausible proxy, optimized confidently, in
-/// the wrong direction. `DataTransform`'s weighted-error test still pins the
-/// proxy's behaviour — including q2_k's disagreement — precisely so the gap stays
-/// visible rather than being quietly forgotten.
-pub fn usesImatrix(t: gguf.GgmlType) bool {
-    return readsImatrix(t);
+/// **SCALED_F8 — measured, and excluded.** Level 1 over 263 krea2 layers: mean
+/// ratio **0.9978** with only **102/263 layers improving**, i.e. the majority
+/// regress for a 0.2% aggregate gain, at the cost of the most expensive search we
+/// have. The mechanism is clear in hindsight and generalizes: **a clipping search
+/// is for fixed-point grids.** Integer formats waste absolute resolution on an
+/// outlier that stretches the range, and clipping reclaims it. fp8 is
+/// floating-point — its precision is already relative to magnitude — so there is
+/// no wasted range to reclaim and clipping only destroys the largest values. Any
+/// future float-scaled format should be assumed to behave the same way until
+/// measured.
+pub fn shipsWeighted(dt: types.DataType) bool {
+    return switch (weightKind(dt)) {
+        .none, .global_fp8 => false,
+        .ggml_block, .rotated_int, .plain_int => true,
+    };
 }
 
 pub const Imatrix = struct {
@@ -156,8 +221,13 @@ pub const Imatrix = struct {
 
     /// Per-column weights for a checkpoint tensor name, or null when the cache
     /// has nothing usable for it.
+    ///
+    /// The name is stripped before lookup, not merely assumed stripped: GGUF
+    /// output hands us already-stripped names, but safetensors output preserves
+    /// the original prefixed ones so bundled checkpoints round-trip intact
+    /// (`Convert.filterAndStripTensors`). Stripping here makes one map serve both.
     pub fn get(self: *const Imatrix, name: []const u8) ?[]const f32 {
-        const w = self.map.get(name) orelse return null;
+        const w = self.map.get(imagearch.stripPrefix(name)) orelse return null;
         return if (w.len == 0) null else w;
     }
 
@@ -165,8 +235,9 @@ pub const Imatrix = struct {
     /// wins: a q8_0 tensor is `unweighted_type` whether or not it was captured,
     /// because the format is the reason nothing happens.
     pub fn decide(self: *const Imatrix, t: types.Tensor) Decision {
-        const gt = gguf.GgmlType.fromString(t.type) catch return .unweighted_type;
-        if (!usesImatrix(gt)) return .unweighted_type;
+        const dt = types.DataType.fromString(t.type) catch return .unweighted_type;
+        const kind = weightKind(dt);
+        if (!shipsWeighted(dt)) return .unweighted_type;
 
         const w = self.get(t.name) orelse return .no_data;
 
@@ -176,8 +247,29 @@ pub const Imatrix = struct {
         const cols = t.dims[t.dims.len - 1];
         if (cols != w.len) return .width_mismatch;
 
-        const block = gt.getBlockSize();
-        if (block == 0 or cols % block != 0) return .block_misaligned;
+        switch (kind) {
+            // Excluded by `shipsWeighted` above, so reaching here would mean the
+            // two functions had drifted apart.
+            .none, .global_fp8 => unreachable,
+            .ggml_block => {
+                const gt = gguf.GgmlType.fromString(t.type) catch return .unweighted_type;
+                const block = gt.getBlockSize();
+                if (block == 0 or cols % block != 0) return .block_misaligned;
+            },
+            // ConvRot rounds in a Hadamard basis applied over fixed groups of
+            // columns, so a row that is not a whole number of groups cannot be
+            // rotated at all — the quantizer would reject it too. Read the group
+            // size from the format rather than assuming the two are equal.
+            .rotated_int => {
+                const g: usize = @intCast(if (dt == .INT8_CONVROT)
+                    TensorClusters.int8_convrot_group_size
+                else
+                    TensorClusters.int4_convrot_group_size);
+                if (g == 0 or cols % g != 0) return .block_misaligned;
+            },
+            // Nibble packing pairs adjacent columns.
+            .plain_int => if (cols % 2 != 0) return .block_misaligned,
+        }
 
         return .{ .use = w };
     }
@@ -361,9 +453,12 @@ test "weights pool across buckets by token count and normalize to mean one" {
     var im = try fromCache(gpa, &cache);
     defer im.deinit();
 
-    // Keyed on the stripped name, not the prefixed one the probe saw.
-    try testing.expect(im.get("model.diffusion_model.blocks.0.attn.wq.weight") == null);
+    // Keyed on the stripped name, and reachable by either spelling: GGUF output
+    // asks with the stripped name, safetensors output with the original prefixed
+    // one, and one map has to serve both.
     const w = im.get("blocks.0.attn.wq.weight").?;
+    try testing.expectEqualSlices(f32, w, im.get("model.diffusion_model.blocks.0.attn.wq.weight").?);
+    try testing.expect(im.get("blocks.0.attn.wk.weight") == null);
 
     // Σx² is 1 for column 0 and 3 for column 1; mean 2 → 0.5 and 1.5.
     try testing.expectEqual(@as(usize, 2), w.len);
@@ -506,15 +601,31 @@ test "readsImatrix matches the ggml encoders that consume quant_weights" {
         try testing.expect(!readsImatrix(t));
 }
 
-test "policy currently weights every type ggml will weight" {
-    // The seam between fact (`readsImatrix`) and choice (`usesImatrix`) is kept
-    // even though they agree today: the one candidate exclusion, q2_k, was
-    // overturned by level 1 on real activations, and this test is what would fail
-    // if someone reintroduced an exclusion without the measurement to back it.
-    for ([_]gguf.GgmlType{ .q2_k, .q3_k, .q4_k, .q5_k, .q6_k, .q4_0, .q4_1, .q5_0, .q5_1 }) |t|
-        try testing.expect(usesImatrix(t));
-    for ([_]gguf.GgmlType{ .q8_0, .mxfp4, .nvfp4, .f16, .bf16, .f32 }) |t|
-        try testing.expect(!usesImatrix(t));
+test "policy ships every mechanism level 1 says helps, and only those" {
+    // The seam between fact (`weightKind`) and choice (`shipsWeighted`) exists so
+    // a withheld format stays measurable. This pins both live decisions: q2_k IS
+    // shipped (a synthetic-evidence exclusion that level 1 overturned), and
+    // SCALED_F8 is NOT (a real-data exclusion level 1 established).
+    for ([_]types.DataType{ .q2_k, .q3_k, .q4_k, .q5_k, .q6_k, .q4_0, .q4_1, .q5_0, .q5_1 }) |dt| {
+        try testing.expectEqual(WeightKind.ggml_block, weightKind(dt));
+        try testing.expect(shipsWeighted(dt));
+    }
+    for ([_]types.DataType{ .INT8_CONVROT, .INT4_CONVROT, .INT4_CONVROT_SR }) |dt| {
+        try testing.expectEqual(WeightKind.rotated_int, weightKind(dt));
+        try testing.expect(shipsWeighted(dt));
+    }
+    try testing.expectEqual(WeightKind.plain_int, weightKind(.INT8));
+    try testing.expect(shipsWeighted(.INT8));
+
+    // Measurable, deliberately not shipped.
+    try testing.expectEqual(WeightKind.global_fp8, weightKind(.SCALED_F8_E4M3));
+    try testing.expect(!shipsWeighted(.SCALED_F8_E4M3));
+
+    // No mechanism at all.
+    for ([_]types.DataType{ .q8_0, .mxfp4, .NVFP4, .MXFP8_E4M3, .MXFP4, .f16, .BF16, .F8_E4M3 }) |dt| {
+        try testing.expectEqual(WeightKind.none, weightKind(dt));
+        try testing.expect(!shipsWeighted(dt));
+    }
 }
 
 test "a collision with an unobserved layer does not under-count coverage" {
