@@ -172,6 +172,9 @@ pub fn main(init: std.process.Init) !void {
     };
     const filetype = res.args.filetype orelse types.FileType.gguf;
     const datatype: ?types.DataType = res.args.datatype;
+    // Refuse a target type the output container cannot hold before opening anything —
+    // it used to be accepted and produce a file no reader could load.
+    conv.validateDatatypeForFiletype(datatype, filetype) catch return;
     const template_path = res.args.template;
     const output_dir = res.args.@"output-dir";
     const output_name = res.args.@"output-name";
