@@ -151,6 +151,52 @@ pub fn detectUpscaling(source_tensors: []const types.Tensor, target_dtype: ?type
     return false;
 }
 
+/// Whether `datatype` is actually storable in `filetype`.
+///
+/// The two type vocabularies overlap by equivalence rather than by name, so a mismatched
+/// spelling is not by itself a problem: `-d f16 -f safetensors` is a legitimate request for
+/// `F16` and `-d BF16 -f gguf` for `bf16`, and `DataType.forFormat` performs that mapping
+/// during type assignment. What does not fit is a type with no counterpart at all — the
+/// block-quantized GGUF types (q2_k…q6_k, q4_0, q8_0, …) in a SafeTensors file, or the
+/// ComfyUI cluster types (SCALED_F8_E4M3, INT4_CONVROT, NVFP4, …) in a GGUF one.
+///
+/// Kept separate from `validateDatatypeForFiletype` (which logs) so the decision itself is
+/// testable: a `std.log.err` from a passing test makes the Zig build runner report the whole
+/// test binary as a failed command.
+pub fn datatypeFitsFiletype(datatype: ?types.DataType, filetype: types.FileType) bool {
+    // A template-driven conversion has no target datatype; per-tensor types come from the
+    // template and are checked against the output format in `resolveTemplateTensorType`.
+    const dt = datatype orelse return true;
+    _ = dt.forFormat(filetype) catch return false;
+    return true;
+}
+
+/// Refuse a target type the output container cannot hold, with a diagnostic naming the fix.
+///
+/// These combinations used to be accepted silently and produce a structurally invalid file:
+/// `-d q4_k -f safetensors` wrote genuine q4_k blocks into a SafeTensors container under
+/// `"dtype":"q4_k"`, and every reader rejects it (ComfyUI raises `KeyError`). Refusing here
+/// costs only a conversion that was never going to load.
+pub fn validateDatatypeForFiletype(datatype: ?types.DataType, filetype: types.FileType) !void {
+    const dt = datatype orelse return;
+    if (!datatypeFitsFiletype(dt, filetype)) {
+        switch (filetype) {
+            .safetensors => std.log.err(
+                "{s} is a GGUF block-quantized type and cannot be stored in a SafeTensors file. " ++
+                    "Use -f gguf to write a GGUF, or choose a SafeTensors type " ++
+                    "(F16, BF16, F8_E4M3, SCALED_F8_E4M3, INT8, INT8_CONVROT, INT4_CONVROT, MXFP4, MXFP8_E4M3, NVFP4).",
+                .{@tagName(dt)},
+            ),
+            .gguf => std.log.err(
+                "{s} has no GGUF representation and can only be written to a SafeTensors file. " ++
+                    "Use -f safetensors, or choose a GGUF type (f16, bf16, f32, q8_0, q6_k, q5_k, q4_k, q3_k, q2_k, ...).",
+                .{@tagName(dt)},
+            ),
+        }
+        return error.DatatypeNotRepresentableInFiletype;
+    }
+}
+
 /// Compute the output file path that `convert` would write to, without
 /// performing any actual conversion.  Useful for overwrite checks in the GUI.
 pub fn computeOutputPath(opts: ConvertOptions, arena_alloc: std.mem.Allocator) ![]const u8 {
@@ -1722,5 +1768,36 @@ test "predictOutputSize matches the actual written file size" {
             std.log.err("size mismatch for {s} {s}: predicted={} actual={}", .{ @tagName(c.ft), @tagName(c.dt), predicted, actual });
             return err;
         };
+    }
+}
+test "datatypeFitsFiletype accepts cross-format equivalents and rejects the rest" {
+    // Equivalent spellings are a legitimate request, not an error: the assignment path maps
+    // them with DataType.forFormat.
+    try testing.expect(datatypeFitsFiletype(.f16, .safetensors));
+    try testing.expect(datatypeFitsFiletype(.F16, .gguf));
+    try testing.expect(datatypeFitsFiletype(.bf16, .safetensors));
+    try testing.expect(datatypeFitsFiletype(.BF16, .gguf));
+    try testing.expect(datatypeFitsFiletype(.F32, .gguf));
+    try testing.expect(datatypeFitsFiletype(.i8, .safetensors));
+
+    // Same-format types always fit.
+    try testing.expect(datatypeFitsFiletype(.q4_k, .gguf));
+    try testing.expect(datatypeFitsFiletype(.q8_0, .gguf));
+    try testing.expect(datatypeFitsFiletype(.SCALED_F8_E4M3, .safetensors));
+    try testing.expect(datatypeFitsFiletype(.INT4_CONVROT, .safetensors));
+
+    // A template-driven conversion has no target type.
+    try testing.expect(datatypeFitsFiletype(null, .gguf));
+    try testing.expect(datatypeFitsFiletype(null, .safetensors));
+
+    // The regression: block-quantized GGUF types in a SafeTensors container. This used to be
+    // accepted and wrote real q4_k blocks under `"dtype":"q4_k"`, which ComfyUI rejects.
+    for ([_]types.DataType{ .q2_k, .q3_k, .q4_k, .q5_k, .q6_k, .q4_0, .q4_1, .q5_0, .q5_1, .q8_0, .iq4_nl, .mxfp4 }) |dt| {
+        try testing.expect(!datatypeFitsFiletype(dt, .safetensors));
+    }
+
+    // And the mirror image: ComfyUI cluster types have no GGUF form.
+    for ([_]types.DataType{ .SCALED_F8_E4M3, .INT8, .INT8_CONVROT, .INT4_CONVROT, .NVFP4, .MXFP4, .MXFP8_E4M3, .F8_E4M3 }) |dt| {
+        try testing.expect(!datatypeFitsFiletype(dt, .gguf));
     }
 }

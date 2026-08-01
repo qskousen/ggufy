@@ -789,6 +789,51 @@ fn putClusterHeaderEntry(
     try header_obj.put(arena, name, .{ .object = obj });
 }
 
+/// Render `t.type` as the dtype string a SafeTensors reader expects.
+///
+/// The SafeTensors dtype vocabulary is uppercase (`F16`), but `DataType` also carries the
+/// lowercase ggml spellings (`f16`) — and those are what a GGUF source, or a `-d f16` flag,
+/// leaves in `Tensor.type`. Emitting the raw tag produced headers no SafeTensors reader
+/// accepts: ComfyUI's `load_torch_file` fails with `KeyError: 'f16'`. Normalizing here means
+/// the writer and the size predictor (both of which go through `buildHeaderObject`) cannot
+/// disagree about it.
+///
+/// Block-quantized GGUF types have no SafeTensors representation at all, so they are refused
+/// rather than written as a `"q4_k"` entry that every reader rejects. `Convert.validateDatatypeForFiletype`
+/// catches that combination up front; this is the backstop on the actual write.
+fn safetensorsDtypeName(type_str: []const u8) ![]const u8 {
+    const dt = types.DataType.fromString(type_str) catch return error.InvalidDataType;
+    const stype = dt.forFormat(.safetensors) catch return error.NoSafetensorsEquivalent;
+    return @tagName(stype);
+}
+
+/// Coerce a `__metadata__` map to the `Map<String,String>` the SafeTensors format requires.
+///
+/// The reference (Rust) implementation refuses anything else outright — a GGUF-sourced
+/// `general.quantization_version` lands here as a JSON integer and produces
+/// `invalid type: integer 2, expected a string` on load. GGUF metadata is typed, so this
+/// affects every gguf → safetensors conversion. Values are rendered as text rather than
+/// dropped, which is also what a real SafeTensors file holds (all-string values).
+fn stringifyMetadataValues(arena: std.mem.Allocator, meta: std.json.ObjectMap) !std.json.ObjectMap {
+    var out = std.json.ObjectMap.empty;
+    var it = meta.iterator();
+    while (it.next()) |entry| {
+        const value = entry.value_ptr.*;
+        const as_string: []const u8 = switch (value) {
+            .string, .number_string => |s| s,
+            .bool => |b| if (b) "true" else "false",
+            .null => "null",
+            .integer => |i| try std.fmt.allocPrint(arena, "{d}", .{i}),
+            .float => |f| try std.fmt.allocPrint(arena, "{d}", .{f}),
+            // Nested containers keep their JSON form, which is how ComfyUI stores
+            // structured values (e.g. the `modelspec.*` and cluster `comfy_quant` blobs).
+            .array, .object => try std.json.Stringify.valueAlloc(arena, value, .{}),
+        };
+        try out.put(arena, entry.key_ptr.*, .{ .string = as_string });
+    }
+    return out;
+}
+
 /// Build the full SafeTensors header JSON object (tensor/sub-tensor entries plus the
 /// optional `__metadata__` map) from a tensor list. Shared by the writer
 /// (`saveWithSTData`) and the size predictor (`calculateFileSize`) so the serialized
@@ -802,7 +847,7 @@ fn buildHeaderObject(
 
     // Add __metadata__ under its special key
     if (metadata) |meta| {
-        try header_obj.put(arena, "__metadata__", .{ .object = meta });
+        try header_obj.put(arena, "__metadata__", .{ .object = try stringifyMetadataValues(arena, meta) });
     }
 
     // Add each tensor entry
@@ -829,7 +874,7 @@ fn buildHeaderObject(
 
         var tensor_obj = std.json.ObjectMap.empty;
 
-        try tensor_obj.put(arena, "dtype", .{ .string = t.type });
+        try tensor_obj.put(arena, "dtype", .{ .string = try safetensorsDtypeName(t.type) });
 
         var shape_arr = std.json.Array.init(arena);
         for (t.dims) |d| {
@@ -848,6 +893,24 @@ fn buildHeaderObject(
     return header_obj;
 }
 
+/// Report which tensor made `buildHeaderObject` fail.
+fn reportUnwritableDtype(tensors: []const types.Tensor) void {
+    for (tensors) |t| {
+        _ = safetensorsDtypeName(t.type) catch |err| {
+            if (err == error.NoSafetensorsEquivalent) {
+                std.log.err(
+                    "Tensor {s} has type {s}, which has no SafeTensors representation. " ++
+                        "Block-quantized types (q4_k, q6_k, q8_0, ...) can only be written to a GGUF file — use -f gguf.",
+                    .{ t.name, t.type },
+                );
+            } else {
+                std.log.err("Tensor {s} has unrecognized type '{s}'.", .{ t.name, t.type });
+            }
+            return;
+        };
+    }
+}
+
 /// Compute the exact on-disk byte size a SafeTensors file with these `tensors` and
 /// `metadata` would occupy, without writing anything: the 8-byte header-length prefix
 /// plus the serialized header JSON plus the contiguous (unpadded) tensor-data region.
@@ -859,7 +922,10 @@ pub fn calculateFileSize(
     arena_alloc: std.mem.Allocator,
     allocator: std.mem.Allocator,
 ) !u64 {
-    const header_obj = try buildHeaderObject(arena_alloc, metadata, tensors);
+    const header_obj = buildHeaderObject(arena_alloc, metadata, tensors) catch |err| {
+        reportUnwritableDtype(tensors);
+        return err;
+    };
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
@@ -874,7 +940,10 @@ pub fn calculateFileSize(
 
 pub fn saveWithSTData(self: Safetensors, source: anytype, threads: usize, callbacks: cb.ConvertCallbacks, groups: *const TensorClusters.GroupResult, stochastic_rounding: u64) !void {
     // Build the full header JSON object (tensor entries + __metadata__)
-    const header_obj = try buildHeaderObject(self.arena_alloc, self.metadata, self.tensors.items);
+    const header_obj = buildHeaderObject(self.arena_alloc, self.metadata, self.tensors.items) catch |err| {
+        reportUnwritableDtype(self.tensors.items);
+        return err;
+    };
 
     // Serialize the full header to bytes
     var aw: std.Io.Writer.Allocating = .init(self.allocator);
@@ -1000,4 +1069,108 @@ pub fn saveWithSTData(self: Safetensors, source: anytype, threads: usize, callba
     }
 
     try writer.interface.flush();
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+const testing = std.testing;
+
+test "safetensors header dtypes use the canonical uppercase spelling" {
+    // The regression this pins: a GGUF source leaves lowercase ggml tags in `Tensor.type`,
+    // and writing them verbatim produced `"dtype":"f16"`, which no SafeTensors reader
+    // accepts (ComfyUI's load_torch_file raises `KeyError: 'f16'`).
+    try testing.expectEqualStrings("F16", try safetensorsDtypeName("f16"));
+    try testing.expectEqualStrings("BF16", try safetensorsDtypeName("bf16"));
+    try testing.expectEqualStrings("F32", try safetensorsDtypeName("f32"));
+    try testing.expectEqualStrings("F64", try safetensorsDtypeName("f64"));
+    try testing.expectEqualStrings("I8", try safetensorsDtypeName("i8"));
+    try testing.expectEqualStrings("I16", try safetensorsDtypeName("i16"));
+    try testing.expectEqualStrings("I32", try safetensorsDtypeName("i32"));
+    try testing.expectEqualStrings("I64", try safetensorsDtypeName("i64"));
+
+    // Types that are already SafeTensors types pass through untouched, which is what makes
+    // this change byte-neutral for every safetensors -> safetensors conversion.
+    for ([_][]const u8{ "F16", "BF16", "F32", "F64", "I8", "U8", "F8_E4M3", "F8_E5M2" }) |name| {
+        try testing.expectEqualStrings(name, try safetensorsDtypeName(name));
+    }
+}
+
+test "safetensors header refuses types with no safetensors representation" {
+    // Block-quantized GGUF types have no SafeTensors dtype. Writing one produced a file
+    // whose header named a dtype every reader rejects, so the writer refuses instead.
+    for ([_][]const u8{ "q2_k", "q3_k", "q4_k", "q5_k", "q6_k", "q4_0", "q5_1", "q8_0", "iq4_nl", "mxfp4" }) |name| {
+        try testing.expectError(error.NoSafetensorsEquivalent, safetensorsDtypeName(name));
+    }
+    try testing.expectError(error.InvalidDataType, safetensorsDtypeName("not_a_type"));
+}
+
+test "safetensors __metadata__ values are coerced to strings" {
+    // SafeTensors requires `Map<String,String>`; the reference Rust implementation rejects
+    // anything else with "invalid type: integer 2, expected a string". GGUF metadata is
+    // typed, so a gguf -> safetensors conversion delivers integers here.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var meta = std.json.ObjectMap.empty;
+    try meta.put(a, "general.architecture", .{ .string = "flux" });
+    try meta.put(a, "general.quantization_version", .{ .integer = 2 });
+    try meta.put(a, "general.file_type", .{ .integer = 1 });
+    try meta.put(a, "some.float", .{ .float = 1.5 });
+    try meta.put(a, "some.bool", .{ .bool = true });
+    try meta.put(a, "some.null", .null);
+
+    const out = try stringifyMetadataValues(a, meta);
+
+    var it = out.iterator();
+    while (it.next()) |entry| {
+        try testing.expect(entry.value_ptr.* == .string);
+    }
+    try testing.expectEqualStrings("flux", out.get("general.architecture").?.string);
+    try testing.expectEqualStrings("2", out.get("general.quantization_version").?.string);
+    try testing.expectEqualStrings("1", out.get("general.file_type").?.string);
+    try testing.expectEqualStrings("1.5", out.get("some.float").?.string);
+    try testing.expectEqualStrings("true", out.get("some.bool").?.string);
+    try testing.expectEqualStrings("null", out.get("some.null").?.string);
+}
+
+test "buildHeaderObject emits a header a safetensors reader can parse" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var meta = std.json.ObjectMap.empty;
+    try meta.put(a, "general.quantization_version", .{ .integer = 2 });
+
+    var dims = [_]usize{ 4, 8 };
+    var dims_1d = [_]usize{4};
+    const tensors = [_]types.Tensor{
+        // As delivered by a GGUF source: lowercase ggml tags.
+        .{ .name = "blocks.0.attn.qkv.weight", .type = "f16", .dims = &dims, .size = 64, .offset = 0 },
+        .{ .name = "blocks.0.norm.weight", .type = "f32", .dims = &dims_1d, .size = 16, .offset = 64 },
+    };
+
+    const header = try buildHeaderObject(a, meta, &tensors);
+    const json = try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = header }, .{});
+
+    // Exact header text — dtypes uppercase, metadata values quoted.
+    try testing.expectEqualStrings(
+        \\{"__metadata__":{"general.quantization_version":"2"},"blocks.0.attn.qkv.weight":{"dtype":"F16","shape":[4,8],"data_offsets":[0,64]},"blocks.0.norm.weight":{"dtype":"F32","shape":[4],"data_offsets":[64,80]}}
+    , json);
+}
+
+test "buildHeaderObject refuses a block-quantized tensor" {
+    // The write-side backstop for `-d q4_k -f safetensors`, which used to write real q4_k
+    // blocks into a SafeTensors container under `"dtype":"q4_k"`.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var dims = [_]usize{ 256, 256 };
+    const tensors = [_]types.Tensor{
+        .{ .name = "blocks.0.attn.qkv.weight", .type = "q4_k", .dims = &dims, .size = 36864, .offset = 0 },
+    };
+    try testing.expectError(error.NoSafetensorsEquivalent, buildHeaderObject(a, null, &tensors));
 }
