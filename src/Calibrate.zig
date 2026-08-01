@@ -24,6 +24,20 @@
 //! Capture does **not** need determinism — statistics tolerate GPU
 //! reduction-order drift — which is why this may run on any backend. The level
 //! 2–4 verdict does need it, and that is a different code path.
+//!
+//! **Backends, and what each one actually records** (plan item 9):
+//!
+//! | backend | probe coverage |
+//! |---|---|
+//! | `cpu` | every layer, through `ops.matmul` |
+//! | `cuda` / `zig-cuda` | every layer, through `dit_cuda`'s own call sites — **except** from an int8/int4 checkpoint, which is refused (see below) |
+//! | `vulkan` | only what falls back to CPU; warned about, no call site yet |
+//!
+//! ⚠️ **The whole point of a GPU capture is not just speed.** A CUDA capture keeps
+//! the checkpoint resident in VRAM, which is what makes a large `--rows` affordable
+//! at all: on CPU the row reservoir competes with the checkpoint's page cache, and
+//! at `--rows 256` (~5.4 GB) that measurably makes the DiT refault its weights every
+//! step.
 
 const std = @import("std");
 const tp = @import("TensorPencil");
@@ -217,23 +231,43 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, opts: Options, set: PromptSet) !S
         .cancel = &cancel,
     };
 
-    // The probe hangs off `ops.matmul`, and only the CPU denoiser goes through
-    // it — `dit_gpu` / `dit_cuda` own their upload and GEMM. Until the
-    // device-side probe lands (ACTIVATION_AWARE_PLAN.md §3.5 / item 9), a GPU
-    // capture records whatever happens to fall back to CPU and silently misses
-    // the rest. Say so: a thin cache that looks well-formed is precisely the
-    // failure this whole module is built to avoid.
-    if (opts.backend != .cpu) {
+    // The probe hangs off `ops.matmul`, and every backend that owns its own upload
+    // and GEMM needs its own call site (ACTIVATION_AWARE_PLAN.md §3.5 / item 9).
+    // CUDA has one — `dit_cuda`'s `lin` and `txtGemm` plus the two patch-embed
+    // GEMMs, which together are all 263 measurable layers. Vulkan does not yet, so a
+    // capture there still records only what falls back to CPU: warn, because a thin
+    // cache that looks well-formed is exactly the failure this module exists to
+    // avoid.
+    if (opts.backend == .vulkan) {
         std.log.warn(
-            "backend '{s}': the activation probe currently only observes the CPU path, " ++
-                "so this capture will miss the GEMMs that run on the device. " ++
-                "Use --backend cpu for a complete cache until device-side probe stats land.",
-            .{@tagName(opts.backend)},
+            "backend 'vulkan': the activation probe has no Vulkan call site yet, so this " ++
+                "capture will miss the GEMMs that run on the device. Use --backend cpu or cuda.",
+            .{},
         );
     }
 
     var session = try tp.pipeline.Session.init(io, gpa, base_opts, opts.log);
     defer session.deinit();
+
+    // ⚠️ **A CUDA capture from an int8/int4 checkpoint is refused, not warned about.**
+    // Those paths rotate and quantize the activation *in place* before the GEMM
+    // (`dit_cuda.linPrep`), so the buffer no longer holds the f32 activation the
+    // whole cache is defined as. What could be recorded there is a W4A4-shaped
+    // number, and filing it as a weight-only statistic would silently corrupt every
+    // §8 search that reads the cache (ACTIVATION_AWARE.md hygiene rule 4).
+    if (opts.backend.isCuda()) {
+        const dt = session.dit.blocks[0].attn.wq.dtype;
+        if (dt == .i8 or dt == .i4) {
+            std.log.err(
+                "backend '{s}' cannot capture from an {t} checkpoint: the CUDA DiT quantizes the " ++
+                    "activation in place before each block GEMM, so the probe would record a " ++
+                    "quantized-activation number as a weight-only one. Capture from the bf16 or " ++
+                    "fp8 checkpoint, or use --backend cpu.",
+                .{ @tagName(opts.backend), dt },
+            );
+            return error.ActivationQuantizedCheckpoint;
+        }
+    }
 
     // The probe is a process-wide single-threaded global, like TensorPencil's own
     // `gpu_dispatch` / `cancel.token`. Restore whatever was there so a GUI that

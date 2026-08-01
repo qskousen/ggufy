@@ -1546,6 +1546,29 @@ pub fn writeClusterDataWeighted(
     pool: *thread_pool_mod.ThreadPool,
     weights: ?[]const f32,
 ) !void {
+    return writeClusterDataPre(writer, allocator, dtype, f32_data, dims, stochastic_rounding, pool, weights, null);
+}
+
+/// `writeClusterDataWeighted` with the option of codes the caller already produced
+/// (plan §8C: GPTQ picks the levels itself, so there is no weight vector that would
+/// make the normal quantizer reproduce them).
+///
+/// `pre` only replaces the *codes*; the container — scale placement, the ComfyUI
+/// metadata tail, the byte order — stays owned here, so a compensated tensor is
+/// byte-compatible with an ordinary one by construction. It is ignored for the
+/// formats §8C does not reach, which is what makes passing a plan safe regardless
+/// of the destination type.
+pub fn writeClusterDataPre(
+    writer: *std.Io.Writer,
+    allocator: std.mem.Allocator,
+    dtype: types.DataType,
+    f32_data: []const f32,
+    dims: []const usize,
+    stochastic_rounding: u64,
+    pool: *thread_pool_mod.ThreadPool,
+    weights: ?[]const f32,
+    pre: ?types.ClusterCodes,
+) !void {
     const rc = rowsCols(dims);
     const rows = rc.rows;
     const cols = rc.cols;
@@ -1593,9 +1616,11 @@ pub fn writeClusterDataWeighted(
         },
         .INT8, .INT8_CONVROT => {
             const is_convrot = dtype == .INT8_CONVROT;
-            const cluster = try Q.quantizeToInt8Weighted(allocator, f32_data, @intCast(rows), @intCast(cols), is_convrot, @intCast(int8_convrot_group_size), pool, weights);
-            defer allocator.free(cluster.weight);
-            defer allocator.free(cluster.scale);
+            const cluster = pre orelse blk: {
+                const c = try Q.quantizeToInt8Weighted(allocator, f32_data, @intCast(rows), @intCast(cols), is_convrot, @intCast(int8_convrot_group_size), pool, weights);
+                break :blk types.ClusterCodes{ .weight = c.weight, .scale = c.scale };
+            };
+            defer if (pre == null) cluster.deinit(allocator);
             try writer.writeAll(cluster.weight);
             try writer.writeAll(std.mem.sliceAsBytes(cluster.scale));
             try writer.writeAll(if (is_convrot) int8_convrot_comfy_json else int8_comfy_json);
@@ -1604,9 +1629,11 @@ pub fn writeClusterDataWeighted(
             // Both write the same convrot_w4a4 layout; SR differs only by rounding the weights
             // stochastically (nonzero seed). Non-SR always quantizes deterministically (seed 0).
             const seed: u64 = if (dtype == .INT4_CONVROT_SR) stochastic_rounding else 0;
-            const cluster = try Q.quantizeToInt4Weighted(allocator, f32_data, @intCast(rows), @intCast(cols), true, @intCast(int4_convrot_group_size), seed, pool, weights);
-            defer allocator.free(cluster.weight);
-            defer allocator.free(cluster.scale);
+            const cluster = pre orelse blk: {
+                const c = try Q.quantizeToInt4Weighted(allocator, f32_data, @intCast(rows), @intCast(cols), true, @intCast(int4_convrot_group_size), seed, pool, weights);
+                break :blk types.ClusterCodes{ .weight = c.weight, .scale = c.scale };
+            };
+            defer if (pre == null) cluster.deinit(allocator);
             try writer.writeAll(cluster.weight);
             try writer.writeAll(std.mem.sliceAsBytes(cluster.scale));
             try writer.writeAll(int4_convrot_comfy_json);

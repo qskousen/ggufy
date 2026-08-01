@@ -143,6 +143,26 @@ pub fn roundtrip(
     cols: usize,
     pool: *ThreadPool,
 ) ![]f32 {
+    return roundtripGroup(fmt, allocator, input, rows, cols, pool, convrot_group_size);
+}
+
+/// `roundtrip` at an explicit ConvRot group size.
+///
+/// The default exists because the harness's shapes are small; the converter ships
+/// a larger group (`TensorClusters.int4_convrot_group_size`). For §8A that is a
+/// caveat on transferability, but for §8C the group size **is** the basis the
+/// compensation is computed in, so measuring at the wrong one measures a different
+/// algorithm. Anything comparing arms against what `convert` writes should pass the
+/// shipped size explicitly.
+pub fn roundtripGroup(
+    fmt: Format,
+    allocator: std.mem.Allocator,
+    input: []const f32,
+    rows: usize,
+    cols: usize,
+    pool: *ThreadPool,
+    group: usize,
+) ![]f32 {
     std.debug.assert(input.len == rows * cols);
 
     if (ggufDstType(fmt)) |dst| return roundtripBytes(dst, allocator, input, pool);
@@ -171,17 +191,17 @@ pub fn roundtrip(
         },
         .int8, .int8_convrot => blk: {
             const cr = fmt == .int8_convrot;
-            const enc = try Q.quantizeToInt8(allocator, input, rows, cols, cr, convrot_group_size, pool);
+            const enc = try Q.quantizeToInt8(allocator, input, rows, cols, cr, group, pool);
             defer allocator.free(enc.weight);
             defer allocator.free(enc.scale);
-            break :blk try TC.dequantizeInt8ConvrotRaw(enc.weight, enc.scale, rows, cols, cr, convrot_group_size, allocator, pool);
+            break :blk try TC.dequantizeInt8ConvrotRaw(enc.weight, enc.scale, rows, cols, cr, group, allocator, pool);
         },
         .int4, .int4_convrot => blk: {
             const cr = fmt == .int4_convrot;
-            const enc = try Q.quantizeToInt4(allocator, input, rows, cols, cr, convrot_group_size, 0, pool);
+            const enc = try Q.quantizeToInt4(allocator, input, rows, cols, cr, group, 0, pool);
             defer allocator.free(enc.weight);
             defer allocator.free(enc.scale);
-            break :blk try TC.dequantizeInt4Raw(enc.weight, enc.scale, rows, cols, cr, convrot_group_size, allocator, pool);
+            break :blk try TC.dequantizeInt4Raw(enc.weight, enc.scale, rows, cols, cr, group, allocator, pool);
         },
         else => unreachable, // byte-based formats handled above
     };
@@ -205,6 +225,20 @@ pub fn roundtripWeighted(
     cols: usize,
     pool: *ThreadPool,
     weights: []const f32,
+) ![]f32 {
+    return roundtripWeightedGroup(fmt, allocator, input, rows, cols, pool, weights, convrot_group_size);
+}
+
+/// `roundtripWeighted` at an explicit ConvRot group size. See `roundtripGroup`.
+pub fn roundtripWeightedGroup(
+    fmt: Format,
+    allocator: std.mem.Allocator,
+    input: []const f32,
+    rows: usize,
+    cols: usize,
+    pool: *ThreadPool,
+    weights: []const f32,
+    group: usize,
 ) ![]f32 {
     std.debug.assert(input.len == rows * cols);
     if (weights.len != cols) return error.WeightsWidthMismatch;
@@ -234,22 +268,22 @@ pub fn roundtripWeighted(
         },
         .int8, .int8_convrot => blk: {
             const cr = fmt == .int8_convrot;
-            const enc = try Q.quantizeToInt8Weighted(allocator, input, rows, cols, cr, convrot_group_size, pool, weights);
+            const enc = try Q.quantizeToInt8Weighted(allocator, input, rows, cols, cr, group, pool, weights);
             defer allocator.free(enc.weight);
             defer allocator.free(enc.scale);
-            break :blk try TC.dequantizeInt8ConvrotRaw(enc.weight, enc.scale, rows, cols, cr, convrot_group_size, allocator, pool);
+            break :blk try TC.dequantizeInt8ConvrotRaw(enc.weight, enc.scale, rows, cols, cr, group, allocator, pool);
         },
         .int4, .int4_convrot => blk: {
             const cr = fmt == .int4_convrot;
-            const enc = try Q.quantizeToInt4Weighted(allocator, input, rows, cols, cr, convrot_group_size, 0, pool, weights);
+            const enc = try Q.quantizeToInt4Weighted(allocator, input, rows, cols, cr, group, 0, pool, weights);
             defer allocator.free(enc.weight);
             defer allocator.free(enc.scale);
-            break :blk try TC.dequantizeInt4Raw(enc.weight, enc.scale, rows, cols, cr, convrot_group_size, allocator, pool);
+            break :blk try TC.dequantizeInt4Raw(enc.weight, enc.scale, rows, cols, cr, group, allocator, pool);
         },
         // MXFP8 and NVFP4 have no weighted path yet (their block scales are a
         // constrained encoding, not a free scalar), so this is the unweighted
         // result — which is the honest answer, not a silent zero.
-        else => try roundtrip(fmt, allocator, input, rows, cols, pool),
+        else => try roundtripGroup(fmt, allocator, input, rows, cols, pool, group),
     };
 }
 

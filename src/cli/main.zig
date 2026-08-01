@@ -8,6 +8,8 @@ const imagearch = ggufy.imageArch;
 const conv = ggufy.convert;
 const calib = ggufy.calibrate;
 const sens = ggufy.sensitivity;
+const vrd = ggufy.verdict;
+const dvg = ggufy.divergence;
 
 const build_options = @import("build_options");
 
@@ -21,6 +23,8 @@ const Command = enum {
     sensitivities,
     calibrate,
     sensitivity,
+    verdict,
+    divergence,
     version,
 };
 
@@ -179,6 +183,297 @@ fn runCalibrate(
     }
 }
 
+/// `ggufy verdict <reference> --candidates a,b [...]` — level 3/4: compare rendered
+/// images across quantization arms and emit a table plus a contact sheet.
+fn runVerdict(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    arena_alloc: std.mem.Allocator,
+    path: []const u8,
+    args: anytype,
+    stdout: *std.Io.Writer,
+) !void {
+    const list = args.candidates orelse {
+        std.log.err("verdict needs at least one candidate: --candidates <dir>[,<dir>...]", .{});
+        return error.MissingArgument;
+    };
+
+    var cands: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, list, ',');
+    while (it.next()) |tok| {
+        const t = std.mem.trim(u8, tok, " \t");
+        if (t.len > 0) try cands.append(arena_alloc, t);
+    }
+
+    var report = vrd.run(allocator, .{
+        .io = io,
+        .reference = path,
+        .candidates = cands.items,
+        .lpips_weights = args.lpips,
+    }) catch |err| {
+        std.log.err("verdict failed: {t}", .{err});
+        return err;
+    };
+    defer report.deinit();
+
+    try vrd.writeMarkdown(stdout, &report);
+
+    if (args.html) |html_path| {
+        const dir = std.fs.path.dirname(html_path) orelse ".";
+        const f = try std.Io.Dir.cwd().createFile(io, html_path, .{ .truncate = true });
+        defer f.close(io);
+        var buf: [1 << 16]u8 = undefined;
+        var fw = f.writer(io, &buf);
+        try vrd.writeHtml(&fw.interface, &report, dir);
+        try fw.interface.flush();
+        try stdout.print("\nWrote contact sheet to {s}\n", .{html_path});
+    }
+}
+
+/// `ggufy divergence <reference> --candidates a,b [...]` — level 2: one-pass
+/// velocity divergence on the reference's own trajectory (teacher-forced), the
+/// only measurement here with no trajectory drift in it.
+fn runDivergence(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    arena_alloc: std.mem.Allocator,
+    path: []const u8,
+    args: anytype,
+    stdout: *std.Io.Writer,
+) !void {
+    const per_tensor = args.@"per-tensor" != 0;
+    if (!per_tensor and args.candidates == null) {
+        std.log.err("divergence needs at least one candidate checkpoint: --candidates <file>[,<file>...]", .{});
+        return error.MissingArgument;
+    }
+    if (per_tensor and args.candidates != null) {
+        // Refused rather than ignored: a report listing candidates nobody measured
+        // is worse than no report.
+        std.log.err("--per-tensor measures tensors of the reference itself; it has no use for --candidates", .{});
+        return error.InvalidArgument;
+    }
+    const list = args.candidates orelse "";
+    const text_encoder = args.@"text-encoder" orelse {
+        std.log.err("divergence needs the text encoder checkpoint: -e/--text-encoder <path>", .{});
+        return error.MissingArgument;
+    };
+    const vae = args.vae orelse {
+        std.log.err("divergence needs the VAE checkpoint: -v/--vae <path>", .{});
+        return error.MissingArgument;
+    };
+
+    const backend_name = args.backend orelse "cpu";
+    const backend = dvg.Backend.fromStr(backend_name) orelse {
+        std.log.err("Unknown backend '{s}'. Use one of: cpu, vulkan, zig-cuda, cuda", .{backend_name});
+        return error.InvalidArgument;
+    };
+    // Levels 1-2 anchor on the CPU f32 path (ACTIVATION_AWARE.md hygiene rule 2):
+    // a GPU reduction-order difference between the two arms would land in the same
+    // number as the quantization difference we are trying to measure.
+    if (backend != .cpu) {
+        std.log.warn(
+            "backend '{s}': level 2 compares two models' velocities, and GPU reduction order " ++
+                "differs run to run — the drift becomes this measurement's noise floor. " ++
+                "Use --backend cpu for the reference number.",
+            .{@tagName(backend)},
+        );
+    }
+
+    var cands: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, list, ',');
+    while (it.next()) |tok| {
+        const t = std.mem.trim(u8, tok, " \t");
+        if (t.len > 0) try cands.append(arena_alloc, t);
+    }
+
+    // The prompt set is part of the measurement, exactly as for `calibrate`, and
+    // the same file works for both.
+    const prompt_json = if (args.prompts) |p|
+        try std.Io.Dir.cwd().readFileAlloc(io, p, arena_alloc, .unlimited)
+    else
+        calib.default_prompts_json;
+    var set = calib.parsePromptSet(allocator, prompt_json) catch |err| {
+        std.log.err("Could not read the prompt set: {t}. Expected {{\"id\": …, \"prompts\": [ … ]}}", .{err});
+        return err;
+    };
+    defer set.deinit();
+
+    const res = args.resolution orelse 512;
+    const steps = args.steps orelse 8;
+    const opts = dvg.Options{
+        .io = io,
+        .reference = path,
+        .candidates = cands.items,
+        .text_encoder_path = text_encoder,
+        .vae_path = vae,
+        .prompts = set.prompts,
+        .width = res,
+        .height = res,
+        .steps = steps,
+        .seed = args.seed orelse 0,
+        .backend = backend,
+        .log = stdout,
+    };
+
+    if (per_tensor) {
+        try runDivergencePerTensor(io, allocator, arena_alloc, opts, args, stdout);
+        return;
+    }
+
+    try stdout.print(
+        "level 2: {d} prompts x {d} steps at {d}^2 on {s} = {d} points per arm, {d} arms\n" ++
+            "reference {s}\n",
+        .{ set.prompts.len, steps, res, @tagName(backend), set.prompts.len * steps, cands.items.len, path },
+    );
+    try stdout.flush();
+
+    var report = dvg.run(allocator, opts) catch |err| {
+        std.log.err("divergence failed: {t}", .{err});
+        return err;
+    };
+    defer report.deinit();
+
+    try stdout.writeByte('\n');
+    try dvg.writeMarkdown(stdout, &report);
+    try stdout.flush();
+
+    const stem = args.@"output-name" orelse "divergence";
+    const csv_path = try joinOut(arena_alloc, args.@"output-dir", stem, ".csv");
+    {
+        const file = try std.Io.Dir.cwd().createFile(io, csv_path, .{ .truncate = true });
+        defer file.close(io);
+        var buf: [1 << 16]u8 = undefined;
+        var fw = file.writer(io, &buf);
+        try dvg.writeCsv(&fw.interface, &report);
+        try fw.interface.flush();
+    }
+    try stdout.print("\nwrote {s}\n", .{csv_path});
+}
+
+/// `ggufy divergence <reference> --per-tensor -F <format> [...]` — level 2, one
+/// tensor at a time: the arm that checks whether level 1's per-layer ranking is the
+/// ranking the whole model agrees with.
+fn runDivergencePerTensor(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    arena_alloc: std.mem.Allocator,
+    opts: dvg.Options,
+    args: anytype,
+    stdout: *std.Io.Writer,
+) !void {
+    const spec = args.formats orelse {
+        std.log.err("--per-tensor needs exactly one format to measure: -F <format> (e.g. -F q4_k)", .{});
+        return error.MissingArgument;
+    };
+    const fmts = sens.parseFormats(arena_alloc, spec) catch |err| {
+        std.log.err("Could not parse --formats '{s}': {t}", .{ spec, err });
+        return err;
+    };
+    if (fmts.len != 1) {
+        // Every extra format multiplies the run by the number of tensors; make the
+        // cost an explicit choice rather than a comma.
+        std.log.err("--per-tensor measures one format per run ({d} given). Run it once per format.", .{fmts.len});
+        return error.InvalidArgument;
+    }
+
+    var names: std.ArrayList([]const u8) = .empty;
+    if (args.tensors) |t| {
+        var it = std.mem.splitScalar(u8, t, ',');
+        while (it.next()) |tok| {
+            const s = std.mem.trim(u8, tok, " \t");
+            if (s.len > 0) try names.append(arena_alloc, s);
+        }
+    }
+    if (args.@"tensors-from") |path| {
+        const text = try std.Io.Dir.cwd().readFileAlloc(io, path, arena_alloc, .unlimited);
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            const s = std.mem.trim(u8, line, " \t\r");
+            if (s.len == 0 or s[0] == '#') continue;
+            try names.append(arena_alloc, s);
+        }
+    }
+
+    const patch_dtype: dvg.PerTensor.PatchDtype = blk: {
+        const name = args.@"patch-dtype" orelse break :blk .f32;
+        if (std.mem.eql(u8, name, "f32")) break :blk .f32;
+        if (std.mem.eql(u8, name, "bf16")) break :blk .bf16;
+        std.log.err("--patch-dtype must be 'f32' or 'bf16' (got '{s}')", .{name});
+        return error.InvalidArgument;
+    };
+    const pt = dvg.PerTensor{
+        .format = fmts[0],
+        .tensors = names.items,
+        .max_tensors = args.@"max-tensors",
+        .controls = args.@"no-controls" == 0,
+        .threads = args.threads orelse 0,
+        .patch_dtype = patch_dtype,
+    };
+
+    // Optional: the level-1 CSV this ranking is compared against. Loaded BEFORE the
+    // measurement — a typo in the path should not cost an hour of forwards.
+    var l1: ?dvg.Level1 = null;
+    defer if (l1) |*m| m.deinit();
+    if (args.level1) |csv_path| {
+        const text = try std.Io.Dir.cwd().readFileAlloc(io, csv_path, arena_alloc, .unlimited);
+        const arm = args.@"level1-arm" orelse "format";
+        l1 = dvg.Level1.parseCsv(allocator, text, sens.formatName(fmts[0]), arm) catch |err| {
+            std.log.err("Could not read level-1 rows for format '{s}', arm '{s}' from {s}: {t}", .{ sens.formatName(fmts[0]), arm, csv_path, err });
+            return err;
+        };
+    }
+
+    const n_tensors: usize = if (names.items.len > 0) names.items.len else 0;
+    try stdout.print(
+        "level 2 per-tensor: format {s}, {d} prompts x {d} steps at {d}^2 on {s} = {d} points per arm\n" ++
+            "reference {s}\n{s}\n",
+        .{
+            sens.formatName(fmts[0]),   opts.prompts.len,
+            opts.steps,                 opts.width,
+            @tagName(opts.backend),     opts.prompts.len * opts.steps,
+            opts.reference,
+            if (n_tensors > 0) "tensors: from --tensors" else "tensors: every matrix weight in the checkpoint (this is a long run)",
+        },
+    );
+    try stdout.flush();
+
+    // The CSV is opened BEFORE the run and streamed into, one flush per arm: a
+    // 263-tensor sweep is hours, and the report is only assembled at the end, so
+    // without this an interruption in hour three leaves nothing measured behind.
+    const stem = args.@"output-name" orelse "divergence-per-tensor";
+    const csv_out = try joinOut(arena_alloc, args.@"output-dir", stem, ".csv");
+    const csv_file = try std.Io.Dir.cwd().createFile(io, csv_out, .{ .truncate = true });
+    defer csv_file.close(io);
+    var csv_buf: [1 << 16]u8 = undefined;
+    var csv_w = csv_file.writer(io, &csv_buf);
+    try csv_w.interface.writeAll(dvg.tensor_csv_header);
+    try csv_w.interface.flush();
+
+    var streamed = pt;
+    streamed.stream_csv = &csv_w.interface;
+
+    var report = dvg.runPerTensor(allocator, opts, streamed) catch |err| {
+        std.log.err("per-tensor divergence failed: {t} (partial results are in {s})", .{ err, csv_out });
+        return err;
+    };
+    defer report.deinit();
+
+    try stdout.writeByte('\n');
+    try dvg.writeTensorMarkdown(stdout, &report, if (l1) |*m| m else null);
+    try stdout.flush();
+
+    const md_out = try joinOut(arena_alloc, args.@"output-dir", stem, ".md");
+    {
+        const file = try std.Io.Dir.cwd().createFile(io, md_out, .{ .truncate = true });
+        defer file.close(io);
+        var buf: [1 << 16]u8 = undefined;
+        var fw = file.writer(io, &buf);
+        try dvg.writeTensorMarkdown(&fw.interface, &report, if (l1) |*m| m else null);
+        try fw.interface.flush();
+    }
+    try stdout.print("\nwrote {s}\nwrote {s}\n", .{ csv_out, md_out });
+}
+
 /// `ggufy sensitivity <model> -C <cache> [...]` — level 1: measure per-layer
 /// output error on the captured activations and write a measured sensitivities
 /// JSON the converter can route on.
@@ -204,6 +499,35 @@ fn runSensitivity(
     else
         &sens.default_formats;
 
+    // §8B is off unless asked for: unlike the weighted arm it is a full extra
+    // quantization plus GEMM per (layer, format, α), and nothing ships it yet.
+    const eq_alphas: []const f32 = if (args.@"eq-alphas") |spec|
+        if (std.mem.eql(u8, spec, "default"))
+            &ggufy.equalize.default_alphas
+        else
+            parseAlphas(arena_alloc, spec) catch |err| {
+                std.log.err("Bad --eq-alphas value '{s}': {t} (expected e.g. \"0.25,0.5\" or \"default\")", .{ spec, err });
+                return err;
+            }
+    else
+        &.{};
+
+    // §8C, same reasoning as §8B and more so: it is the most expensive arm here and
+    // nothing ships it, so it only runs when asked for.
+    const gptq_damp: f32 = if (args.@"gptq-damp") |spec|
+        std.fmt.parseFloat(f32, spec) catch |err| {
+            std.log.err("Bad --gptq-damp value '{s}': {t}", .{ spec, err });
+            return err;
+        }
+    else
+        ggufy.gptq.default_damp;
+    if (!(gptq_damp > 0)) {
+        // A zero ridge is not a more aggressive setting, it is a singular one: the
+        // Gram has rank at most the number of sampled rows.
+        std.log.err("--gptq-damp must be greater than zero (the Gram is rank-deficient without it)", .{});
+        return error.InvalidArgument;
+    }
+
     const opts = sens.Options{
         .model_path = path,
         .calib_path = calib_path,
@@ -211,6 +535,13 @@ fn runSensitivity(
         .bucket = args.bucket,
         .kernel_arm = args.@"no-kernel-arm" == 0,
         .weighted_arm = args.@"no-weighted-arm" == 0,
+        .eq_alphas = eq_alphas,
+        .gptq = args.gptq != 0,
+        .gptq_damp = gptq_damp,
+        .gptq_holdout = args.@"gptq-holdout" orelse 3,
+        .gptq_eval_calib = args.@"calib-eval",
+        .gptq_train_rows = args.@"gptq-train-rows",
+        .convrot_group = args.@"convrot-group" orelse ggufy.sensitivity.default_convrot_group,
         .max_layers = args.@"max-layers",
         .threads = threads,
         .log = stdout,
@@ -245,6 +576,23 @@ fn runSensitivity(
     try writeReportFile(io, csv_path, &report, sens.writeCsv);
 
     try stdout.print("\nwrote {s} ({d} layers) and {s}\n", .{ json_path, report.layers.len, csv_path });
+}
+
+/// Parse `--eq-alphas` ("0.25,0.5,0.75"). Rejects anything outside [0, 1]: α is a
+/// fraction of the importance to move into the weights, and a value outside that
+/// range is a typo, not an experiment.
+fn parseAlphas(arena_alloc: std.mem.Allocator, spec: []const u8) ![]const f32 {
+    var out: std.ArrayList(f32) = .empty;
+    var it = std.mem.splitScalar(u8, spec, ',');
+    while (it.next()) |raw| {
+        const tok = std.mem.trim(u8, raw, " \t");
+        if (tok.len == 0) continue;
+        const v = try std.fmt.parseFloat(f32, tok);
+        if (!(v >= 0 and v <= 1)) return error.OutOfRange;
+        try out.append(arena_alloc, v);
+    }
+    if (out.items.len == 0) return error.NoAlphas;
+    return out.items;
 }
 
 fn joinOut(arena_alloc: std.mem.Allocator, dir: ?[]const u8, stem: []const u8, ext: []const u8) ![]const u8 {
@@ -306,7 +654,25 @@ pub fn main(init: std.process.Init) !void {
         \\    --max-layers <INT>         With sensitivity: stop after this many layers (a quick look, not a trustworthy ranking).
         \\    --no-kernel-arm            With sensitivity: skip the native-kernel arm and measure format loss only.
         \\    --no-weighted-arm          With sensitivity: skip the activation-weighted arm (imatrix + clipping search).
-        \\<COMMAND>    Specify a command: header, tree, metadata, convert, template, calibrate, sensitivity, version
+        \\    --eq-alphas <NAME>         With sensitivity: also measure activation-equalization arms (§8B) at these alphas, e.g. "0.25,0.5" or "default". Off by default; costs one extra quantize+GEMM per layer, format and alpha.
+        \\    --gptq                     With sensitivity: measure the GPTQ error-compensation arm (§8C) for the int8/int4 formats. With convert: apply it, choosing each weight's level by compensation rather than rounding (needs -C, safetensors output only, adds minutes).
+        \\    --gptq-damp <NAME>         With --gptq: ridge as a fraction of the mean Gram diagonal. Default 0.01.
+        \\    --gptq-holdout <INT>       With --gptq: hold 1 row in N back from the Hessian and measure on those. Default 3; 2 splits the sample evenly.
+        \\    --calib-eval <FILENAME>    With --gptq: score against this second cache (same checkpoint, disjoint prompts) instead of a held-out row split. The number that decides whether GPTQ generalizes.
+        \\    --gptq-train-rows <INT>    With --gptq: fit the Hessian on at most this many token rows (evenly subsampled). Sweep it to see how the win scales with calibration data.
+        \\    --convrot-group <INT>      With sensitivity: ConvRot rotation group for the rotating arms. Default 64 (the harness's); pass 256 to measure what convert actually writes.
+        \\    --candidates <NAME>        With verdict: comma-separated candidate image dirs (or files) to compare against the reference. With divergence: candidate DiT checkpoints.
+        \\    --per-tensor               With divergence: quantize ONE tensor at a time (format from -F) and measure the whole model's velocity error — the arm that checks whether level 1 ranks layers the way the model does. Refuses --candidates.
+        \\    --tensors <NAME>           With --per-tensor: comma-separated checkpoint tensor names to measure. Default: every matrix weight (263 on krea2, hours). A list stratified over level 1's ranking is what answers the correlation question cheaply.
+        \\    --tensors-from <FILENAME>  With --per-tensor: read the tensor names from a file, one per line (blank lines and #-comments skipped). For lists too long or too scripted for a flag.
+        \\    --max-tensors <INT>        With --per-tensor: keep at most this many of the selected tensors, sampled at an even stride.
+        \\    --no-controls              With --per-tensor: skip the two control arms (overlay-inertness and the f32 dequant floor). They are what make the table interpretable.
+        \\    --level1 <FILENAME>        With --per-tensor: a level-1 CSV (from sensitivity) to correlate the per-tensor ranking against. Uses -F's format name.
+        \\    --level1-arm <NAME>        With --level1: which level-1 arm's rows to read. Default "format"; "weighted" for the imatrix arm.
+        \\    --patch-dtype <NAME>       With --per-tensor: dtype the substituted tensor is written back as, "f32" (default, exact) or "bf16". bf16 is what makes this arm runnable on a GPU — the GPU DiTs need one weight class per model — at the cost of ~0.2% extra rounding.
+        \\    --html <FILENAME>          With verdict: also write an HTML contact sheet here.
+        \\    --lpips <FILENAME>         With verdict: LPIPS weights (AlexNet, from TensorPencil's tools/gen_lpips_fixtures.py). Adds the LPIPS column - the metric that tracks human judgement.
+        \\<COMMAND>    Specify a command: header, tree, metadata, convert, template, calibrate, sensitivity, verdict, divergence, version
         \\<FILENAME>   The file to use for input (not required for the version command)
     );
 
@@ -359,6 +725,8 @@ pub fn main(init: std.process.Init) !void {
         try stdout.print("  sensitivities  Generate a sensitivities JSON template from the specified file\n", .{});
         try stdout.print("  calibrate      Run diffusion forwards on the specified model and record a calibration cache\n", .{});
         try stdout.print("  sensitivity    Measure per-layer sensitivity from a calibration cache and write a measured sensitivities JSON\n", .{});
+        try stdout.print("  verdict        Compare rendered images across quantization arms (PSNR, SSIM, LPIPS, detail, contact sheet)\n", .{});
+        try stdout.print("  divergence     Level 2: one-pass velocity divergence between checkpoints, drift-free\n", .{});
         try stdout.print("  version        Print version information\n\n", .{});
         try stdout.print("Options:\n", .{});
         try stdout.flush();
@@ -404,6 +772,29 @@ pub fn main(init: std.process.Init) !void {
     else
         null;
 
+    // §8C. Two ways to ask for compensation and not get it, both worth refusing
+    // loudly rather than producing a file that looks like what was asked for:
+    // without a cache there is nothing to compensate against, and GGUF output does
+    // not carry the cluster formats §8C reaches at all.
+    //
+    // Scoped to `convert`: `--gptq` also selects the level-1 arm on `sensitivity`,
+    // which has no output file and inherits the default gguf filetype, so an
+    // unscoped guard rejects the measurement command that the flag mostly exists for.
+    const want_gptq = res.args.gptq != 0;
+    if (want_gptq and command == .convert and res.args.calib == null) {
+        std.log.err("--gptq needs a calibration cache: -C/--calib <path>", .{});
+        return;
+    }
+    if (want_gptq and command == .convert and filetype == .gguf) {
+        std.log.err(
+            "--gptq applies to the int4/int8 cluster formats, which are safetensors-only; " ++
+                "GGUF output would silently ignore it. Use -f safetensors, or -C alone for GGUF " ++
+                "(activation-aware k-quants, measured at 9-19%).",
+            .{},
+        );
+        return;
+    }
+
     // Shared conversion options — used by both the real convert path and the
     // --calculate-size prediction, so the predicted size matches what convert writes.
     const convert_opts = conv.ConvertOptions{
@@ -425,6 +816,7 @@ pub fn main(init: std.process.Init) !void {
         .allow_upscale = allow_upscale,
         .arch_override = arch_override,
         .stochastic_rounding = res.args.@"stochastic-rounding",
+        .gptq = want_gptq and command == .convert,
     };
 
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -440,6 +832,19 @@ pub fn main(init: std.process.Init) !void {
     }
     if (command == .sensitivity) {
         try runSensitivity(io, allocator, arena_alloc, path, res.args, threads, stdout);
+        try stdout.flush();
+        return;
+    }
+    // Verdict compares rendered images, so its positional is an image path (or a
+    // directory of them) rather than a model — handled before file-type sniffing.
+    if (command == .verdict) {
+        try runVerdict(io, allocator, arena_alloc, path, res.args, stdout);
+        try stdout.flush();
+        return;
+    }
+
+    if (command == .divergence) {
+        try runDivergence(io, allocator, arena_alloc, path, res.args, stdout);
         try stdout.flush();
         return;
     }
@@ -524,7 +929,7 @@ pub fn main(init: std.process.Init) !void {
                 },
                 .names => try dumpNames(f.tensors.items, res.args.shapes != 0, allocator, stdout),
                 // All three are dispatched before file-type detection.
-                .calibrate, .sensitivity, .version => unreachable,
+                .calibrate, .sensitivity, .verdict, .divergence, .version => unreachable,
             }
         },
         .gguf => {
@@ -592,7 +997,7 @@ pub fn main(init: std.process.Init) !void {
                     std.log.info("Sensitivities exported to {s}", .{out_path});
                 },
                 // All three are dispatched before file-type detection.
-                .calibrate, .sensitivity, .version => unreachable,
+                .calibrate, .sensitivity, .verdict, .divergence, .version => unreachable,
             }
         },
     }

@@ -12,6 +12,7 @@ const TensorClusters = @import("TensorClusters.zig");
 const DataTransform = @import("DataTransform.zig");
 const CalibrationCache = @import("CalibrationCache.zig");
 const Imatrix = @import("Imatrix.zig");
+const GptqPlan = @import("GptqPlan.zig");
 const build_options = @import("build_options");
 
 // Cluster identity blobs + layout now live in TensorClusters (the shared source of truth).
@@ -65,6 +66,15 @@ pub const ConvertOptions = struct {
     /// Leaving it null keeps every quantizer bit-exact against its reference
     /// implementation, which is what the golden fixtures pin.
     calibration_path: ?[]const u8 = null,
+    /// Plan §8C: on top of `calibration_path`, choose each weight's *level* by GPTQ
+    /// error compensation against the full Gram rather than by rounding. Same
+    /// format, same bytes, same size — only which level each weight lands on.
+    ///
+    /// Applies to the int4/int8 safetensors clusters only, and deliberately not to
+    /// GGUF: level 1 measured ~5% there against 9–19% for `--calib` alone, with
+    /// ~9% of layers regressing. Requires a cache, and costs several minutes on a
+    /// large model. See `GptqPlan`.
+    gptq: bool = false,
     /// Optional GUI progress/cancel hooks.  No-ops when null.
     callbacks: cb.ConvertCallbacks = .{},
 };
@@ -1365,6 +1375,27 @@ fn writeSafetensors(
     defer if (imatrix) |*im| im.deinit();
     if (imatrix) |*im| out_st.imatrix = imatrixLookup(im);
 
+    // --- GPTQ error compensation (plan §8C) -----------------------------------
+    // Stacks on §8A: the imatrix still picks each grid, GPTQ picks the level within
+    // it. The cache stays open for the whole write, because unlike §8A this needs
+    // the sampled activation rows and not just their per-channel energy.
+    var gptq_cache: ?CalibrationCache.Cache = null;
+    defer if (gptq_cache) |*c| c.deinit();
+    var gptq_plan: GptqPlan.Plan = undefined;
+    if (opts.gptq) {
+        if (imatrix) |*im| {
+            gptq_cache = try CalibrationCache.Cache.open(allocator, opts.io, opts.calibration_path.?);
+            gptq_plan = .{ .gpa = allocator, .cache = &gptq_cache.?, .imatrix = im };
+            out_st.gptq = GptqPlan.lookup(&gptq_plan);
+        } else {
+            // Reachable only without --calib, which `Convert.run` rejects earlier;
+            // kept because silently converting without the compensation the user
+            // asked for is the one outcome that must not happen.
+            std.log.err("--gptq needs a calibration cache (-C); nothing was compensated", .{});
+            return error.MissingCalibration;
+        }
+    }
+
     try buildSafetensorsMetadata(&out_st.metadata, f, template_metadata, extra_metadata, arena_alloc);
 
     const sr_seed: u64 = opts.stochastic_rounding orelse TensorClusters.default_stochastic_seed;
@@ -1374,6 +1405,20 @@ fn writeSafetensors(
         }
         return err;
     };
+    if (opts.gptq) {
+        const s = gptq_plan.summary;
+        std.log.info(
+            "GPTQ error compensation (§8C): {d} tensors compensated, {d} unsupported type, " ++
+                "{d} no calibration rows, {d} too narrow for the guard, {d} failed",
+            .{ s.use, s.unsupported_type, s.no_data, s.too_narrow, s.failed },
+        );
+        if (s.use == 0) {
+            std.log.warn("No tensor was compensated — this conversion is identical to --calib alone", .{});
+        }
+        if (s.failed > 0) {
+            std.log.warn("{d} tensors fell back to the uncompensated path after a sweep error", .{s.failed});
+        }
+    }
     std.log.info("Converted to {s}", .{out_filename});
 
     _ = arch;

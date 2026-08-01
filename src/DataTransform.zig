@@ -1076,7 +1076,12 @@ pub const Quantizer = struct {
     }
 
     /// Round half-to-even (banker's rounding), matching torch's `.round()`.
-    fn roundHalfToEven(x: f32) f32 {
+    ///
+    /// Public because §8C's GPTQ loop rounds the same grids this file does and
+    /// must round them *identically* — a second implementation of the rule would
+    /// make the measured difference between GPTQ and RTN partly a rounding
+    /// difference.
+    pub fn roundHalfToEven(x: f32) f32 {
         const fl = @floor(x);
         const diff = x - fl;
         if (diff < 0.5) return fl;
@@ -1180,12 +1185,17 @@ pub const Quantizer = struct {
     /// Weighted squared error of quantizing `vals` at scale `s`.
     ///
     /// This is the hot loop of the whole clipping search — every candidate ratio
-    /// walks every element of every row — so it is vectorized. Note the f64
-    /// accumulation is per lane and reduced at the end, which is a different
-    /// summation order from a scalar loop; the value can differ in the last bits.
-    /// That is fine because it is deterministic and only ever used to *rank*
-    /// candidates, but it does mean this is not bit-identical to a naive scalar
-    /// implementation of the same formula.
+    /// walks every element of every row — so it is vectorized. Measured on a 26 GB
+    /// checkpoint to INT4_CONVROT: **393 s scalar, 88 s vectorized**, taking the
+    /// `--calib` overhead from 6.3x to 1.43x.
+    ///
+    /// The f64 accumulation is per lane and reduced at the end, a different
+    /// summation order from a scalar loop, so the returned *value* can differ in
+    /// the last bits. That is safe because it is deterministic (comptime lane
+    /// count) and only ever used to rank candidates — and empirically the ranking
+    /// does not notice: the vectorized and scalar implementations produce
+    /// **byte-identical output** across all 430 tensors of that model, so no row's
+    /// argmin flipped.
     fn clipError(vals: []const f32, w: []const f32, s: f32, qlo: f32, qhi: f32) f64 {
         const sv: @Vector(clip_lanes, f32) = @splat(s);
         const lo: @Vector(clip_lanes, f32) = @splat(qlo);
@@ -1229,7 +1239,12 @@ pub const Quantizer = struct {
     /// `qdiv` is the divisor the format's default uses (127 for int8, 7 for
     /// int4); `qlo`/`qhi` are the clamp bounds, which are not always symmetric
     /// with it (int8 clamps to [-128, 127]).
-    fn searchScale(vals: []const f32, w: ?[]const f32, qdiv: f32, qlo: f32, qhi: f32) f32 {
+    ///
+    /// Public because §8C picks its scales here too. GPTQ changes *which level*
+    /// each weight rounds to, not where the grid sits, so it has to inherit the
+    /// grid from whatever `convert` would have shipped — otherwise the level-1
+    /// arm would be measuring a scale change and a rounding change at once.
+    pub fn searchScale(vals: []const f32, w: ?[]const f32, qdiv: f32, qlo: f32, qhi: f32) f32 {
         var amax: f32 = 0.0;
         for (vals) |v| {
             if (!std.math.isNan(v) and !std.math.isInf(v)) amax = @max(amax, @abs(v));

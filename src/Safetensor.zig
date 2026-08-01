@@ -26,6 +26,9 @@ current_data_begin: u64 = 0,
 /// every tensor is quantized unweighted, which is the historical behaviour, the
 /// default, and what the ComfyUI-pinned fixtures cover.
 imatrix: ?types.ImatrixLookup = null,
+/// §8C compensation, when `convert --gptq` installed a plan. Only the cluster path
+/// consults it; GGUF output never does, deliberately (see `GptqPlan`).
+gptq: ?types.GptqLookup = null,
 
 const Safetensors = @This();
 
@@ -938,9 +941,18 @@ pub fn saveWithSTData(self: Safetensors, source: anytype, threads: usize, callba
             if (src_f32) |data| {
                 defer self.allocator.free(data);
                 if (dest_is_cluster) {
-                    try TensorClusters.writeClusterDataWeighted(
+                    // §8C first, when a plan is installed: it returns null for every
+                    // tensor its policy declines, and the writer then quantizes
+                    // exactly as it would have without `--gptq`.
+                    const pre: ?types.ClusterCodes = if (self.gptq) |g|
+                        try g.forTensor(self.allocator, t, data, &pool)
+                    else
+                        null;
+                    defer if (pre) |c| c.deinit(self.allocator);
+                    try TensorClusters.writeClusterDataPre(
                         &writer.interface, self.allocator, dt, data, t.dims, stochastic_rounding, &pool,
                         if (self.imatrix) |im| im.forTensor(t) else null,
+                        pre,
                     );
                 } else {
                     const out = try DataTransform.Quantizer.convertTensorData(

@@ -56,6 +56,45 @@ pub const ImatrixLookup = struct {
     }
 };
 
+/// A cluster tensor's payload in the layout the writers emit: packed codes
+/// followed by per-row scales. Produced outside the normal quantizer path by §8C,
+/// whose rounding cannot be expressed as a weight vector the way §8A's can.
+pub const ClusterCodes = struct {
+    weight: []u8,
+    scale: []f32,
+
+    pub fn deinit(self: ClusterCodes, allocator: std.mem.Allocator) void {
+        allocator.free(self.weight);
+        allocator.free(self.scale);
+    }
+};
+
+/// §8C's counterpart to `ImatrixLookup`, and type-erased for the same reason: the
+/// file writers must not depend on the calibration stack. Returns null whenever the
+/// plan declines the tensor, which is the writer's signal to quantize as it
+/// otherwise would — so a conversion never fails because compensation was
+/// unavailable, it just falls back to what `--calib` alone produces.
+pub const GptqLookup = struct {
+    ctx: *anyopaque,
+    quantize: *const fn (
+        ctx: *anyopaque,
+        allocator: std.mem.Allocator,
+        t: Tensor,
+        f32_data: []const f32,
+        pool: *anyopaque,
+    ) anyerror!?ClusterCodes,
+
+    pub fn forTensor(
+        self: GptqLookup,
+        allocator: std.mem.Allocator,
+        t: Tensor,
+        f32_data: []const f32,
+        pool: *anyopaque,
+    ) anyerror!?ClusterCodes {
+        return self.quantize(self.ctx, allocator, t, f32_data, pool);
+    }
+};
+
 pub const Tensor = struct {
     name: []const u8,
     type: []const u8,

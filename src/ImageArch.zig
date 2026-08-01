@@ -15,6 +15,41 @@ pub const ShapeRule = struct {
     extent: usize,
 };
 
+/// Can §8B's per-channel fold `x / s` be produced without a runtime change?
+///
+/// Equalization scales a weight's input columns by `s` and requires whatever
+/// feeds it to divide by the same `s`. Whether that is free, cheap-but-invasive,
+/// or impossible is a property of the architecture's graph, which is why the
+/// relation lives here rather than in `Equalize.zig`.
+pub const Foldability = enum {
+    /// A static per-channel producer (an RMSNorm scale vector) feeds this weight,
+    /// with nothing additive between it and the GEMM. Divide the producer's vector
+    /// by `s` and the transform is exact at zero runtime cost — the case §8B was
+    /// designed around.
+    exact,
+    /// A static norm scale exists, but the activations are additively modulated
+    /// after it (AdaLN `(1 + a) ⊙ n + b`) by a runtime vector that no per-layer
+    /// static tensor carries alone. `1/s` folds into the norm and commutes with
+    /// the multiplicative half, but `W·diag(s)` also multiplies the shift, so the
+    /// transform is **not** exact. Needs the runtime to divide the modulated
+    /// activations, i.e. a per-layer vector in the file and one multiply at the
+    /// modulate site.
+    runtime_shift,
+    /// The input is a computed activation with no per-channel producer at all
+    /// (attention output → `wo`, the SwiGLU product → `down`, a raw embedding).
+    /// Equalization here means a format change plus a kernel change on every
+    /// backend, which §8B explicitly declines.
+    none,
+};
+
+/// One rule in an architecture's foldability relation. Both bounds must match the
+/// **stripped** tensor name; an empty `prefix` matches anything.
+pub const FoldRule = struct {
+    prefix: []const u8 = "",
+    suffix: []const u8,
+    fold: Foldability,
+};
+
 /// Represents a model architecture with its detection keys and configuration
 pub const Arch = struct {
     /// String describing architecture name
@@ -47,6 +82,12 @@ pub const Arch = struct {
     /// from fine-tuned source files. Top-level keys are merged into the output `config` KV,
     /// with the source file's keys taking priority over these defaults.
     base_config_json: []const u8 = "",
+    /// §8B: which weights have a foldable per-channel producer. First matching rule
+    /// wins; anything unmatched is `.none`. Empty means "not analyzed for this
+    /// architecture", which reads as `.none` everywhere — conservative, and the
+    /// right default, since claiming a fold that does not exist would ship a model
+    /// computing a different function.
+    eq_folds: []const FoldRule = &.{},
 
     /// Check if this architecture matches the given tensor names
     pub fn matches(self: Arch, tensor_names: []const []const u8) bool {
@@ -121,6 +162,23 @@ pub const Arch = struct {
             if (std.mem.indexOf(u8, key, pattern) != null) return true;
         }
         return false;
+    }
+
+    /// Whether §8B equalization of this weight's input channels can be folded
+    /// into a static producer. Takes the tensor name in either packaging — it
+    /// strips the container prefix itself, as the rest of this file's lookups do.
+    pub fn foldability(self: Arch, tensor_name: []const u8) Foldability {
+        const key = stripPrefix(tensor_name);
+        for (self.eq_folds) |rule| {
+            if (!std.mem.startsWith(u8, key, rule.prefix)) continue;
+            if (!std.mem.endsWith(u8, key, rule.suffix)) continue;
+            // A rule must not match the tensor it is describing the *producer* of,
+            // which for a same-name prefix+suffix pair would mean overlapping
+            // bounds on too short a name.
+            if (key.len < rule.prefix.len + rule.suffix.len) continue;
+            return rule.fold;
+        }
+        return .none;
     }
 
     /// Check if the key should be upcast from bf16
@@ -604,6 +662,43 @@ pub const krea2 = Arch{
     .keys_nvfp4_passthrough = &.{
         "first.weight",
     },
+    // §8B. Read off TensorPencil's `dit.zig` (`txtBlockForward` and
+    // `blockForward`), which mirrors comfy/ldm/krea2/model.py.
+    //
+    // The text tower is plain pre-norm — `x += attn(rmsNorm(x) ⊙ prenorm)` — so
+    // its q/k/v/gate share one static producer and its mlp gate/up share another.
+    // Folding there is exact, and free: `.prenorm.scale`/`.postnorm.scale` are
+    // already kept at fp32 by `upcast_from_bf16` above, so dividing them by `s`
+    // costs one f32 rounding per channel.
+    //
+    // The 28 main blocks look identical but are not: AdaLN-single inserts
+    // `(1 + a) ⊙ n + b` between the norm and the projections, and `b`'s `tvec`
+    // half comes from `tproj.1`, which every block shares. There is no per-block
+    // static tensor holding block *i*'s shift, so nothing to divide — see
+    // `Foldability.runtime_shift`. Same story for `last.linear`, whose shift is
+    // `t + last.modulation.lin`.
+    .eq_folds = &.{
+        .{ .prefix = "txtfusion.", .suffix = ".attn.wq.weight", .fold = .exact },
+        .{ .prefix = "txtfusion.", .suffix = ".attn.wk.weight", .fold = .exact },
+        .{ .prefix = "txtfusion.", .suffix = ".attn.wv.weight", .fold = .exact },
+        .{ .prefix = "txtfusion.", .suffix = ".attn.gate.weight", .fold = .exact },
+        .{ .prefix = "txtfusion.", .suffix = ".mlp.gate.weight", .fold = .exact },
+        .{ .prefix = "txtfusion.", .suffix = ".mlp.up.weight", .fold = .exact },
+        // txtmlp.0.scale → txtmlp.1, a single consumer with no modulation.
+        .{ .suffix = "txtmlp.1.weight", .fold = .exact },
+        .{ .prefix = "blocks.", .suffix = ".attn.wq.weight", .fold = .runtime_shift },
+        .{ .prefix = "blocks.", .suffix = ".attn.wk.weight", .fold = .runtime_shift },
+        .{ .prefix = "blocks.", .suffix = ".attn.wv.weight", .fold = .runtime_shift },
+        .{ .prefix = "blocks.", .suffix = ".attn.gate.weight", .fold = .runtime_shift },
+        .{ .prefix = "blocks.", .suffix = ".mlp.gate.weight", .fold = .runtime_shift },
+        .{ .prefix = "blocks.", .suffix = ".mlp.up.weight", .fold = .runtime_shift },
+        .{ .suffix = "last.linear.weight", .fold = .runtime_shift },
+        // Everything else is `.none` by default, which is correct and worth
+        // naming: `attn.wo` reads the attention output, `mlp.down` the SwiGLU
+        // product, `first` the raw patches, and `tmlp`/`tproj`/`.projector` the
+        // timestep and per-layer conditioning paths. None has a per-channel
+        // producer to fold into.
+    },
 };
 
 /// List of all known architectures, in detection priority order
@@ -626,6 +721,14 @@ pub const arch_list = [_]*const Arch{
     &ernie,
     &krea2,
 };
+
+/// Look an architecture up by its `name`, for callers that were handed one as a
+/// string rather than detecting it — a calibration cache records the arch it was
+/// captured from, and the level-1 harness needs the per-arch rules behind it.
+pub fn byName(name: []const u8) ?*const Arch {
+    for (arch_list) |arch| if (std.mem.eql(u8, arch.name, name)) return arch;
+    return null;
+}
 
 /// Core matcher: names must match, and any `shape_detect` rules must hold.
 /// `tensors` is null when only names are known; an architecture that needs

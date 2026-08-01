@@ -291,6 +291,82 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(imatrix_test).step);
 
+    // §8B equalization. Pure policy — it only needs the umbrella because its tests
+    // reuse Imatrix's floor constant, which reaches the cache reader.
+    const equalize_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/Equalize.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "TensorPencil", .module = tp },
+                .{ .name = "tp_core", .module = tp_core },
+            },
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(equalize_test).step);
+
+    // §8C GPTQ. Pure numerics, but its tests pin the sweep against the ComfyUI
+    // int4/int8 quantizers via the precision harness, which reaches ggml.
+    const gptq_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/Gptq.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "TensorPencil", .module = tp },
+                .{ .name = "tp_core", .module = tp_core },
+            },
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(gptq_test).step);
+
+    // §8C convert-side policy: reads activation rows out of a calibration cache,
+    // so it needs the umbrella like the other cache consumers.
+    const gptq_plan_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/GptqPlan.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "TensorPencil", .module = tp },
+                .{ .name = "tp_core", .module = tp_core },
+            },
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(gptq_plan_test).step);
+
+    // Image verdict: decodes PNGs and computes metrics through TensorPencil.
+    const verdict_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/Verdict.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "TensorPencil", .module = tp },
+            },
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(verdict_test).step);
+
+    // Level 2 divergence: drives TensorPencil's pipeline stages, so it needs the
+    // umbrella. (The measurement itself needs checkpoints and self-skips without
+    // them; these tests cover the metric arithmetic and the option guards.)
+    const divergence_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/Divergence.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "TensorPencil", .module = tp },
+                // The per-tensor arm quantizes through `precision_harness`, which
+                // reaches ggml via tp_core.
+                .{ .name = "tp_core", .module = tp_core },
+            },
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(divergence_test).step);
+
     const convert_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/Convert.zig"),
