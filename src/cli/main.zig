@@ -10,6 +10,7 @@ const calib = ggufy.calibrate;
 const sens = ggufy.sensitivity;
 const vrd = ggufy.verdict;
 const dvg = ggufy.divergence;
+const het = ggufy.heterogeneity;
 
 const build_options = @import("build_options");
 
@@ -25,6 +26,7 @@ const Command = enum {
     sensitivity,
     verdict,
     divergence,
+    heterogeneity,
     version,
 };
 
@@ -91,6 +93,27 @@ fn formatDuration(ns: u64, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "{d:.2}h", .{s / 3600}) catch buf[0..0];
 }
 
+/// True when `path` is a checkpoint that carries its own text encoder and VAE — an
+/// LDM single-file SD checkpoint. Those commands normally require `-e`/`-v`, and for
+/// such a file the flags are not only unnecessary but misleading: TensorPencil loads
+/// the conditioner and decoder out of the same container.
+///
+/// Cheap: only the header is parsed. A GGUF (ggufy's own model-only output) never
+/// qualifies, which is correct — a quantized UNet does need the original checkpoint
+/// for CLIP and the VAE.
+fn checkpointIsSelfContained(io: std.Io, allocator: std.mem.Allocator, arena_alloc: std.mem.Allocator, path: []const u8) bool {
+    var f = ggufy.fileLoader.TensorFile.loadFile(io, allocator, arena_alloc, path) catch return false;
+    defer f.deinit();
+    var has_clip = false;
+    var has_vae = false;
+    for (f.tensors.items) |t| {
+        if (std.mem.startsWith(u8, t.name, "cond_stage_model.")) has_clip = true;
+        if (std.mem.startsWith(u8, t.name, "first_stage_model.")) has_vae = true;
+        if (has_clip and has_vae) return true;
+    }
+    return false;
+}
+
 /// `ggufy calibrate <dit> -e <text-encoder> -v <vae> [...]` — run the prompt set
 /// through real diffusion forwards and write the calibration cache.
 fn runCalibrate(
@@ -101,11 +124,16 @@ fn runCalibrate(
     args: anytype,
     stdout: *std.Io.Writer,
 ) !void {
-    const text_encoder = args.@"text-encoder" orelse {
+    // An LDM single-file SD checkpoint holds all three models, so -e/-v are optional
+    // there and required everywhere else.
+    const self_contained = checkpointIsSelfContained(io, allocator, arena_alloc, path);
+    const text_encoder = args.@"text-encoder" orelse blk: {
+        if (self_contained) break :blk path;
         std.log.err("calibrate needs the text encoder checkpoint: -e/--text-encoder <path>", .{});
         return error.MissingArgument;
     };
-    const vae = args.vae orelse {
+    const vae = args.vae orelse blk: {
+        if (self_contained) break :blk path;
         std.log.err("calibrate needs the VAE checkpoint: -v/--vae <path>", .{});
         return error.MissingArgument;
     };
@@ -253,11 +281,16 @@ fn runDivergence(
         return error.InvalidArgument;
     }
     const list = args.candidates orelse "";
-    const text_encoder = args.@"text-encoder" orelse {
+    // Same as calibrate: an LDM single-file SD checkpoint supplies its own conditioner
+    // and decoder, so the flags are optional for it and required otherwise.
+    const self_contained = checkpointIsSelfContained(io, allocator, arena_alloc, path);
+    const text_encoder = args.@"text-encoder" orelse blk: {
+        if (self_contained) break :blk path;
         std.log.err("divergence needs the text encoder checkpoint: -e/--text-encoder <path>", .{});
         return error.MissingArgument;
     };
-    const vae = args.vae orelse {
+    const vae = args.vae orelse blk: {
+        if (self_contained) break :blk path;
         std.log.err("divergence needs the VAE checkpoint: -v/--vae <path>", .{});
         return error.MissingArgument;
     };
@@ -394,6 +427,46 @@ fn runDivergencePerTensor(
         }
     }
 
+    // A set's arm is named by its *label*, not by a tensor, so a sensitivities file
+    // written from a set run would be keyed on names no checkpoint has — and a miss
+    // is only a warning in the converter, so it would look like it had worked.
+    if (args.sets != null and args.@"emit-sensitivities" != null) {
+        std.log.err("--emit-sensitivities needs per-tensor arms; it cannot be combined with --sets", .{});
+        return error.InvalidArgument;
+    }
+
+    // --sets label:file[,label:file...]
+    var sets: std.ArrayList(dvg.PerTensor.Set) = .empty;
+    if (args.sets) |sets_spec| {
+        var it = std.mem.splitScalar(u8, sets_spec, ',');
+        while (it.next()) |tok| {
+            const entry = std.mem.trim(u8, tok, " \t");
+            if (entry.len == 0) continue;
+            const colon = std.mem.indexOfScalar(u8, entry, ':') orelse {
+                std.log.err("--sets wants 'label:file' entries (got '{s}')", .{entry});
+                return error.InvalidArgument;
+            };
+            const label = entry[0..colon];
+            const path = entry[colon + 1 ..];
+            const text = std.Io.Dir.cwd().readFileAlloc(io, path, arena_alloc, .unlimited) catch |err| {
+                std.log.err("--sets: could not read '{s}': {t}", .{ path, err });
+                return err;
+            };
+            var members: std.ArrayList([]const u8) = .empty;
+            var lines = std.mem.splitScalar(u8, text, '\n');
+            while (lines.next()) |line| {
+                const nm = std.mem.trim(u8, line, " \t\r");
+                if (nm.len == 0 or nm[0] == '#') continue;
+                try members.append(arena_alloc, nm);
+            }
+            if (members.items.len == 0) {
+                std.log.err("--sets: '{s}' lists no tensors", .{path});
+                return error.InvalidArgument;
+            }
+            try sets.append(arena_alloc, .{ .label = label, .tensors = members.items });
+        }
+    }
+
     const patch_dtype: dvg.PerTensor.PatchDtype = blk: {
         const name = args.@"patch-dtype" orelse break :blk .f32;
         if (std.mem.eql(u8, name, "f32")) break :blk .f32;
@@ -408,6 +481,7 @@ fn runDivergencePerTensor(
         .controls = args.@"no-controls" == 0,
         .threads = args.threads orelse 0,
         .patch_dtype = patch_dtype,
+        .sets = sets.items,
     };
 
     // Optional: the level-1 CSV this ranking is compared against. Loaded BEFORE the
@@ -462,6 +536,22 @@ fn runDivergencePerTensor(
     try dvg.writeTensorMarkdown(stdout, &report, if (l1) |*m| m else null);
     try stdout.flush();
 
+    if (args.@"emit-sensitivities") |sens_path| {
+        const file = try std.Io.Dir.cwd().createFile(io, sens_path, .{ .truncate = true });
+        defer file.close(io);
+        var buf: [1 << 16]u8 = undefined;
+        var fw = file.writer(io, &buf);
+        // The converter looks up STRIPPED names (`filterAndStripTensors` removes the
+        // container prefix), so a file keyed on the names the probe saw would match
+        // nothing — and silently, since a miss is only a warning.
+        dvg.writeSensitivitiesJson(arena_alloc, &fw.interface, &report, "model.diffusion_model.", report.arch) catch |err| {
+            std.log.err("could not write sensitivities to {s}: {t}", .{ sens_path, err });
+            return err;
+        };
+        try fw.interface.flush();
+        try stdout.print("wrote {s} (scored by measured per-layer damage)\n", .{sens_path});
+    }
+
     const md_out = try joinOut(arena_alloc, args.@"output-dir", stem, ".md");
     {
         const file = try std.Io.Dir.cwd().createFile(io, md_out, .{ .truncate = true });
@@ -477,6 +567,65 @@ fn runDivergencePerTensor(
 /// `ggufy sensitivity <model> -C <cache> [...]` — level 1: measure per-layer
 /// output error on the captured activations and write a measured sensitivities
 /// JSON the converter can route on.
+/// `ggufy heterogeneity <checkpoint> [-F q4_k]` — the free half of the routing
+/// question: how much per-tensor quantization error VARIES inside one checkpoint,
+/// in weight space, with no inference and no calibration cache.
+///
+/// It exists because the routing verdict turned on krea2's routable damage spanning
+/// only 2.3x around its median, and whether that is a fact about krea2 or about
+/// diffusion models cannot be answered until TensorPencil can run a second
+/// architecture. See `Heterogeneity.zig` for what this can and cannot conclude — it
+/// promotes an architecture for the expensive measurement, it never rules one out.
+fn runHeterogeneity(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    arena_alloc: std.mem.Allocator,
+    path: []const u8,
+    args: anytype,
+    threads: usize,
+    stdout: *std.Io.Writer,
+) !void {
+    const fmt: het.Format = blk: {
+        const spec = args.formats orelse break :blk .q4_k;
+        const fmts = sens.parseFormats(arena_alloc, spec) catch |err| {
+            std.log.err("Bad --formats value '{s}': {t}", .{ spec, err });
+            return err;
+        };
+        if (fmts.len != 1) {
+            std.log.err("heterogeneity screens one format per run ({d} given)", .{fmts.len});
+            return error.InvalidArgument;
+        }
+        break :blk fmts[0];
+    };
+
+    var report = het.run(allocator, io, .{
+        .model_path = path,
+        .format = fmt,
+        .threads = threads,
+    }) catch |err| {
+        std.log.err("heterogeneity screen failed: {t}", .{err});
+        return err;
+    };
+    defer report.deinit();
+
+    try het.writeMarkdown(allocator, &report, stdout, args.top orelse 10);
+    try stdout.flush();
+
+    // The CSV is the per-tensor table, for cross-architecture analysis. There is
+    // deliberately no JSON: a weight-space ranking must not be shippable as a
+    // sensitivities file (see the module header).
+    if (args.@"output-name") |stem| {
+        const csv_path = try joinOut(arena_alloc, args.@"output-dir", stem, ".csv");
+        const file = try std.Io.Dir.cwd().createFile(io, csv_path, .{ .truncate = true });
+        defer file.close(io);
+        var buf: [1 << 16]u8 = undefined;
+        var fw = file.writer(io, &buf);
+        try het.writeCsv(&report, &fw.interface);
+        try fw.interface.flush();
+        try stdout.print("\nwrote {s}\n", .{csv_path});
+    }
+}
+
 fn runSensitivity(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -670,9 +819,11 @@ pub fn main(init: std.process.Init) !void {
         \\    --level1 <FILENAME>        With --per-tensor: a level-1 CSV (from sensitivity) to correlate the per-tensor ranking against. Uses -F's format name.
         \\    --level1-arm <NAME>        With --level1: which level-1 arm's rows to read. Default "format"; "weighted" for the imatrix arm.
         \\    --patch-dtype <NAME>       With --per-tensor: dtype the substituted tensor is written back as, "f32" (default, exact) or "bf16". bf16 is what makes this arm runnable on a GPU — the GPU DiTs need one weight class per model — at the cost of ~0.2% extra rounding.
+        \\    --emit-sensitivities <FILENAME>  With --per-tensor: write a sensitivities JSON from the MEASURED per-layer damage, scored by src/LadderScore.zig (one bit per doubling of damage above the routable median — never a percentile rank), for convert to route on. This is the cheap form of the brute-force per-layer method the hand-built arch files came from.
+        \\    --sets <NAME>              With --per-tensor: measure SETS of tensors instead of one at a time, as "label:file[,label:file...]" where each file lists tensor names. One arm per set, every member quantized together — the direct test of whether per-layer damages compose.
         \\    --html <FILENAME>          With verdict: also write an HTML contact sheet here.
         \\    --lpips <FILENAME>         With verdict: LPIPS weights (AlexNet, from TensorPencil's tools/gen_lpips_fixtures.py). Adds the LPIPS column - the metric that tracks human judgement.
-        \\<COMMAND>    Specify a command: header, tree, metadata, convert, template, calibrate, sensitivity, verdict, divergence, version
+        \\<COMMAND>    Specify a command: header, tree, metadata, convert, template, calibrate, sensitivity, verdict, divergence, heterogeneity, version
         \\<FILENAME>   The file to use for input (not required for the version command)
     );
 
@@ -835,6 +986,13 @@ pub fn main(init: std.process.Init) !void {
         try stdout.flush();
         return;
     }
+    // Weight-space only: it needs the checkpoint and nothing else, so it is dispatched
+    // beside the inference commands rather than through the converter's file handling.
+    if (command == .heterogeneity) {
+        try runHeterogeneity(io, allocator, arena_alloc, path, res.args, threads, stdout);
+        try stdout.flush();
+        return;
+    }
     // Verdict compares rendered images, so its positional is an image path (or a
     // directory of them) rather than a model — handled before file-type sniffing.
     if (command == .verdict) {
@@ -929,7 +1087,7 @@ pub fn main(init: std.process.Init) !void {
                 },
                 .names => try dumpNames(f.tensors.items, res.args.shapes != 0, allocator, stdout),
                 // All three are dispatched before file-type detection.
-                .calibrate, .sensitivity, .verdict, .divergence, .version => unreachable,
+                .calibrate, .sensitivity, .verdict, .divergence, .heterogeneity, .version => unreachable,
             }
         },
         .gguf => {
@@ -997,7 +1155,7 @@ pub fn main(init: std.process.Init) !void {
                     std.log.info("Sensitivities exported to {s}", .{out_path});
                 },
                 // All three are dispatched before file-type detection.
-                .calibrate, .sensitivity, .verdict, .divergence, .version => unreachable,
+                .calibrate, .sensitivity, .verdict, .divergence, .heterogeneity, .version => unreachable,
             }
         },
     }

@@ -13,6 +13,7 @@ const DataTransform = @import("DataTransform.zig");
 const CalibrationCache = @import("CalibrationCache.zig");
 const Imatrix = @import("Imatrix.zig");
 const GptqPlan = @import("GptqPlan.zig");
+const LadderScore = @import("LadderScore.zig");
 const build_options = @import("build_options");
 
 // Cluster identity blobs + layout now live in TensorClusters (the shared source of truth).
@@ -391,12 +392,70 @@ pub const QuantizationLevel = enum(u8) {
     }
 };
 
+/// The highest level the **sensitivity** mechanism may upgrade a tensor to.
+///
+/// Returns the source index unchanged when the user asked for an unquantized
+/// target (there is nothing to interpolate then, and the candidate list must
+/// always contain the target). Otherwise it caps the ladder at `q8_0` — the
+/// highest *quantized* level — excluding f16/bf16/f32/f64.
+///
+/// ⚠️ **Why, because it is a real behaviour change and it has a receipt.**
+/// `calculateQuantizationLevel` interpolates over the level *index*, so every
+/// step of the ladder costs one score-step regardless of how many bits it buys.
+/// Across the quantized levels that is nearly true (1.0 / 1.06 / 1.94 bits) and
+/// the approximation is harmless. The step from `q8_0` (8.5 bits) to `bf16`
+/// (16.0) is **7.5 bits** — 4× the largest quantized step and 1.7× the entire
+/// q4_k→q8_0 span. Composed with `LadderScore`'s encoding at the default
+/// `-a 50`, any tensor whose measured damage reached **13.4× the population
+/// median** landed on bf16, where the allocation the encoding is derived from
+/// asks for ~q8_0. That is not a rounding disagreement; it is double the bits.
+///
+/// Three independent reasons the cap is the right resolution rather than a
+/// rescaling of the encoding:
+///
+///  1. **`LadderScore.full_range_doublings = 4` is calibrated to exactly this
+///     ladder** — "the ladder above a k-quant target has ~4 useful bits in it
+///     (q4_k → q8_0)". With bf16 on the end, the ladder it is calibrated
+///     against is not the ladder it feeds. Capping makes the constant true by
+///     construction instead of true by comment.
+///  2. **Tensors that genuinely need full precision never reach here.**
+///     `assignTensorType` applies `arch.isHighPrecision` / `shouldUpcast` and
+///     the 1-D and embedding rules *before* the sensitivity branch, and the
+///     level-2 per-tensor sweep independently rediscovered that list (krea2's
+///     seven most damaging tensors are all already `keys_hiprec`). So the
+///     unquantized top of the ladder is redundant with a mechanism that
+///     predates it and is validated.
+///  3. **The measured evidence runs against bf16 upgrades**, though it stops
+///     short of a measured arm: on the krea2 rate–distortion plane every
+///     scoring that spent into the top of the ladder tied or lost against
+///     uniform, and the computed frontier's two bf16 variants were its worst
+///     points (10.04 GiB and 13.20 GiB, both below the uniform curve). Those
+///     predictions come from the composition law, which is biased *in favour*
+///     of routing by ~13%, so they are an upper bound on how well bf16
+///     upgrades do.
+///
+/// The cap only ever *reduces* spend, so it cannot make a routed model larger
+/// than it was, and it is inert for any file whose scores stay below ~94 at
+/// `-a 50` — which is every hand-built arch file's median by a wide margin.
+pub fn sensitivityLadderTop(target_level: QuantizationLevel, source_idx: u8) u8 {
+    const highest_quantized = @intFromEnum(QuantizationLevel.q8_0);
+    // An unquantized target has no quantized ladder to cap; leave it alone.
+    if (@intFromEnum(target_level) > highest_quantized) return source_idx;
+    return @min(source_idx, highest_quantized);
+}
+
 /// Calculate an appropriate quantization level for one tensor given its
 /// sensitivity score and the user's aggressiveness setting.
 ///
 /// Builds a filtered list of only the permitted levels (from target up to
 /// source precision), then interpolates directly within that list so the
 /// full sensitivity range maps evenly across all allowed levels.
+///
+/// ⚠️ **The interpolation is over the level *index*, not over bits/weight**, and
+/// the two are only proportional if the ladder's levels are evenly spaced in
+/// bits. They are not: q4_k → q5_k → q6_k → q8_0 steps by 1.0, 1.06, 1.94 bits,
+/// and the *unquantized* step above that is 7.5 (q8_0 8.5 → bf16 16.0). That last
+/// step is why `sensitivityLadderTop` exists — see there for the measurement.
 ///
 /// - `sensitivity`:    1–100, 1 = least sensitive, 100 = most sensitive.
 /// - `aggressiveness`: 1–100, higher = more aggressive (stays near target).
@@ -427,8 +486,10 @@ pub fn calculateQuantizationLevel(
     // sensitivity scaling skips straight to bf16.
     const skip_f16 = source_idx > @intFromEnum(QuantizationLevel.f16);
 
+    const ladder_top = sensitivityLadderTop(target_level, source_idx);
+
     var i: u8 = @intFromEnum(target_level);
-    while (i <= source_idx) : (i += 1) {
+    while (i <= ladder_top) : (i += 1) {
         if (skip_f16 and i == @intFromEnum(QuantizationLevel.f16)) continue;
         const candidate: QuantizationLevel = @enumFromInt(i);
         if (families.allows(candidate)) {
@@ -666,6 +727,17 @@ fn assignQuantTypes(
             std.log.debug("Using built-in sensitivities file for {s}", .{arch.name});
             sensitivities = try std.json.parseFromSlice(std.json.Value, arena_alloc, arch.sensitivities, .{});
             use_sensitivity = true;
+        }
+        // What the file says about its own provenance. Advisory, not fatal: the
+        // hand-built arch files carry no `__meta__` and are legitimate (brute-forced
+        // from per-layer image damage, which is the right measurement). What must not
+        // pass silently is a *generated* file whose encoding this build does not
+        // interpret — the defect that produced a model 2.76x off the rate-distortion
+        // curve was exactly the generator and the converter disagreeing, unlabelled.
+        if (use_sensitivity) {
+            if (LadderScore.metaWarning(sensitivities.value)) |why| {
+                std.log.warn("sensitivities: {s}", .{why});
+            }
         }
     }
 
@@ -1604,10 +1676,16 @@ pub fn templateTypeSuffix(
     }
 }
 
-/// Generate a sensitivities JSON file from a tensor list.
+/// Generate a sensitivities JSON file from a tensor list, for a human to fill in.
 /// Only includes tensors that would actually be quantized:
 /// not architecture-ignored, not too small, not high-precision, not upcast-forced.
-/// All values are initialised to 50.0 (neutral sensitivity).
+///
+/// Every value starts at `LadderScore.homogeneous_score` — **1, not 50**. 50 reads as
+/// "neutral" and is nothing of the kind: `calculateQuantizationLevel`'s upgrade
+/// boundary at the default `-a 50` on a five-level ladder is score ~36, so an
+/// unedited template used to route *every* tensor a level up from what the user
+/// asked for. 1 means "the target type", which is the honest starting point for a
+/// file nobody has scored yet.
 pub fn generateSensitivitiesFromTensors(
     tensors: []const types.Tensor,
     arch_opt: ?*const imagearch.Arch,
@@ -1628,7 +1706,7 @@ pub fn generateSensitivitiesFromTensors(
             if (a.isHighPrecision(t.name)) continue;
             if (a.shouldUpcast(t.name)) continue;
         }
-        try sens_obj.put(arena_alloc, try arena_alloc.dupe(u8, t.name), .{ .float = 50.0 });
+        try sens_obj.put(arena_alloc, try arena_alloc.dupe(u8, t.name), .{ .float = LadderScore.homogeneous_score });
     }
 
     var stringifier = std.json.Stringify{ .writer = writer, .options = .{ .whitespace = .indent_2 } };
@@ -1724,6 +1802,72 @@ test "assignOutputLayout: contiguous offsets and full cluster size for a templat
     try testing.expectEqual(@as(u64, 0), model.items[0].offset);
     try testing.expectEqual(@as(u64, 32), model.items[1].offset);
     try testing.expectEqual(@as(u64, 32 + expected_cluster_size), model.items[2].offset);
+}
+
+test "LadderScore.upgradeThreshold is exactly this file's upgrade boundary" {
+    // The generator's score encoding and this function's interpretation of a score
+    // were designed *separately* once, and composing them produced a krea2 file
+    // measuring 2.76x off the uniform rate–distortion curve (`LadderScore`'s header
+    // has the numbers). `LadderScore.upgradeThreshold` is how a report predicts what
+    // a file it just wrote will do; this test is the seam where that prediction is
+    // pinned to the real rule, so the two cannot drift apart again.
+    const k: QuantizationFamilies = .{ .allow_k = true };
+
+    // q4_k target from a bf16 source: q4_k, q5_k, q6_k, q8_0 — four levels, because
+    // `sensitivityLadderTop` caps the sensitivity mechanism at the highest quantized
+    // type. `LadderScore.default_ladder_levels` is the other half of this seam.
+    for ([_]f32{ 1, 25, 50, 75, 100 }) |aggr| {
+        const thr = LadderScore.upgradeThreshold(aggr, LadderScore.default_ladder_levels).?;
+        const below = try calculateQuantizationLevel(@floatCast(thr - 0.05), aggr, .q4_k, "bf16", k);
+        const above = try calculateQuantizationLevel(@floatCast(thr + 0.05), aggr, .q4_k, "bf16", k);
+        try testing.expectEqual(QuantizationLevel.q4_k, below);
+        try testing.expectEqual(QuantizationLevel.q5_k, above);
+    }
+
+    // And a shorter ladder moves the boundary, which is why `levels` is a parameter:
+    // q6_k→q8_0 is two levels, so each level covers more of the score range and the
+    // bar to upgrade is HIGHER, not lower.
+    const thr2 = LadderScore.upgradeThreshold(50, 2).?;
+    try testing.expect(thr2 > LadderScore.upgradeThreshold(50, LadderScore.default_ladder_levels).?);
+    try testing.expectEqual(QuantizationLevel.q6_k, try calculateQuantizationLevel(@floatCast(thr2 - 0.05), 50, .q6_k, "bf16", k));
+    try testing.expectEqual(QuantizationLevel.q8_0, try calculateQuantizationLevel(@floatCast(thr2 + 0.05), 50, .q6_k, "bf16", k));
+}
+
+test "the sensitivity ladder stops at the highest quantized type" {
+    // ⚠️ The regression this pins, measured 2026-08-02 by reading the composed map:
+    // the ladder's top entry used to be **bf16**, 7.5 bits above q8_0 — 4x the
+    // largest quantized step and 1.7x the whole q4_k->q8_0 span the encoding is
+    // calibrated against. At the default `-a 50` that handed 16-bit weights to any
+    // tensor whose damage reached 13.4x the population median, where the allocation
+    // `LadderScore` derives asks for ~q8_0. SD1.5's measured max/median is 14.0x, so
+    // it crossed on the one architecture that has routing headroom at all.
+    const k: QuantizationFamilies = .{ .allow_k = true };
+
+    // The top of the range is q8_0, from every unquantized source and at every
+    // aggressiveness — a saturated score must not buy full precision.
+    for ([_][]const u8{ "bf16", "f16", "f32" }) |src| {
+        for ([_]f32{ 1, 50, 100 }) |aggr| {
+            try testing.expectEqual(
+                QuantizationLevel.q8_0,
+                try calculateQuantizationLevel(100, aggr, .q4_k, src, k),
+            );
+        }
+    }
+
+    // The cap only ever removes candidates *above* q8_0, so nothing below it moves.
+    try testing.expectEqual(QuantizationLevel.q4_k, try calculateQuantizationLevel(1, 50, .q4_k, "bf16", k));
+
+    // An unquantized target has no quantized ladder to cap, and must still be
+    // reachable — otherwise `-d bf16` with a sensitivities file would find an empty
+    // candidate list.
+    try testing.expectEqual(QuantizationLevel.bf16, try calculateQuantizationLevel(100, 50, .bf16, "bf16", k));
+    try testing.expectEqual(QuantizationLevel.bf16, try calculateQuantizationLevel(1, 50, .bf16, "bf16", k));
+    try testing.expectEqual(QuantizationLevel.f32, try calculateQuantizationLevel(100, 50, .f16, "f32", k));
+
+    // And the helper's own contract, since two call sites now depend on it.
+    try testing.expectEqual(@as(u8, @intFromEnum(QuantizationLevel.q8_0)), sensitivityLadderTop(.q4_k, @intFromEnum(QuantizationLevel.bf16)));
+    // A source *below* q8_0 still bounds the ladder — you cannot upgrade past it.
+    try testing.expectEqual(@as(u8, @intFromEnum(QuantizationLevel.q6_k)), sensitivityLadderTop(.q4_k, @intFromEnum(QuantizationLevel.q6_k)));
 }
 
 test "assignTensorType: 1D tensors are never block-quantized" {

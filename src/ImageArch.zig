@@ -628,18 +628,6 @@ pub const krea2 = Arch{
     },
     .shape_fix = true,
     .threshhold = null,
-    // MEASURED, not hand-authored: percentile-ranked Q4_K output error on real
-    // captured activations (`ggufy calibrate` + `ggufy sensitivity`, 512², 4
-    // steps, 4 prompts, r=32×3 buckets), against the BF16 `animosity_krea2Ver10`
-    // checkpoint so the baseline is genuine full precision. Keyed on the
-    // canonical unprefixed names; `Convert.zig` strips container prefixes before
-    // the fallback lookup, so this covers both packagings.
-    //
-    // The ranking reproduced at Spearman 0.9938 against a capture from a
-    // *different* krea2 finetune (the fp8 checkpoint), which is what justifies
-    // shipping one file for the architecture rather than per checkpoint.
-    // See ACTIVATION_AWARE_PLAN.md §7.
-    .sensitivities = @embedFile("sensitivities/krea2.json"),
     .keys_hiprec = &.{
         // Measurement agrees with this list: txtfusion's attention projections
         // are the most damaged layers in the model by a clear margin.

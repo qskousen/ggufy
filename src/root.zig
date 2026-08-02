@@ -10,6 +10,9 @@ pub const safetensor = @import("Safetensor.zig");
 pub const types = @import("types.zig");
 pub const fileLoader = @import("FileLoader.zig");
 pub const callbacks = @import("callbacks.zig");
+/// The 1–100 sensitivity-score encoding shared by the two measurement levels that
+/// emit a `sensitivities/*.json` and read by `Convert.calculateQuantizationLevel`.
+pub const ladderScore = @import("LadderScore.zig");
 
 /// Activation-aware quantization support (see ACTIVATION_AWARE_PLAN.md). Needs the
 /// TensorPencil umbrella (inference), unlike everything above.
@@ -23,3 +26,6 @@ pub const gptq = @import("Gptq.zig");
 pub const gptqPlan = @import("GptqPlan.zig");
 pub const verdict = @import("Verdict.zig");
 pub const divergence = @import("Divergence.zig");
+/// Weight-space dispersion screen — the free half of the routing question, and the
+/// only cross-architecture measurement available before TensorPencil can run one.
+pub const heterogeneity = @import("Heterogeneity.zig");

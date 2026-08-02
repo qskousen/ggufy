@@ -63,6 +63,8 @@ const cb = @import("callbacks.zig");
 const ph = @import("precision_harness.zig");
 const ThreadPool = @import("ThreadPool.zig").ThreadPool;
 const TensorClusters = @import("TensorClusters.zig");
+const imagearch = @import("ImageArch.zig");
+const LadderScore = @import("LadderScore.zig");
 
 pub const Backend = tp.pipeline.Backend;
 pub const Format = ph.Format;
@@ -329,7 +331,8 @@ fn captureReference(
     lat_w: usize,
     cancel: *std.atomic.Value(bool),
 ) !Ref {
-    const lat_len = tp.models.wan_vae.latent_channels * lat_h * lat_w;
+    // Family-aware: krea2's Wan VAE has 16 latent channels, SD's AutoencoderKL 4.
+    const lat_len = sess.latentChannels() * lat_h * lat_w;
 
     var ref: Ref = .{
         .conds = try gpa.alloc(tp.pipeline.Cond, opts.prompts.len),
@@ -370,8 +373,17 @@ fn captureReference(
         const enc_ns = std.Io.Clock.real.now(opts.io).nanoseconds - t_enc;
 
         // Every prompt starts from the same seed, exactly as `generate` does, so a
-        // trajectory is reproducible from the report's header alone.
+        // trajectory is reproducible from the report's header alone — including the
+        // scaling to the schedule's first sigma, which is 1.0 (a no-op) for krea2 and
+        // ~14.6 for SD. Without it an SD arm denoises a latent 15x too small, i.e.
+        // measures the model well outside the distribution it was trained on.
+        //
+        // ⚠️ Via the **session**, not `tp.sampler` directly: the two parameterizations
+        // scale differently (krea2 by `sigma0`, SD by `sqrt(1 + sigma0²)`), and calling
+        // the flow-matching form on an SD arm starts every trajectory 0.23% off — which
+        // is enough to move a render visibly, so it would move a divergence figure too.
         tp.sampler.fillNoise(x, opts.seed);
+        sess.scaleInitialNoise(x, sigmas[0]);
 
         t_enc = std.Io.Clock.real.now(opts.io).nanoseconds;
         var den = try sess.denoiser(gpa, ref.conds[pi], ref.neg, opts.cfg, lat_h, lat_w, sigmas);
@@ -427,7 +439,7 @@ fn measureArm(
     cancel: *std.atomic.Value(bool),
     out: []Point,
 ) !void {
-    const channels = tp.models.wan_vae.latent_channels;
+    const channels = sess.latentChannels();
     const positions = lat_h * lat_w;
 
     const v_apx = try gpa.alloc(f32, channels * positions);
@@ -461,16 +473,20 @@ pub fn run(gpa: std.mem.Allocator, opts: Options) !Report {
     // into the other at the points a measurement can act on.
     var cancel: std.atomic.Value(bool) = .init(false);
 
-    const sched = try tp.pipeline.schedule(gpa, opts.steps, opts.shift);
-    defer gpa.free(sched);
-    const sigmas = try arena.dupe(f32, sched);
-
     // --- reference trajectory -------------------------------------------------
+    // The schedule comes from the *session*, because it is family-dependent: krea2's
+    // flow-matching sigmas read `--shift`, SD's discrete ladder ignores it. So the
+    // reference session is built first and the sigmas outlive it in the arena — every
+    // arm must sample the identical ladder or the comparison means nothing.
     var ref: Ref = undefined;
+    var sigmas: []const f32 = undefined;
     {
         const ref_opts = baseOpts(opts, opts.reference, &cancel);
         var sess = try tp.pipeline.Session.init(opts.io, gpa, ref_opts, opts.log);
         defer sess.deinit();
+        const sched = try sess.schedule(gpa, opts.steps, opts.shift);
+        defer gpa.free(sched);
+        sigmas = try arena.dupe(f32, sched);
         ref = try captureReference(gpa, sess, opts, sigmas, lat_h, lat_w, &cancel);
     }
     defer ref.deinit(gpa);
@@ -572,6 +588,20 @@ pub const PerTensor = struct {
     /// bf16 — so the penalty lands only on the quantized arms, and it is measurable:
     /// run the same tensor both ways on CPU.
     patch_dtype: PatchDtype = .f32,
+    /// Measure *sets* of tensors — one arm per set, every member quantized at once —
+    /// instead of one arm per tensor. Empty (the default) keeps the per-tensor mode.
+    ///
+    /// The question this exists for is **additivity**: a per-tensor table says what
+    /// each layer costs alone, and every use of it (routing, ranking, "the error is
+    /// dominated by the weak set") quietly assumes those costs compose. Quantizing a
+    /// whole set at once measures the composition directly, and comparing it against
+    /// the quadrature sum of its members' solo damages says whether the assumption
+    /// holds.
+    ///
+    /// ⚠️ **Memory scales with the set.** Every member's patch is resident at once,
+    /// so a 263-tensor set is the whole model again (~13 GB at bf16) on top of the
+    /// base mapping. Prefer quartile-sized sets to whole-model ones.
+    sets: []const Set = &.{},
     /// CSV sink written **as each arm completes**, flushed every time.
     ///
     /// A full 263-tensor sweep is hours of forwards, and without this a crash, an
@@ -581,6 +611,12 @@ pub const PerTensor = struct {
     stream_csv: ?*std.Io.Writer = null,
 
     pub const PatchDtype = enum { f32, bf16 };
+
+    /// A named group of checkpoint tensors, measured as one arm.
+    pub const Set = struct {
+        label: []const u8,
+        tensors: []const []const u8,
+    };
 };
 
 /// The substituted tensor's bytes at `dt`.
@@ -600,7 +636,27 @@ const Patch = struct {
 
 fn patchBytes(gpa: std.mem.Allocator, dt: PerTensor.PatchDtype, values: []const f32) !Patch {
     switch (dt) {
-        .f32 => return .{ .bytes = std.mem.sliceAsBytes(values), .owned = null },
+        // ⚠️ **Copies, and must.** This used to hand back `values` itself with
+        // `owned = null`, which made the patch's lifetime the caller's local
+        // buffer rather than the `Patch` — and the quantized arm frees its
+        // round-trip buffer at the end of the inner member loop, BEFORE
+        // `replaceDenoiser` and the forward. A model that keeps zero-copy views
+        // into its store (`sd_unet.mat` does; the DiT materializes, which is why
+        // krea2 never showed it) then reads freed memory.
+        //
+        // It did not fail loudly. Small tensors read freed-but-intact heap and
+        // reported plausible numbers; a 26 MB one is mmap-backed, so the free
+        // unmapped it and the arm reported rel L2 ~1.0 — *identically for q4_k and
+        // q8_0*, which is the tell: an 8-bit round trip cannot be as damaging as a
+        // 4-bit one, so the number could not have been about quantization at all.
+        // Then it segfaulted. The copy costs one allocation per arm against a
+        // whole-model forward.
+        .f32 => {
+            const out = try gpa.alloc(u8, values.len * 4);
+            errdefer gpa.free(out);
+            @memcpy(out, std.mem.sliceAsBytes(values));
+            return .{ .bytes = out, .owned = out };
+        },
         .bf16 => {
             const out = try gpa.alloc(u8, values.len * 2);
             errdefer gpa.free(out);
@@ -628,6 +684,9 @@ pub const TensorArm = struct {
     /// `prompts × steps` points, prompt-major. Empty when `skipped` is set.
     points: []Point,
     steps: usize,
+    /// How many tensors this arm quantized: 1 in per-tensor mode, the set size in
+    /// set mode. Reported so a set's number is never mistaken for a layer's.
+    members: usize = 1,
     /// Why this tensor produced no measurement, if it did not. A layer the format
     /// cannot encode is unmeasured, never zero — the level-1 harness learned that
     /// the hard way (a zero would rank the model's input projection as its least
@@ -673,6 +732,19 @@ pub const TensorReport = struct {
     /// 0–2 controls, then one arm per tensor.
     controls: []TensorArm,
     arms: []TensorArm,
+    /// The architecture detected from the reference checkpoint's tensor names, or
+    /// null for one `ImageArch` does not know. Only `writeSensitivitiesJson` needs
+    /// it — for the routable/hiprec split its scale is normalized over — but it is
+    /// recorded on the report so a run says which relation it used.
+    arch: ?*const imagearch.Arch = null,
+    /// False when `--max-tensors` (or an explicit `--tensors` list) covered only part
+    /// of the routable population.
+    ///
+    /// ⚠️ The median anchor is the measured population's, so a partial sweep does not
+    /// write a partial file — it writes a **rescaled** one. `--max-tensors` thins by
+    /// even stride precisely so a partial ranking stays representative, but the
+    /// *anchor* is still a subset's median, which shifts every score.
+    complete: bool = true,
 
     pub fn steps(self: *const TensorReport) usize {
         return self.sigmas.len - 1;
@@ -684,6 +756,15 @@ pub const TensorReport = struct {
     }
 };
 
+/// Columns of a weight seen as a matrix: everything past the output dimension.
+/// For a rank-2 tensor that is `dims[1]`; for a rank-4 convolution it is
+/// `ci*kh*kw`, the width its im2col GEMM actually has.
+fn flatCols(dims: []const usize) usize {
+    var c: usize = 1;
+    for (dims[1..]) |d| c *= d;
+    return c;
+}
+
 /// Which tensors a per-tensor run will measure.
 ///
 /// An explicit list is taken as given (a name the checkpoint lacks is an error, not
@@ -693,9 +774,19 @@ pub const TensorReport = struct {
 /// `missing` receives the offending name on `error.MissingTensor` — reported by the
 /// caller rather than logged here, so this stays a pure selection function (and its
 /// test stays silent, per the repo's no-output-on-pass rule).
+///
+/// ⚠️ **`prefix` restricts the sweep to the denoiser's own tensors**, and a bundled
+/// checkpoint makes that mandatory rather than tidy. An LDM single-file SD
+/// checkpoint's container also holds `cond_stage_model.*` (CLIP) and
+/// `first_stage_model.*` (the VAE); patching one of those through a **denoiser**
+/// overlay changes nothing, so it measures as *zero damage* — which in a
+/// sensitivities file is not a missing row but a confident wrong one. Comes from
+/// `Session.denoiserPrefix()`, and is `""` for krea2 and for ggufy's model-only
+/// GGUFs, where the container holds the denoiser alone.
 fn selectTensors(
     arena: std.mem.Allocator,
     base: tp.weights.WeightStore,
+    prefix: []const u8,
     pt: PerTensor,
     missing: *[]const u8,
 ) ![]const []const u8 {
@@ -707,14 +798,29 @@ fn selectTensors(
                 missing.* = n;
                 return error.MissingTensor;
             }
+            if (!std.mem.startsWith(u8, n, prefix)) {
+                // Explicit, so this is a user error rather than something to filter:
+                // the name exists but is not the denoiser's, and patching it would
+                // report zero damage instead of failing.
+                missing.* = n;
+                return error.TensorNotInDenoiser;
+            }
             try picked.append(arena, try arena.dupe(u8, n));
         }
     } else {
         for (base.names()) |n| {
+            if (!std.mem.startsWith(u8, n, prefix)) continue;
             if (!std.mem.endsWith(u8, n, ".weight")) continue;
             const v = base.get(n).?;
-            if (v.info.shape.rank != 2) continue;
-            if (v.info.shape.dims[0] < 2 or v.info.shape.dims[1] < 2) continue;
+            // Rank >= 2, not rank == 2: a **convolution** is rank 4, and on a UNet
+            // that is most of the model. Measuring only the rank-2 tensors would
+            // cover 31% of SD1.5's UNet parameters and silently omit the other
+            // 68.5% — and it is the convolutions that make this architecture worth
+            // measuring at all. Same partial-coverage trap as the activation probe
+            // that recorded a UNet's linears and none of its convs.
+            if (v.info.shape.rank < 2) continue;
+            const dims = v.info.shape.slice();
+            if (dims[0] < 2 or flatCols(dims) < 2) continue;
             try picked.append(arena, try arena.dupe(u8, n));
         }
     }
@@ -758,10 +864,6 @@ pub fn runPerTensor(gpa: std.mem.Allocator, opts: Options, pt: PerTensor) !Tenso
     try pool.init(.{ .allocator = gpa, .n_jobs = n_jobs });
     defer pool.deinit();
 
-    const sched = try tp.pipeline.schedule(gpa, opts.steps, opts.shift);
-    defer gpa.free(sched);
-    const sigmas = try arena.dupe(f32, sched);
-
     // ONE session for the whole run: the reference trajectory, then every arm, with
     // only the DiT swapped between them. The text encoder and VAE are loaded once
     // and — the part that matters — the conditioning is encoded once, so no arm can
@@ -770,19 +872,36 @@ pub fn runPerTensor(gpa: std.mem.Allocator, opts: Options, pt: PerTensor) !Tenso
     var sess = try tp.pipeline.Session.init(opts.io, gpa, sess_opts, opts.log);
     defer sess.deinit();
 
+    // Family-dependent, so it comes from the session (see the whole-checkpoint arm).
+    const sched = try sess.schedule(gpa, opts.steps, opts.shift);
+    defer gpa.free(sched);
+    const sigmas = try arena.dupe(f32, sched);
+
     var ref = try captureReference(gpa, sess, opts, sigmas, lat_h, lat_w, &cancel);
     defer ref.deinit(gpa);
 
-    const base = sess.dit_st.store();
+    const base = sess.denoiserStore();
     var ov: tp.weights.Overlay = .{ .base = base };
     defer ov.deinit(gpa);
 
     var missing: []const u8 = "";
-    const names = selectTensors(arena, base, pt, &missing) catch |err| {
-        if (err == error.MissingTensor) {
+    // A bundled SD checkpoint's container also holds CLIP and the VAE; only the
+    // denoiser's own tensors can be measured through a denoiser overlay.
+    const den_prefix = sess.denoiserPrefix();
+    const names = selectTensors(arena, base, den_prefix, pt, &missing) catch |err| switch (err) {
+        error.MissingTensor => {
             std.log.err("per-tensor: '{s}' is not in the reference checkpoint '{s}'", .{ missing, opts.reference });
-        }
-        return err;
+            return err;
+        },
+        error.TensorNotInDenoiser => {
+            std.log.err(
+                "per-tensor: '{s}' is in '{s}' but is not part of the denoiser (prefix '{s}') — " ++
+                    "patching it would measure as zero damage rather than fail",
+                .{ missing, opts.reference, den_prefix },
+            );
+            return err;
+        },
+        else => return err,
     };
     if (names.len == 0) return error.NoTensors;
 
@@ -791,7 +910,7 @@ pub fn runPerTensor(gpa: std.mem.Allocator, opts: Options, pt: PerTensor) !Tenso
     if (pt.controls) {
         {
             // Empty overlay: same bytes, reached through one more indirection.
-            try sess.replaceDit(ov.store());
+            try sess.replaceDenoiser(ov.store());
             const points = try arena.alloc(Point, ref.snaps.len);
             try measureArm(gpa, sess, opts, ref, sigmas, lat_h, lat_w, &cancel, points);
             try controls.append(arena, .{
@@ -819,7 +938,7 @@ pub fn runPerTensor(gpa: std.mem.Allocator, opts: Options, pt: PerTensor) !Tenso
             defer exact_patch.deinit(gpa);
             ov.clear();
             try ov.put(gpa, names[0], patchTpDtype(pt.patch_dtype), exact_patch.bytes);
-            try sess.replaceDit(ov.store());
+            try sess.replaceDenoiser(ov.store());
             const points = try arena.alloc(Point, ref.snaps.len);
             try measureArm(gpa, sess, opts, ref, sigmas, lat_h, lat_w, &cancel, points);
             try controls.append(arena, .{
@@ -833,85 +952,135 @@ pub fn runPerTensor(gpa: std.mem.Allocator, opts: Options, pt: PerTensor) !Tenso
             try streamArm(pt.stream_csv, controls.items[controls.items.len - 1]);
             // Restore before `exact` goes out of scope: the DiT holds views into it.
             ov.clear();
-            try sess.replaceDit(base);
+            try sess.replaceDenoiser(base);
         }
     }
 
-    // --- one arm per tensor ---------------------------------------------------
-    const arms = try arena.alloc(TensorArm, names.len);
-    for (names, 0..) |name, ai| {
+    // --- one arm per unit -------------------------------------------------------
+    // A "unit" is one tensor in the default mode, or a whole named set when
+    // `pt.sets` is given. Sharing the loop keeps the two modes measured identically —
+    // an additivity check is only meaningful if the parts and the whole come off the
+    // same code path.
+    const Unit = struct { label: []const u8, names: []const []const u8 };
+    var units: std.ArrayList(Unit) = .empty;
+    if (pt.sets.len > 0) {
+        for (pt.sets) |set| try units.append(arena, .{ .label = set.label, .names = set.tensors });
+    } else {
+        for (names) |n| try units.append(arena, .{ .label = n, .names = (try arena.dupe([]const u8, &.{n})) });
+    }
+
+    const arms = try arena.alloc(TensorArm, units.items.len);
+    for (units.items, 0..) |unit, ai| {
         if (opts.callbacks.isCancelled()) {
             cancel.store(true, .release);
             return error.Canceled;
         }
-        const v = base.get(name).?;
-        const shape = v.info.shape.slice();
-        if (shape.len != 2) {
-            arms[ai] = .{
-                .name = name,
-                .rows = 0,
-                .cols = 0,
-                .kind = .quantized,
-                .points = &.{},
-                .steps = opts.steps,
-                .skipped = try std.fmt.allocPrint(arena, "rank {d}, not a matrix", .{shape.len}),
-            };
-            try streamArm(pt.stream_csv, arms[ai]);
-            continue;
+
+        // Patches for every member of the unit, all resident until the arm is done.
+        var patches: std.ArrayList(Patch) = .empty;
+        defer {
+            // Drop the overlay's references FIRST: the DiT is still holding this
+            // store, so freeing the patch bytes while they are reachable would leave
+            // the next forward reading freed memory rather than failing loudly.
+            ov.clear();
+            for (patches.items) |pp| pp.deinit(gpa);
+            patches.deinit(gpa);
         }
-        const rows = shape[0];
-        const cols = shape[1];
 
-        const w = try v.toF32Alloc(gpa);
-        defer gpa.free(w);
+        var rows: usize = 0;
+        var cols: usize = 0;
+        var skip: ?[]const u8 = null;
+        var members: usize = 0;
 
-        // A format that cannot encode this shape (q4_k wants cols % 256 == 0, and
-        // krea2's patch embed is 6144x64) leaves the tensor UNMEASURED. Not zero:
-        // zero would read as "quantizing this layer is free".
-        const w_hat = ph.roundtripGroup(pt.format, gpa, w, rows, cols, &pool, pt.convrot_group) catch |err| {
+        for (unit.names) |name| {
+            const v = base.get(name) orelse {
+                skip = try std.fmt.allocPrint(arena, "'{s}' is not in the checkpoint", .{name});
+                break;
+            };
+            const shape = v.info.shape.slice();
+            if (shape.len < 2) {
+                if (unit.names.len == 1) {
+                    skip = try std.fmt.allocPrint(arena, "rank {d}, not a matrix", .{shape.len});
+                    break;
+                }
+                continue; // a set just skips members it cannot use
+            }
+            // A rank-4 convolution weight [co][ci][kh][kw] is row-major exactly
+            // [co][ci*kh*kw], which is how `convert` quantizes it and how the
+            // im2col GEMM reads it — so the flattened view needs no reshaping, and
+            // the patch keeps the base tensor's rank (`Overlay.put`), so the
+            // loader's rank-4 check still passes.
+            rows = shape[0];
+            cols = flatCols(shape);
+
+            const w = try v.toF32Alloc(gpa);
+            defer gpa.free(w);
+
+            // A format that cannot encode this shape (q4_k wants cols % 256 == 0, and
+            // krea2's patch embed is 6144x64) leaves the tensor UNMEASURED. Not zero:
+            // zero would read as "quantizing this layer is free".
+            const w_hat = ph.roundtripGroup(pt.format, gpa, w, rows, cols, &pool, pt.convrot_group) catch |err| {
+                if (unit.names.len == 1) {
+                    skip = try std.fmt.allocPrint(arena, "{s} cannot encode {d}x{d}: {t}", .{ ph.formats[@intFromEnum(pt.format)].name, rows, cols, err });
+                    break;
+                }
+                continue;
+            };
+            defer gpa.free(w_hat);
+
+            const patch = try patchBytes(gpa, pt.patch_dtype, w_hat);
+            errdefer patch.deinit(gpa);
+            try patches.append(gpa, patch);
+            try ov.put(gpa, name, patchTpDtype(pt.patch_dtype), patch.bytes);
+            members += 1;
+        }
+
+        if (skip == null and members == 0) skip = try arena.dupe(u8, "no member could be encoded");
+        if (skip) |why| {
             arms[ai] = .{
-                .name = name,
+                .name = unit.label,
                 .rows = rows,
                 .cols = cols,
                 .kind = .quantized,
                 .points = &.{},
                 .steps = opts.steps,
-                .skipped = try std.fmt.allocPrint(arena, "{s} cannot encode {d}x{d}: {t}", .{ ph.formats[@intFromEnum(pt.format)].name, rows, cols, err }),
+                .members = members,
+                .skipped = why,
             };
             try streamArm(pt.stream_csv, arms[ai]);
             continue;
-        };
-        defer gpa.free(w_hat);
+        }
 
-        const patch = try patchBytes(gpa, pt.patch_dtype, w_hat);
-        defer patch.deinit(gpa);
-        ov.clear();
-        try ov.put(gpa, name, patchTpDtype(pt.patch_dtype), patch.bytes);
-        try sess.replaceDit(ov.store());
+        try sess.replaceDenoiser(ov.store());
 
         const points = try arena.alloc(Point, ref.snaps.len);
         try measureArm(gpa, sess, opts, ref, sigmas, lat_h, lat_w, &cancel, points);
         arms[ai] = .{
-            .name = name,
-            .rows = rows,
-            .cols = cols,
+            .name = unit.label,
+            .rows = if (unit.names.len == 1) rows else 0,
+            .cols = if (unit.names.len == 1) cols else 0,
             .kind = .quantized,
             .points = points,
             .steps = opts.steps,
+            .members = members,
         };
         try streamArm(pt.stream_csv, arms[ai]);
-        opts.callbacks.reportProgress(@intCast(ai + 1), @intCast(names.len), @intCast(ref.snaps.len), @intCast(ref.snaps.len));
+        opts.callbacks.reportProgress(@intCast(ai + 1), @intCast(units.items.len), @intCast(ref.snaps.len), @intCast(ref.snaps.len));
         // One line per arm as it lands: a 24-tensor sweep is over an hour of
         // forwards, and a silent log is indistinguishable from a hang.
         if (opts.log) |lw| {
-            try lw.print("[{d}/{d}] {s} ({d}x{d}) rel L2 {e:.4}\n", .{ ai + 1, names.len, name, rows, cols, arms[ai].meanRelL2() });
+            if (unit.names.len == 1) {
+                try lw.print("[{d}/{d}] {s} ({d}x{d}) rel L2 {e:.4}\n", .{ ai + 1, units.items.len, unit.label, rows, cols, arms[ai].meanRelL2() });
+            } else {
+                try lw.print("[{d}/{d}] set {s} ({d} tensors) rel L2 {e:.4}\n", .{ ai + 1, units.items.len, unit.label, members, arms[ai].meanRelL2() });
+            }
             try lw.flush();
         }
 
         // Put the base weights back before `w_hat` is freed — the DiT holds views
         // into it, and a session whose weights dangle is a session nobody may use.
         ov.clear();
-        try sess.replaceDit(base);
+        try sess.replaceDenoiser(base);
     }
 
     const prompts = try arena.alloc([]const u8, opts.prompts.len);
@@ -930,6 +1099,13 @@ pub fn runPerTensor(gpa: std.mem.Allocator, opts: Options, pt: PerTensor) !Tenso
         .backend = @tagName(opts.backend),
         .controls = controls.items,
         .arms = arms,
+        // Detected from the DiT's own names rather than taken as a flag: this
+        // report's only consumer of the arch is the sensitivities emitter, and a
+        // mistyped flag there would silently change which tensors set the scale.
+        .arch = imagearch.detectArch(base.names()),
+        // An explicit tensor list or a `--max-tensors` cap means the anchor is a
+        // subset's median, which rescales every score in an emitted file.
+        .complete = pt.tensors.len == 0 and pt.max_tensors == null,
     };
 }
 
@@ -1117,6 +1293,81 @@ fn streamArm(sink: ?*std.Io.Writer, a: TensorArm) !void {
     const w = sink orelse return;
     try writeArmRows(w, a);
     try w.flush();
+}
+
+/// Emit a `sensitivities/<arch>.json` from **measured per-tensor whole-model
+/// damage** — the file `Convert.zig` routes precision on, generated from the one
+/// arm that measures the quantity routing actually needs.
+///
+/// This is the cheap form of the brute-force method the hand-built `sdxl.json` /
+/// `sd1.5.json` came from (~100 renders per layer): 16 forwards per layer, no
+/// sampler, no VAE, and drift-free. It is the recommended generator — level 1's
+/// per-layer proxy ranks layers at only Spearman 0.36 against this.
+///
+/// The 1–100 encoding is `LadderScore`'s, shared with level 1 so that the two
+/// generators and the converter's interpretation cannot drift apart again. Read that
+/// module before touching the numbers: the percentile encoding this replaced
+/// produced a krea2 file measuring 2.76× off the uniform rate–distortion curve.
+///
+/// `arch` supplies the routable/hiprec split the scale is normalized over; pass null
+/// for an unknown architecture and every measured tensor takes part. On krea2 that
+/// matters a lot — the seven most damaging tensors are all `keys_hiprec`, so letting
+/// them set the scale compresses the 224 the score can steer.
+///
+/// Unmeasured layers are **omitted**, never scored 0: `Convert.zig`'s "no entry →
+/// use the target type" fallback is the correct handling, whereas a 0 would assert
+/// that the layer is the safest in the model.
+pub fn writeSensitivitiesJson(
+    gpa: std.mem.Allocator,
+    w: *std.Io.Writer,
+    report: *const TensorReport,
+    strip_prefix: []const u8,
+    arch: ?*const imagearch.Arch,
+) !void {
+    var pop: std.ArrayList(f64) = .empty;
+    defer pop.deinit(gpa);
+    var n: usize = 0;
+    for (report.arms) |a| {
+        if (a.skipped != null or a.points.len == 0) continue;
+        n += 1;
+        if (LadderScore.isRoutable(arch, a.name)) try pop.append(gpa, a.meanRelL2());
+    }
+    if (n == 0) return error.NoMeasuredLayers;
+    // Nothing routable measured: normalize over everything rather than emit a file
+    // of flat scores. Not a case to optimize for — it means the sweep covered only
+    // structurally-protected tensors — but it must not silently produce a uniform file.
+    if (pop.items.len == 0) {
+        for (report.arms) |a| {
+            if (a.skipped != null or a.points.len == 0) continue;
+            try pop.append(gpa, a.meanRelL2());
+        }
+    }
+    const ladder = try LadderScore.fromDamages(gpa, pop.items);
+
+    try w.writeAll("{\n");
+    try (LadderScore.Provenance{
+        .generator = "level2-per-tensor-damage",
+        .arch = if (arch) |a| a.name else "",
+        .reference_format = ph.formats[@intFromEnum(report.format)].name,
+        .scored = n,
+        .anchor_population = pop.items.len,
+        .complete = report.complete,
+    }).write(w);
+    var written: usize = 1;
+    for (report.arms) |a| {
+        if (a.skipped != null or a.points.len == 0) continue;
+        const d = a.meanRelL2();
+        const score: f64 = if (ladder) |l| l.score(d) else LadderScore.homogeneous_score;
+        const name = if (strip_prefix.len > 0 and std.mem.startsWith(u8, a.name, strip_prefix))
+            a.name[strip_prefix.len..]
+        else
+            a.name;
+        if (written > 0) try w.writeAll(",\n");
+        try w.print("  {f}: {d:.6}", .{ std.json.fmt(name, .{}), score });
+        written += 1;
+    }
+    if (written > 0) try w.writeByte('\n');
+    try w.writeAll("}\n");
 }
 
 pub fn writeTensorCsv(w: *std.Io.Writer, report: *const TensorReport) !void {
@@ -1444,12 +1695,12 @@ test "selectTensors: explicit names are taken as given, derived names are the ma
     // Derived: the rank-2 `.weight`. The rank-1 norm is not a matmul, and the
     // `_scale` sidecar is not a weight at all.
     var missing: []const u8 = "";
-    const derived = try selectTensors(arena.allocator(), store, .{ .format = .q4_k }, &missing);
+    const derived = try selectTensors(arena.allocator(), store, "", .{ .format = .q4_k }, &missing);
     try testing.expectEqual(@as(usize, 1), derived.len);
     try testing.expectEqualStrings("blocks.0.attn.wq.weight", derived[0]);
 
     // Explicit: taken as given, in the order given.
-    const given = try selectTensors(arena.allocator(), store, .{
+    const given = try selectTensors(arena.allocator(), store, "", .{
         .format = .q4_k,
         .tensors = &.{ "blocks.0.prenorm.weight", "blocks.0.attn.wq.weight" },
     }, &missing);
@@ -1458,11 +1709,25 @@ test "selectTensors: explicit names are taken as given, derived names are the ma
 
     // A name the checkpoint lacks is an error: a typo must not silently shrink the
     // sample a correlation is computed over.
-    try testing.expectError(error.MissingTensor, selectTensors(arena.allocator(), store, .{
+    try testing.expectError(error.MissingTensor, selectTensors(arena.allocator(), store, "", .{
         .format = .q4_k,
         .tensors = &.{"blocks.99.nope.weight"},
     }, &missing));
     try testing.expectEqualStrings("blocks.99.nope.weight", missing);
+
+    // A prefix restricts the derived sweep to the denoiser's own tensors — the
+    // bundled-SD case, where the container also holds CLIP and the VAE.
+    const scoped = try selectTensors(arena.allocator(), store, "blocks.", .{ .format = .q4_k }, &missing);
+    try testing.expectEqual(@as(usize, 1), scoped.len);
+    const none = try selectTensors(arena.allocator(), store, "model.diffusion_model.", .{ .format = .q4_k }, &missing);
+    try testing.expectEqual(@as(usize, 0), none.len);
+
+    // An EXPLICIT name outside the denoiser fails rather than being filtered: it
+    // would otherwise report zero damage, which is a confident wrong row.
+    try testing.expectError(error.TensorNotInDenoiser, selectTensors(arena.allocator(), store, "model.diffusion_model.", .{
+        .format = .q4_k,
+        .tensors = &.{"blocks.0.attn.wq.weight"},
+    }, &missing));
 }
 
 test "max_tensors thins by even stride, not by prefix" {
@@ -1498,7 +1763,7 @@ test "max_tensors thins by even stride, not by prefix" {
     const store: tp.weights.WeightStore = .{ .safetensors = &st };
 
     var missing: []const u8 = "";
-    const picked = try selectTensors(arena.allocator(), store, .{ .format = .q4_k, .max_tensors = 3 }, &missing);
+    const picked = try selectTensors(arena.allocator(), store, "", .{ .format = .q4_k, .max_tensors = 3 }, &missing);
     try testing.expectEqual(@as(usize, 3), picked.len);
     try testing.expectEqualStrings("blocks.0.attn.wq.weight", picked[0]);
     try testing.expectEqualStrings("blocks.3.attn.wq.weight", picked[1]);
@@ -1567,6 +1832,137 @@ test "Level1 CSV parse keeps exactly the requested format and arm" {
     try testing.expectError(error.NotALevel1Csv, Level1.parseCsv(gpa, "a,b,c\n1,2,3\n", "Q4_K", "format"));
 }
 
+test "the sensitivities emitter keeps magnitude, so a long tail routes as a long tail" {
+    // The bug this guards against is not in either component but in their
+    // composition: level 1 emitted percentile RANKS while `Convert.zig` reads the
+    // score as a linear position on the precision ladder, so the model spread evenly
+    // across levels regardless of the damage distribution — measured on krea2 as a
+    // 2.3x worse model at a larger size than plain uniform q6_k.
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    // A long-tailed damage distribution: one bad layer, the rest clustered low.
+    const dmg = [_]f64{ 0.020, 0.0030, 0.0025, 0.0022, 0.0020 };
+    var arms: [6]TensorArm = undefined;
+    var pts: [6][1]Point = undefined;
+    for (dmg, 0..) |d, i| {
+        pts[i] = .{.{ .step = 0, .sigma = 1.0, .rel_l2 = d, .cos = 1, .mean_pos_cos = 1, .max_pos_rel = d }};
+        arms[i] = .{
+            .name = try std.fmt.allocPrint(arena.allocator(), "pfx.blocks.{d}.attn.wq.weight", .{i}),
+            .rows = 8, .cols = 8, .kind = .quantized, .points = &pts[i], .steps = 1,
+        };
+    }
+    // An unmeasurable layer must be OMITTED, not scored 0 — a 0 would tell the
+    // converter this is the safest layer in the model.
+    arms[5] = .{ .name = "pfx.first.weight", .rows = 6144, .cols = 64, .kind = .quantized, .points = &.{}, .steps = 1, .skipped = "cannot encode" };
+
+    var report: TensorReport = .{
+        .arena = std.heap.ArenaAllocator.init(gpa),
+        .reference = "r", .format = .q4_k, .convrot_group = 256, .patch_dtype = .f32,
+        .prompts = &.{}, .sigmas = &.{ 1.0, 0.0 }, .resolution = .{ 256, 256 },
+        .seed = 0, .backend = "cpu", .controls = &.{}, .arms = arms[0..],
+    };
+    defer report.arena.deinit();
+
+    var buf: [2048]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try writeSensitivitiesJson(gpa, &w, &report, "pfx.", null);
+    const out = w.buffered();
+
+    // The prefix is stripped, because that is the namespace the converter looks up.
+    try testing.expect(std.mem.indexOf(u8, out, "\"blocks.0.attn.wq.weight\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "pfx.") == null);
+    // The unmeasured layer is absent entirely.
+    try testing.expect(std.mem.indexOf(u8, out, "first.weight") == null);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, out, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    // Five scores plus the reserved provenance key, which is not a tensor name.
+    try testing.expectEqual(@as(usize, 6), obj.count());
+    const meta = obj.get(LadderScore.meta_key).?.object;
+    try testing.expectEqualStrings("level2-per-tensor-damage", meta.get("generator").?.string);
+    try testing.expectEqualStrings(LadderScore.encoding_id, meta.get("encoding").?.string);
+
+    // 0.020 against a 0.0025 median is exactly 3 doublings, i.e. three quarters of
+    // the way up the ladder — the encoding reports how much worse the layer is, not
+    // merely that it is the worst.
+    const worst = obj.get("blocks.0.attn.wq.weight").?.float;
+    const best = obj.get("blocks.4.attn.wq.weight").?.float;
+    try testing.expectApproxEqAbs(@as(f64, 1 + 99 * 0.75), worst, 1e-6);
+    try testing.expectApproxEqAbs(@as(f64, 1), best, 1e-9);
+
+    // The property that matters: with a long tail, the MEDIAN layer must stay low
+    // enough that the converter leaves it at the target type. Convert.zig maps
+    // norm = (score-1)/99 through norm^(0.5+3*hard/100) and rounds onto the ladder,
+    // so at the default aggressiveness 50 (exponent 2) a layer needs
+    // norm² · (levels−1) ≥ 0.5 to be upgraded at all. A percentile encoding puts the
+    // median at 50.5 and upgrades half the model; magnitude must not.
+    const median = obj.get("blocks.2.attn.wq.weight").?.float;
+    try testing.expect(median < LadderScore.upgradeThreshold(50, LadderScore.default_ladder_levels).?);
+    var upgraded: usize = 0;
+    var it = obj.iterator();
+    const max_idx: f64 = @floatFromInt(LadderScore.default_ladder_levels - 1);
+    while (it.next()) |e| {
+        if (std.mem.eql(u8, e.key_ptr.*, LadderScore.meta_key)) continue;
+        const norm = (e.value_ptr.float - 1) / 99;
+        if (std.math.pow(f64, norm, 2.0) * max_idx >= 0.5) upgraded += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), upgraded); // only the genuine outlier
+}
+
+test "the emitted scale ignores tensors the converter protects structurally" {
+    // Measured trap: krea2's most damaging tensors are all `keys_hiprec`, and
+    // `assignTensorType` protects them *before* it ever reads a score. Letting them
+    // set the scale therefore steers on tensors the score cannot move, and the first
+    // regenerated krea2 file came out as uniform-plus-one-tensor because of it.
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    // txtfusion (hiprec) is 8x the routable median; among the routable three, one is
+    // 4x the median and should be the only one to earn an upgrade.
+    const names = [_][]const u8{
+        "pfx.txtfusion.lw.0.attn.wo.weight",
+        "pfx.blocks.0.attn.wq.weight",
+        "pfx.blocks.1.attn.wq.weight",
+        "pfx.blocks.2.attn.wq.weight",
+    };
+    const dmg = [_]f64{ 2.4e-2, 3.0e-3, 3.0e-3, 1.2e-2 };
+    var arms: [4]TensorArm = undefined;
+    var pts: [4][1]Point = undefined;
+    for (dmg, 0..) |d, i| {
+        pts[i] = .{.{ .step = 0, .sigma = 1.0, .rel_l2 = d, .cos = 1, .mean_pos_cos = 1, .max_pos_rel = d }};
+        arms[i] = .{ .name = names[i], .rows = 8, .cols = 8, .kind = .quantized, .points = &pts[i], .steps = 1 };
+    }
+    var report: TensorReport = .{
+        .arena = std.heap.ArenaAllocator.init(gpa),
+        .reference = "r", .format = .q4_k, .convrot_group = 256, .patch_dtype = .f32,
+        .prompts = &.{}, .sigmas = &.{ 1.0, 0.0 }, .resolution = .{ 256, 256 },
+        .seed = 0, .backend = "cpu", .controls = &.{}, .arms = arms[0..],
+    };
+    defer report.arena.deinit();
+    const thr = LadderScore.upgradeThreshold(50, LadderScore.default_ladder_levels).?;
+
+    // With the arch known, the routable median is 3.0e-3 and the 1.2e-2 tensor is two
+    // doublings above it — enough to be upgraded.
+    var buf: [2048]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try writeSensitivitiesJson(gpa, &w, &report, "pfx.", imagearch.byName("krea2").?);
+    var with = try std.json.parseFromSlice(std.json.Value, gpa, w.buffered(), .{});
+    defer with.deinit();
+    try testing.expect(with.value.object.get("blocks.2.attn.wq.weight").?.float >= thr);
+
+    // Without it the hiprec tensor joins the population, the median moves to 7.5e-3,
+    // and the tensor that deserved protection no longer gets it.
+    var w2 = std.Io.Writer.fixed(&buf);
+    try writeSensitivitiesJson(gpa, &w2, &report, "pfx.", null);
+    var without = try std.json.parseFromSlice(std.json.Value, gpa, w2.buffered(), .{});
+    defer without.deinit();
+    try testing.expect(without.value.object.get("blocks.2.attn.wq.weight").?.float < thr);
+}
+
 test "patchBytes: f32 is exact, bf16 is bf16-rounded and nothing worse" {
     // The bf16 patch dtype exists only so this arm can run on a GPU, so its cost has
     // to be exactly bf16 rounding — not, say, a truncation or a byte-order slip that
@@ -1577,9 +1973,16 @@ test "patchBytes: f32 is exact, bf16 is bf16-rounded and nothing worse" {
     const as_f32 = try patchBytes(gpa, .f32, &vals);
     defer as_f32.deinit(gpa);
     try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&vals), as_f32.bytes);
-    // f32 borrows the round-trip buffer rather than copying 400 MB per arm.
-    try testing.expect(as_f32.owned == null);
-    try testing.expectEqual(std.mem.sliceAsBytes(&vals).ptr, as_f32.bytes.ptr);
+    // ⚠️ **The patch must OWN its bytes, for both dtypes.** This test asserted the
+    // opposite until 2026-08-02 — `owned == null` and pointer identity with the
+    // caller's buffer — which was the contract of the borrowed-slice bug documented
+    // in `patchBytes`: the quantized arm frees its round-trip buffer before the
+    // forward, so a borrowing patch pointed at freed memory and reported rel L2 ~1.0
+    // for q4_k and q8_0 alike. The implementation was fixed and the test was not, so
+    // the suite has been red ever since — which is its own lesson, since a red test
+    // nobody reads is a test that cannot pin anything.
+    try testing.expect(as_f32.owned != null);
+    try testing.expect(as_f32.bytes.ptr != std.mem.sliceAsBytes(&vals).ptr);
 
     const bf = try patchBytes(gpa, .bf16, &vals);
     defer bf.deinit(gpa);

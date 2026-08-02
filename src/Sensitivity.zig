@@ -65,6 +65,7 @@ const Imatrix = @import("Imatrix.zig");
 const Equalize = @import("Equalize.zig");
 const Gptq = @import("Gptq.zig");
 const TensorClusters = @import("TensorClusters.zig");
+const LadderScore = @import("LadderScore.zig");
 
 pub const Format = ph.Format;
 
@@ -361,6 +362,16 @@ pub const Report = struct {
     fold_known: bool = false,
     /// Layers that got a score — i.e. that had a reference-format measurement.
     scored: usize,
+    /// How many scored layers set the median anchor (the routable population).
+    anchor_population: usize = 0,
+    /// False when `--max-layers` cut the sweep short.
+    ///
+    /// ⚠️ **This is not cosmetic.** The anchor is the routable population's *median*,
+    /// so a truncated sweep is not a partial file — it is a **miscalibrated** one,
+    /// with every score shifted by the subset's median. `cache.layers()` is in cache
+    /// order, so a truncated run also takes a structurally biased slice (the early
+    /// blocks), not a random one. The JSON records this and the converter warns on it.
+    complete: bool = true,
 
     pub fn deinit(self: *Report) void {
         self.arena.deinit();
@@ -372,54 +383,58 @@ pub const Report = struct {
 // Scoring
 // ---------------------------------------------------------------------------
 
-/// Turn measured error into the 1–100 scale `Convert.zig` consumes.
+/// Turn measured error into the 1–100 scale `Convert.zig` consumes, via the one
+/// module that owns that encoding (`LadderScore`) — see its header for why it is one
+/// bit per doubling of damage above the routable median, rather than the percentile
+/// rank this function used to emit, and what the percentile version measured.
 ///
-/// Percentile rank, not a normalized magnitude: the converter treats the score
-/// as a *relative* position, and rel-L2 across layers has a long tail, so a
-/// linear map would compress almost everything into a narrow band and let two
-/// outliers set the scale. Ranking is invariant to that.
-fn scoreLayers(gpa: std.mem.Allocator, layers: []LayerResult, reference: Format) !usize {
+/// `arch` supplies the routable/hiprec split, and it matters: the tensors the
+/// converter protects structurally are also the most damaging ones, so letting them
+/// set the scale compresses everything the score can actually steer. Null (an
+/// architecture `ImageArch` does not know) normalizes over every measured layer,
+/// which is the only option available and is recorded in the report.
+const Scored = struct { scored: usize, anchor_population: usize };
+
+fn scoreLayers(
+    gpa: std.mem.Allocator,
+    layers: []LayerResult,
+    reference: Format,
+    arch: ?*const imagearch.Arch,
+) !Scored {
     // Only layers that actually have a reference-format measurement take part.
-    var order: std.ArrayList(usize) = .empty;
-    defer order.deinit(gpa);
+    var measured: std.ArrayList(usize) = .empty;
+    defer measured.deinit(gpa);
     for (layers, 0..) |*l, i| {
         l.score = null;
-        if (l.find(reference) != null) try order.append(gpa, i);
+        if (l.find(reference) != null) try measured.append(gpa, i);
     }
-    if (order.items.len == 0) return 0;
-    if (order.items.len == 1) {
-        layers[order.items[0]].score = 50;
-        return 1;
+    if (measured.items.len == 0) return .{ .scored = 0, .anchor_population = 0 };
+
+    const err = struct {
+        fn f(ls: []const LayerResult, ref: Format, i: usize) f64 {
+            return ls[i].find(ref).?.format_arm.rel_l2;
+        }
+    }.f;
+
+    // The anchor comes from the routable population only.
+    var pop: std.ArrayList(f64) = .empty;
+    defer pop.deinit(gpa);
+    for (measured.items) |i| {
+        if (LadderScore.isRoutable(arch, layers[i].name)) try pop.append(gpa, err(layers, reference, i));
+    }
+    // Nothing routable measured — a sweep that covered only structurally-protected
+    // tensors. Normalize over everything rather than emit a file of flat scores.
+    if (pop.items.len == 0) {
+        for (measured.items) |i| try pop.append(gpa, err(layers, reference, i));
     }
 
-    const Ctx = struct {
-        layers: []const LayerResult,
-        reference: Format,
-        fn err(self: @This(), i: usize) f64 {
-            return self.layers[i].find(self.reference).?.format_arm.rel_l2;
-        }
-        fn lessThan(self: @This(), a: usize, b: usize) bool {
-            return self.err(a) < self.err(b);
-        }
-    };
-    const ctx = Ctx{ .layers = layers, .reference = reference };
-    std.mem.sort(usize, order.items, ctx, Ctx.lessThan);
-
-    // Ties must not get different scores just because the sort put one first:
-    // equal error means equal sensitivity, and a converter routing them
-    // differently on sort order would be nondeterministic in effect.
-    const ranked = order.items;
-    const denom: f64 = @floatFromInt(ranked.len - 1);
-    var i: usize = 0;
-    while (i < ranked.len) {
-        var j = i + 1;
-        while (j < ranked.len and ctx.err(ranked[j]) == ctx.err(ranked[i])) j += 1;
-        const mid = (@as(f64, @floatFromInt(i)) + @as(f64, @floatFromInt(j - 1))) / 2;
-        const score = 1 + 99 * (mid / denom);
-        for (ranked[i..j]) |idx| layers[idx].score = score;
-        i = j;
+    const ladder = try LadderScore.fromDamages(gpa, pop.items);
+    for (measured.items) |i| {
+        // Ties get the same score by construction: the score is a function of the
+        // error alone, so routing cannot depend on sort order.
+        layers[i].score = if (ladder) |l| l.score(err(layers, reference, i)) else LadderScore.homogeneous_score;
     }
-    return ranked.len;
+    return .{ .scored = measured.items.len, .anchor_population = pop.items.len };
 }
 
 // ---------------------------------------------------------------------------
@@ -808,12 +823,24 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, opts: Options) !Report {
         }
     }
 
-    const scored = try scoreLayers(gpa, results.items, opts.reference_format);
+    const sc = try scoreLayers(gpa, results.items, opts.reference_format, arch);
+    const scored = sc.scored;
     if (scored < results.items.len) {
         std.log.warn(
             "{d} of {d} layers could not be measured at the reference format {s} (shape constraints); " ++
                 "they are left out of the sensitivities JSON rather than scored as insensitive",
             .{ results.items.len - scored, results.items.len, formatName(opts.reference_format) },
+        );
+    }
+    // A truncated sweep rescales the whole ladder (the anchor is the measured
+    // population's median), so it is recorded rather than left to be inferred.
+    const complete = opts.max_layers == null or opts.max_layers.? >= names.len;
+    if (!complete) {
+        std.log.warn(
+            "--max-layers stopped this sweep at {d} of {d} layers. The median anchor is that " ++
+                "subset's, so EVERY score is rescaled — the JSON is marked incomplete and the " ++
+                "converter will warn. Do not route on it.",
+            .{ limit, names.len },
         );
     }
 
@@ -843,6 +870,8 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, opts: Options) !Report {
         .fold_none = folds.none,
         .fold_known = arch != null,
         .scored = scored,
+        .anchor_population = sc.anchor_population,
+        .complete = complete,
     };
 }
 
@@ -1413,7 +1442,19 @@ pub fn parseFormats(gpa: std.mem.Allocator, spec: []const u8) ![]Format {
 /// path with zero converter changes.
 pub fn writeSensitivitiesJson(report: *const Report, w: *std.Io.Writer) !void {
     try w.writeAll("{\n");
-    var written: usize = 0;
+    // Provenance first, under a reserved key no checkpoint tensor can collide with.
+    // Every score file before 2026-08-02 was a bare name→score map, so a percentile-era
+    // file and a LadderScore-era one were indistinguishable without inspecting the
+    // score *distribution* — which is exactly what nobody does before converting.
+    try (LadderScore.Provenance{
+        .generator = "level1-output-error",
+        .arch = report.arch,
+        .reference_format = formatName(report.reference_format),
+        .scored = report.scored,
+        .anchor_population = report.anchor_population,
+        .complete = report.complete,
+    }).write(w);
+    var written: usize = 1;
     for (report.layers) |l| {
         const score = l.score orelse continue;
         if (written > 0) try w.writeAll(",\n");
@@ -1480,7 +1521,33 @@ pub fn writeMarkdown(report: *const Report, w: *std.Io.Writer, top_n: usize) !vo
     try w.print("- calibration: `{s}` (prompt set `{s}`)\n", .{ report.calib_path, report.prompt_set });
     try w.print("- arch: `{s}`\n", .{report.arch});
     try w.print("- layers measured: {d} ({d} scored at the reference format)\n", .{ report.layers.len, report.scored });
-    try w.print("- sensitivity score: percentile rank of {s} format-arm rel-L2\n", .{formatName(report.reference_format)});
+    try w.print(
+        "- sensitivity score: `1 + 99·clamp(log2(d/d_median)/{d:.0}, 0, 1)` where `d` is {s} format-arm\n" ++
+            "  rel-L2 and the median is over the layers the converter can route — one extra bit of\n" ++
+            "  precision per doubling of damage (`LadderScore`). **Not** a percentile rank: see that\n" ++
+            "  module for the 2.76×-off-the-curve model the rank encoding produced\n",
+        .{ LadderScore.full_range_doublings, formatName(report.reference_format) },
+    );
+    // What this file would actually *do*, said before anyone spends an hour
+    // converting and measuring it. The generator's encoding and the converter's
+    // interpretation were designed separately once, and this is the seam.
+    {
+        const arch = imagearch.byName(report.arch);
+        var routable: usize = 0;
+        var upgraded: usize = 0;
+        const thr = LadderScore.upgradeThreshold(50, LadderScore.default_ladder_levels).?;
+        for (report.layers) |l| {
+            const sc = l.score orelse continue;
+            if (!LadderScore.isRoutable(arch, l.name)) continue;
+            routable += 1;
+            if (sc >= thr) upgraded += 1;
+        }
+        try w.print(
+            "- at the default `-a 50` on a {d}-level ladder (q4_k→q8_0, the k-family case), **{d} of {d}**\n" ++
+                "  scored routable layers would be upgraded off the target type (score ≥ {d:.1})\n",
+            .{ LadderScore.default_ladder_levels, upgraded, routable, thr },
+        );
+    }
     if (report.scored < report.layers.len) {
         try w.print(
             "- {d} layers have no {s} measurement (their shape violates its block constraint); they are\n" ++
@@ -2054,31 +2121,89 @@ test "a zero reference token is excluded rather than counted as perfect" {
     try testing.expectApproxEqAbs(@as(f64, 0.0), m.max_token_rel, 1e-9);
 }
 
-test "scores are percentile ranks, and ties share a score" {
+test "scores keep magnitude, and ties share a score" {
+    // Was "scores are percentile ranks", which is the encoding this replaced: it
+    // spread the model evenly over the precision ladder whatever the damage
+    // distribution was, and measured 2.76x off the uniform rate–distortion curve on
+    // krea2. See `LadderScore` for the numbers.
     const gpa = testing.allocator;
 
-    fn_scope: {
-        var f0 = [_]FormatResult{.{ .fmt = .q4_k, .bits = 4.5, .format_arm = .{ .rel_l2 = 0.1, .mean_token_cos = 1, .max_token_rel = 0 }, .kernel_arm = null }};
-        var f1 = [_]FormatResult{.{ .fmt = .q4_k, .bits = 4.5, .format_arm = .{ .rel_l2 = 0.5, .mean_token_cos = 1, .max_token_rel = 0 }, .kernel_arm = null }};
-        var f2 = [_]FormatResult{.{ .fmt = .q4_k, .bits = 4.5, .format_arm = .{ .rel_l2 = 0.5, .mean_token_cos = 1, .max_token_rel = 0 }, .kernel_arm = null }};
-        var f3 = [_]FormatResult{.{ .fmt = .q4_k, .bits = 4.5, .format_arm = .{ .rel_l2 = 0.9, .mean_token_cos = 1, .max_token_rel = 0 }, .kernel_arm = null }};
-        var layers = [_]LayerResult{
-            .{ .name = "a", .rows = 1, .cols = 1, .tokens = 1, .per_format = &f0 },
-            .{ .name = "b", .rows = 1, .cols = 1, .tokens = 1, .per_format = &f1 },
-            .{ .name = "c", .rows = 1, .cols = 1, .tokens = 1, .per_format = &f2 },
-            .{ .name = "d", .rows = 1, .cols = 1, .tokens = 1, .per_format = &f3 },
-        };
-        const scored = try scoreLayers(gpa, &layers, .q4_k);
+    var f0 = [_]FormatResult{.{ .fmt = .q4_k, .bits = 4.5, .format_arm = .{ .rel_l2 = 0.1, .mean_token_cos = 1, .max_token_rel = 0 }, .kernel_arm = null }};
+    var f1 = [_]FormatResult{.{ .fmt = .q4_k, .bits = 4.5, .format_arm = .{ .rel_l2 = 0.5, .mean_token_cos = 1, .max_token_rel = 0 }, .kernel_arm = null }};
+    var f2 = [_]FormatResult{.{ .fmt = .q4_k, .bits = 4.5, .format_arm = .{ .rel_l2 = 0.5, .mean_token_cos = 1, .max_token_rel = 0 }, .kernel_arm = null }};
+    var f3 = [_]FormatResult{.{ .fmt = .q4_k, .bits = 4.5, .format_arm = .{ .rel_l2 = 0.9, .mean_token_cos = 1, .max_token_rel = 0 }, .kernel_arm = null }};
+    var layers = [_]LayerResult{
+        .{ .name = "a", .rows = 1, .cols = 1, .tokens = 1, .per_format = &f0 },
+        .{ .name = "b", .rows = 1, .cols = 1, .tokens = 1, .per_format = &f1 },
+        .{ .name = "c", .rows = 1, .cols = 1, .tokens = 1, .per_format = &f2 },
+        .{ .name = "d", .rows = 1, .cols = 1, .tokens = 1, .per_format = &f3 },
+    };
+    const scored = (try scoreLayers(gpa, &layers, .q4_k, null)).scored;
 
-        try testing.expectEqual(@as(usize, 4), scored);
-        try testing.expectApproxEqAbs(@as(f64, 1), layers[0].score.?, 1e-9); // lowest error
-        try testing.expectApproxEqAbs(@as(f64, 100), layers[3].score.?, 1e-9); // highest
-        // The tied pair sits at the average of ranks 1 and 2 — and crucially gets
-        // the SAME score, so routing does not depend on sort order.
-        try testing.expectApproxEqAbs(layers[1].score.?, layers[2].score.?, 1e-12);
-        try testing.expectApproxEqAbs(@as(f64, 1 + 99 * 1.5 / 3.0), layers[1].score.?, 1e-9);
-        break :fn_scope;
-    }
+    try testing.expectEqual(@as(usize, 4), scored);
+    // The median of {0.1, 0.5, 0.5, 0.9} is 0.5, and the median layer keeps the
+    // target type — so both tied layers score 1, as does the one below them.
+    try testing.expectApproxEqAbs(@as(f64, 1), layers[0].score.?, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 1), layers[1].score.?, 1e-9);
+    // Ties share a score by construction: the score is a function of the error
+    // alone, so routing cannot depend on sort order.
+    try testing.expectApproxEqAbs(layers[1].score.?, layers[2].score.?, 1e-12);
+    // The worst layer is 0.848 doublings above the median, i.e. a fifth of the way
+    // up the ladder — NOT at the top. Being the worst of a homogeneous population
+    // buys nothing; that is the whole difference from a rank encoding.
+    try testing.expectApproxEqAbs(@as(f64, 1 + 99 * @log2(1.8) / 4.0), layers[3].score.?, 1e-6);
+    try testing.expect(layers[3].score.? < LadderScore.upgradeThreshold(50, 5).?);
+
+    // And the magnitude property, which ranking did not have: multiplying every
+    // error by a constant must not change a single score.
+    var g0 = f0;
+    var g1 = f1;
+    var g2 = f2;
+    var g3 = f3;
+    for ([_]*[1]FormatResult{ &g0, &g1, &g2, &g3 }) |g| g[0].format_arm.rel_l2 *= 1000;
+    var scaled = [_]LayerResult{
+        .{ .name = "a", .rows = 1, .cols = 1, .tokens = 1, .per_format = &g0 },
+        .{ .name = "b", .rows = 1, .cols = 1, .tokens = 1, .per_format = &g1 },
+        .{ .name = "c", .rows = 1, .cols = 1, .tokens = 1, .per_format = &g2 },
+        .{ .name = "d", .rows = 1, .cols = 1, .tokens = 1, .per_format = &g3 },
+    };
+    _ = try scoreLayers(gpa, &scaled, .q4_k, null);
+    for (layers, scaled) |a, b| try testing.expectApproxEqAbs(a.score.?, b.score.?, 1e-9);
+}
+
+test "the scale is normalized over the layers the converter can actually route" {
+    // The trap, measured: krea2's seven most damaging tensors are all `keys_hiprec`,
+    // which `assignTensorType` protects *before* it ever looks at a score. The first
+    // regenerated file normalized over all 263 measured tensors, which compressed the
+    // 224 routable ones into scores 1..23 — all below the upgrade threshold — and the
+    // "routed" model came out as uniform q4_k plus a single q5_k tensor.
+    const gpa = testing.allocator;
+    var hi = [_]FormatResult{.{ .fmt = .q4_k, .bits = 4.5, .format_arm = .{ .rel_l2 = 1.0, .mean_token_cos = 1, .max_token_rel = 0 }, .kernel_arm = null }};
+    var a = [_]FormatResult{.{ .fmt = .q4_k, .bits = 4.5, .format_arm = .{ .rel_l2 = 0.010, .mean_token_cos = 1, .max_token_rel = 0 }, .kernel_arm = null }};
+    var b = [_]FormatResult{.{ .fmt = .q4_k, .bits = 4.5, .format_arm = .{ .rel_l2 = 0.012, .mean_token_cos = 1, .max_token_rel = 0 }, .kernel_arm = null }};
+    var c = [_]FormatResult{.{ .fmt = .q4_k, .bits = 4.5, .format_arm = .{ .rel_l2 = 0.040, .mean_token_cos = 1, .max_token_rel = 0 }, .kernel_arm = null }};
+    var layers = [_]LayerResult{
+        // krea2's hiprec list matches `txtfusion` — never routed, whatever its score.
+        .{ .name = "model.diffusion_model.txtfusion.lw.0.attn.wo.weight", .rows = 1, .cols = 1, .tokens = 1, .per_format = &hi },
+        .{ .name = "model.diffusion_model.blocks.0.attn.wq.weight", .rows = 1, .cols = 1, .tokens = 1, .per_format = &a },
+        .{ .name = "model.diffusion_model.blocks.1.attn.wq.weight", .rows = 1, .cols = 1, .tokens = 1, .per_format = &b },
+        .{ .name = "model.diffusion_model.blocks.2.attn.wq.weight", .rows = 1, .cols = 1, .tokens = 1, .per_format = &c },
+    };
+
+    const thr = LadderScore.upgradeThreshold(50, 5).?;
+
+    _ = try scoreLayers(gpa, &layers, .q4_k, imagearch.byName("krea2").?);
+    // The routable population is {0.010, 0.012, 0.040}, median 0.012 — so the 0.040
+    // layer is 1.74 doublings above typical and earns an upgrade, while the hiprec
+    // outlier saturates at 100 without ever having set the scale.
+    try testing.expect(layers[3].score.? > thr);
+    try testing.expectApproxEqAbs(@as(f64, 100), layers[0].score.?, 1e-9);
+
+    // With the arch unknown there is no split to make, so the hiprec layer joins the
+    // population and drags the median up to 0.026 — and the one routable layer that
+    // deserved protection no longer gets it. That is exactly the trap, as a number.
+    _ = try scoreLayers(gpa, &layers, .q4_k, null);
+    try testing.expect(layers[3].score.? < thr);
 }
 
 test "a layer with no reference-format measurement is unscored, not ranked lowest" {
@@ -2097,13 +2222,16 @@ test "a layer with no reference-format measurement is unscored, not ranked lowes
         .{ .name = "first.weight", .rows = 1, .cols = 1, .tokens = 1, .per_format = &without },
         .{ .name = "c", .rows = 1, .cols = 1, .tokens = 1, .per_format = &other },
     };
-    const scored = try scoreLayers(gpa, &layers, .q4_k);
+    const scored = (try scoreLayers(gpa, &layers, .q4_k, null)).scored;
 
     try testing.expectEqual(@as(usize, 2), scored);
     try testing.expect(layers[1].score == null);
-    // The two that were measured still span the full range between them.
+    // With two values the median is their mean, so the lower one sits at the bottom
+    // and the higher one climbs by however many doublings it actually is above it —
+    // here 0.4 against a 0.3 median, which is a third of a doubling and nothing like
+    // the top of the ladder.
     try testing.expectApproxEqAbs(@as(f64, 1), layers[0].score.?, 1e-9);
-    try testing.expectApproxEqAbs(@as(f64, 100), layers[2].score.?, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 1 + 99 * @log2(4.0 / 3.0) / 4.0), layers[2].score.?, 1e-6);
 
     // And the unscored layer must not appear in the JSON at all: absent means
     // "converter, use your own rule", which is the correct fallback.
@@ -2130,10 +2258,58 @@ test "a layer with no reference-format measurement is unscored, not ranked lowes
     try testing.expect(std.mem.indexOf(u8, json, "first.weight") == null);
     try testing.expect(std.mem.indexOf(u8, json, "\"a\"") != null);
 
-    // It must still be valid JSON of the shape Convert.zig consumes.
+    // It must still be valid JSON of the shape Convert.zig consumes: two scores plus
+    // the reserved provenance key, which is not a tensor name and so can never
+    // collide with the converter's lookup.
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
     defer parsed.deinit();
-    try testing.expectEqual(@as(usize, 2), parsed.value.object.count());
+    try testing.expectEqual(@as(usize, 3), parsed.value.object.count());
+    const meta = parsed.value.object.get(LadderScore.meta_key).?.object;
+    try testing.expectEqualStrings(LadderScore.encoding_id, meta.get("encoding").?.string);
+    try testing.expectEqualStrings("level1-output-error", meta.get("generator").?.string);
+    try testing.expectEqualStrings("Q4_K", meta.get("reference_format").?.string);
+    try testing.expect(meta.get("complete").?.bool);
+    // A file this build understands must raise no warning; that is the whole point of
+    // recording the encoding.
+    try testing.expect(LadderScore.metaWarning(parsed.value) == null);
+}
+
+test "an incomplete sweep's file is marked, and the converter warns about it" {
+    // ⚠️ The anchor is the measured population's MEDIAN, so `--max-layers` does not
+    // write a partial file — it writes a rescaled one, with every score shifted. That
+    // is strictly worse than the percentile encoding it replaced, where a partial run
+    // merely gave a sparse ranking, so it has to be visible on the artifact itself.
+    const gpa = testing.allocator;
+    var f = [_]FormatResult{.{ .fmt = .q4_k, .bits = 4.5, .format_arm = .{ .rel_l2 = 0.2, .mean_token_cos = 1, .max_token_rel = 0 }, .kernel_arm = null }};
+    var layers = [_]LayerResult{.{ .name = "a", .rows = 1, .cols = 1, .tokens = 1, .per_format = &f, .score = 1 }};
+    var report: Report = .{
+        .arena = std.heap.ArenaAllocator.init(gpa),
+        .layers = &layers,
+        .reference_format = .q4_k,
+        .model_path = "m",
+        .calib_path = "c",
+        .arch = "krea2",
+        .prompt_set = "p",
+        .reference_is_quantized = false,
+        .reference_dtype = "f32",
+        .kernel_arms = 0,
+        .weighted_arms = 0,
+        .scored = 1,
+        .anchor_population = 1,
+        .complete = false,
+    };
+    defer report.deinit();
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try writeSensitivitiesJson(&report, &aw.writer);
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, aw.written(), .{});
+    defer parsed.deinit();
+    try testing.expect(!parsed.value.object.get(LadderScore.meta_key).?.object.get("complete").?.bool);
+    // And it must be the *first* thing the converter complains about, ahead of any
+    // encoding check, because a rescaled ladder is the more serious defect.
+    const why = LadderScore.metaWarning(parsed.value).?;
+    try testing.expect(std.mem.indexOf(u8, why, "truncated") != null);
 }
 
 test "scores are emitted under the canonical unprefixed tensor name" {
@@ -2149,7 +2325,7 @@ test "scores are emitted under the canonical unprefixed tensor name" {
         .{ .name = "model.diffusion_model.blocks.0.attn.wq.weight", .rows = 1, .cols = 1, .tokens = 1, .per_format = &f },
         .{ .name = "model.diffusion_model.txtfusion.projector.weight", .rows = 1, .cols = 1, .tokens = 1, .per_format = &g },
     };
-    const scored = try scoreLayers(gpa, &layers, .q4_k);
+    const scored = (try scoreLayers(gpa, &layers, .q4_k, null)).scored;
 
     var report: Report = .{
         .arena = std.heap.ArenaAllocator.init(gpa),
@@ -2174,7 +2350,8 @@ test "scores are emitted under the canonical unprefixed tensor name" {
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, aw.written(), .{});
     defer parsed.deinit();
     const obj = parsed.value.object;
-    try testing.expectEqual(@as(usize, 2), obj.count());
+    // Two scores plus the reserved provenance key.
+    try testing.expectEqual(@as(usize, 3), obj.count());
     try testing.expect(obj.get("blocks.0.attn.wq.weight") != null);
     try testing.expect(obj.get("txtfusion.projector.weight") != null);
     // The prefixed form must NOT be what got written, or the file only ever

@@ -367,6 +367,33 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(divergence_test).step);
 
+    // The 1–100 sensitivity-score encoding, shared by both measurement levels and
+    // read by Convert.calculateQuantizationLevel. Pure arithmetic plus ImageArch's
+    // name rules, so it needs no dependency at all.
+    const ladder_score_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/LadderScore.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(ladder_score_test).step);
+
+    // Weight-space heterogeneity screen: quantizes through precision_harness (ggml via
+    // tp_core) and reads checkpoints through the umbrella's safetensors.
+    const heterogeneity_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/Heterogeneity.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "TensorPencil", .module = tp },
+                .{ .name = "tp_core", .module = tp_core },
+            },
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(heterogeneity_test).step);
+
     const convert_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/Convert.zig"),
