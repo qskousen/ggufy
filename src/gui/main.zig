@@ -43,12 +43,12 @@ const gguf_type_names = blk: {
 
 // Safetensors output types that we can convert
 const st_target_types = [_]ggufy.types.DataType{
-    .F32, .F16, .BF16, .F8_E4M3, .SCALED_F8_E4M3, .F8_E5M2, .MXFP8_E4M3, .NVFP4, .INT8, .INT8_CONVROT, .INT4_CONVROT, .INT4_CONVROT_SR,
+    .F32, .F16, .BF16, .F8_E4M3, .SCALED_F8_E4M3, .F8_E5M2, .MXFP8_E4M3, .NVFP4, .INT8, .INT8_CONVROT, .INT4_CONVROT, .INT4_CONVROT_SR, .ASYM_W4A8_INT8,
 };
 
 // User-facing display names — must stay in sync with st_target_types.
 const st_type_names = [_][]const u8{
-    "F32", "F16", "BF16", "F8_E4M3", "Scaled F8_E4M3", "F8_E5M2", "MXFP8_E4M3", "NVFP4", "INT8", "INT8 ConvRot", "INT4 ConvRot", "INT4 ConvRot SR",
+    "F32", "F16", "BF16", "F8_E4M3", "Scaled F8_E4M3", "F8_E5M2", "MXFP8_E4M3", "NVFP4", "INT8", "INT8 ConvRot", "INT4 ConvRot", "INT4 ConvRot SR", "W4A8 ConvRot",
 };
 
 comptime {

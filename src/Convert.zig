@@ -184,7 +184,7 @@ pub fn validateDatatypeForFiletype(datatype: ?types.DataType, filetype: types.Fi
             .safetensors => std.log.err(
                 "{s} is a GGUF block-quantized type and cannot be stored in a SafeTensors file. " ++
                     "Use -f gguf to write a GGUF, or choose a SafeTensors type " ++
-                    "(F16, BF16, F8_E4M3, SCALED_F8_E4M3, INT8, INT8_CONVROT, INT4_CONVROT, MXFP4, MXFP8_E4M3, NVFP4).",
+                    "(F16, BF16, F8_E4M3, SCALED_F8_E4M3, INT8, INT8_CONVROT, INT4_CONVROT, ASYM_W4A8_INT8, MXFP4, MXFP8_E4M3, NVFP4).",
                 .{@tagName(dt)},
             ),
             .gguf => std.log.err(
@@ -904,6 +904,12 @@ fn clusterEligible(t: *const types.Tensor, ttype: types.DataType, num_elements: 
         // convrot_w4a4 rotates in column-groups of convrot_groupsize, so the input dim must
         // be divisible by it (which also guarantees the even column count nibble-packing needs).
         .INT4_CONVROT, .INT4_CONVROT_SR => t.dims.len == 2 and n_cols % TensorClusters.int4_convrot_group_size == 0,
+        // Two separate constraints on the input dim: the rotation group and the scale group.
+        // The rotation group is a multiple of the scale group today, so the first check covers
+        // both, but the scale group is a per-layer field and need not stay 16.
+        .ASYM_W4A8_INT8 => t.dims.len == 2 and
+            n_cols % TensorClusters.asym_w4a8_convrot_group_size == 0 and
+            n_cols % TensorClusters.asym_w4a8_group_size == 0,
         else => false,
     };
 }

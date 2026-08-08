@@ -884,7 +884,7 @@ pub const Quantizer = struct {
     }
 
     /// Round half-to-even (banker's rounding), matching torch's `.round()`.
-    fn roundHalfToEven(x: f32) f32 {
+    pub fn roundHalfToEven(x: f32) f32 {
         const fl = @floor(x);
         const diff = x - fl;
         if (diff < 0.5) return fl;
@@ -1129,6 +1129,348 @@ pub const Quantizer = struct {
         pool: *thread_pool_mod.ThreadPool,
     ) !Int4Data {
         return quantizeToInt4(allocator, input, rows, cols, true, group_size, stochastic_rounding, pool);
+    }
+
+    // asym_w4a8_int8 (ComfyUI AsymW4A8Int8Layout).
+    //
+    // 4 bits of storage, 8 bits of arithmetic. Where convrot_w4a4 quantizes weights and
+    // activations to 4 bits, this format decodes each 4-bit code to a full int8 value at
+    // load time, so the matrix multiply is int8 against an int8 activation. That is why the
+    // decode rounds to whole numbers instead of reconstructing a float.
+    //
+    // Matches comfy_kitchen quantize_w4a8_int8_weight in symmetric codebook mode, applied to
+    // the rotated weight, per group of w4a8_group_size columns:
+    //
+    //   group_scale = max(amax(group), 1e-8)
+    //   code        = nearest(codebook, w / group_scale)
+    //   twice:
+    //       group_scale = max(dot(w, c) / max(dot(c, c), 1e-8), 1e-8)   with c = codebook[code]
+    //       code        = nearest(codebook, w / group_scale)
+    //   s_channel   = max(amax_row(codebook[code] * group_scale) / 127, 1e-8)
+    //   s_rel       = fp8_e4m3(group_scale / s_channel)
+    //   levels[j]   = clamp(round(codebook[j] * s_rel), -127, 127)
+    //   code        = nearest(levels, w / s_channel)
+    //
+    // Ties go to the lower index in both assignment steps. cols must be even and a multiple
+    // of the group size. Caller owns every returned slice.
+    //
+    // Output is not byte for byte the same as comfy_kitchen on a bf16 checkpoint. It builds
+    // the rotation matrix in the weight's own dtype, so a bf16 weight rotates in bf16. This
+    // code rotates in f32, which is slightly more accurate and moves a few percent of the
+    // s_rel bytes by one step.
+
+    /// ComfyUI's default W4A8 scale group, the group_size field of the comfy_quant JSON.
+    pub const w4a8_group_size: usize = 16;
+
+    /// The 16 levels comfy_kitchen uses, copied exactly. They are Lloyd-Max optimal for a
+    /// Gaussian, which is what the rotation makes each group look like, so one fixed table
+    /// works about as well as fitting one per tensor.
+    ///
+    /// comfy_kitchen fits its own table when a group is heavy-tailed instead of Gaussian.
+    /// This code always writes the fixed table and warns when that test would have tripped.
+    /// The table is stored in the file, so decoding is correct either way; only byte equality
+    /// with comfy_kitchen's output is lost on such a tensor.
+    pub const w4a8_codebook = [16]f32{
+        -0.980602, -0.794529, -0.638165, -0.500986, -0.377321, -0.263187, -0.155210, -0.050720,
+        0.052541,  0.156985,  0.265284,  0.379533,  0.502636,  0.638953,  0.794876,  0.980671,
+    };
+
+    /// Excess kurtosis above which comfy_kitchen fits its own codebook instead of the fixed one.
+    const w4a8_gate_kurtosis: f64 = -0.1;
+
+    pub const AsymW4a8Data = struct {
+        weight: []u8, // packed 4-bit codebook indices, [rows * cols / 2]
+        s_rel: []u8, // per-group scale, raw fp8 e4m3 bytes, [rows * cols / group_size]
+        s_channel: []f32, // per-output-row scale, [rows]
+        /// True when comfy_kitchen would have fitted its own codebook for this weight.
+        codebook_fit_recommended: bool,
+    };
+
+    pub fn quantizeToAsymW4a8(
+        allocator: std.mem.Allocator,
+        input: []const f32,
+        rows: usize,
+        cols: usize,
+        convrot_group_size: usize,
+        pool: *thread_pool_mod.ThreadPool,
+    ) !AsymW4a8Data {
+        if (input.len != rows * cols) return error.InputSizeMismatch;
+        if (cols % w4a8_group_size != 0) return error.ColsNotDivisibleByGroupSize;
+        if (cols % convrot_group_size != 0) return error.ColsNotDivisibleByGroupSize;
+
+        // Rotation is in-place, so it needs a mutable copy. This format is always rotated.
+        const rotated = try allocator.alloc(f32, input.len);
+        defer allocator.free(rotated);
+        @memcpy(rotated, input);
+        try rotateGroupwiseInPlace(rotated, rows, cols, convrot_group_size, pool);
+
+        const groups_per_row = cols / w4a8_group_size;
+
+        const weight = try allocator.alloc(u8, rows * (cols / 2));
+        errdefer allocator.free(weight);
+        const s_rel = try allocator.alloc(u8, rows * groups_per_row);
+        errdefer allocator.free(s_rel);
+        const s_channel = try allocator.alloc(f32, rows);
+        errdefer allocator.free(s_channel);
+
+        // Scratch for the settled per-group scales, so the workers allocate nothing.
+        const group_scales = try allocator.alloc(f32, rows * groups_per_row);
+        defer allocator.free(group_scales);
+
+        // Each row has its own s_channel, so rows are independent and the split over threads
+        // does not change the result.
+        const threads_u64: u64 = @intCast(pool.threads.len);
+        const rows_u64: u64 = @intCast(rows);
+        const rows_per_thread = @divTrunc(rows_u64, threads_u64);
+        const leftover = rows_u64 - (rows_per_thread * threads_u64);
+
+        var wg: thread_pool_mod.WaitGroup = .{};
+        var i: u64 = 0;
+        while (i < threads_u64) : (i += 1) {
+            const start = i * rows_per_thread;
+            var end = start + rows_per_thread;
+            if (i == threads_u64 - 1) end += leftover;
+            if (start == end) continue;
+            pool.spawnWg(&wg, quantizeAsymW4a8Rows, .{ rotated, weight, s_rel, s_channel, group_scales, cols, @as(usize, @intCast(start)), @as(usize, @intCast(end)) });
+        }
+        wg.wait();
+
+        return .{
+            .weight = weight,
+            .s_rel = s_rel,
+            .s_channel = s_channel,
+            .codebook_fit_recommended = w4a8CodebookFitRecommended(rotated, cols),
+        };
+    }
+
+    /// Elements sampled by the kurtosis check. comfy_kitchen samples the same count randomly;
+    /// an evenly spaced sample estimates the same shape.
+    const w4a8_gate_sample_elems: usize = 1 << 19;
+
+    /// Advisory check: would comfy_kitchen have fitted a per-tensor codebook for this
+    /// (already rotated) weight?
+    fn w4a8CodebookFitRecommended(rotated: []const f32, cols: usize) bool {
+        const n_groups = rotated.len / w4a8_group_size;
+        if (n_groups == 0 or cols == 0) return false;
+
+        // Stride whole groups so each sampled value is normalized by its own group's amax,
+        // and so the sample spans the tensor rather than its first rows.
+        const want_groups = @max(1, w4a8_gate_sample_elems / w4a8_group_size);
+        const stride = @max(1, n_groups / want_groups);
+
+        var sum: f64 = 0.0;
+        var count: f64 = 0.0;
+        var m2: f64 = 0.0;
+        var m4: f64 = 0.0;
+
+        // Two passes over the SAMPLE (mean, then central moments), not over the tensor.
+        var g: usize = 0;
+        while (g < n_groups) : (g += stride) {
+            const group = rotated[g * w4a8_group_size ..][0..w4a8_group_size];
+            var amax: f32 = 0.0;
+            for (group) |v| {
+                if (!std.math.isNan(v) and !std.math.isInf(v)) amax = @max(amax, @abs(v));
+            }
+            const gs: f32 = @max(amax, 1e-8);
+            for (group) |v| {
+                sum += @as(f64, v / gs);
+                count += 1.0;
+            }
+        }
+        if (count < 2.0) return false;
+        const mean = sum / count;
+
+        g = 0;
+        while (g < n_groups) : (g += stride) {
+            const group = rotated[g * w4a8_group_size ..][0..w4a8_group_size];
+            var amax: f32 = 0.0;
+            for (group) |v| {
+                if (!std.math.isNan(v) and !std.math.isInf(v)) amax = @max(amax, @abs(v));
+            }
+            const gs: f32 = @max(amax, 1e-8);
+            for (group) |v| {
+                const d = @as(f64, v / gs) - mean;
+                m2 += d * d;
+                m4 += d * d * d * d;
+            }
+        }
+        // torch's .std() is the sample (n-1) estimator; comfy divides by it before the
+        // 4th moment, so match that rather than the population form.
+        const variance = m2 / (count - 1.0);
+        const sd = @sqrt(variance) + 1e-9;
+        const excess = (m4 / count) / (sd * sd * sd * sd) - 3.0;
+        return excess > w4a8_gate_kurtosis;
+    }
+
+    /// Index of the first entry >= v, or sorted.len if every entry is below it. Same as
+    /// torch.searchsorted with right=false.
+    ///
+    /// That index is just the count of entries below v, so the 16 entry case counts lanes
+    /// with one vector compare instead of branching through a binary search.
+    fn lowerBoundF32(sorted: []const f32, v: f32) usize {
+        if (sorted.len == 16) {
+            const V = @Vector(16, f32);
+            const vec: V = sorted[0..16].*;
+            const less = vec < @as(V, @splat(v));
+            const ones: @Vector(16, u8) = @splat(1);
+            const zeros: @Vector(16, u8) = @splat(0);
+            return @reduce(.Add, @select(u8, less, ones, zeros));
+        }
+        var lo: usize = 0;
+        var hi: usize = sorted.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (sorted[mid] < v) lo = mid + 1 else hi = mid;
+        }
+        return lo;
+    }
+
+    /// Nearest entry of an ascending table, ties going to the lower index, which is what
+    /// comfy_kitchen does. The table may contain duplicates, because rounding the levels to
+    /// whole numbers can collapse several codebook entries onto one value at a small s_rel.
+    fn nearestIndex(sorted: []const f32, v: f32) u8 {
+        const last = sorted.len - 1;
+        const pos = lowerBoundF32(sorted, v);
+        const lo_i = if (pos == 0) 0 else @min(pos - 1, last);
+        const hi_i = @min(pos, last);
+        const d_lo = @abs(v - sorted[lo_i]);
+        const d_hi = @abs(v - sorted[hi_i]);
+        return @intCast(if (d_hi < d_lo) hi_i else lo_i);
+    }
+
+    /// One scale group as a single vector. Every per-element step of the sweep does the same
+    /// thing to all 16 lanes, so the group is the natural unit to vectorize over.
+    const GroupVec = @Vector(w4a8_group_size, f32);
+    const GroupIdx = @Vector(w4a8_group_size, u8);
+
+    /// Halfway points between neighbouring levels, which are the boundaries a nearest-level
+    /// assignment decides on. The nearest level is then just the count of boundaries below
+    /// the value, so this replaces a lower bound search plus a distance comparison with one
+    /// count. Ties still fall to the lower level, since a value sitting exactly on a boundary
+    /// is not below it.
+    ///
+    /// This matches nearestIndex in exact arithmetic but not always in f32, because averaging
+    /// two levels rounds. A value within one ulp of a boundary can land on either side, which
+    /// changes about one code in a million by a single level and does not measurably change
+    /// the error. nearestIndex stays the reference definition and is what the dequantizer and
+    /// any table that is not 16 wide use.
+    fn levelMidpoints(levels: [16]f32) [15]f32 {
+        var mids: [15]f32 = undefined;
+        for (0..15) |j| mids[j] = (levels[j] + levels[j + 1]) * 0.5;
+        return mids;
+    }
+
+    /// Boundaries for the fixed codebook. Same for every group, so computed once.
+    const w4a8_codebook_mids: [15]f32 = levelMidpoints(w4a8_codebook);
+
+    /// Assign every lane to its nearest level, given that table's boundaries.
+    fn assignGroup(vals: GroupVec, mids: [15]f32) GroupIdx {
+        const ones: GroupIdx = @splat(1);
+        const zeros: GroupIdx = @splat(0);
+        var count: GroupIdx = @splat(0);
+        inline for (0..15) |j| {
+            const below = @as(GroupVec, @splat(mids[j])) < vals;
+            count += @select(u8, below, ones, zeros);
+        }
+        return count;
+    }
+
+    /// Largest finite magnitude in the group. Max does not depend on the order it is taken
+    /// in, so this matches a scalar loop exactly. NaN and infinity are masked to zero first;
+    /// both compare false against a finite bound, so one comparison covers them.
+    fn groupAmax(gv: GroupVec) f32 {
+        const av = @abs(gv);
+        const finite = av < @as(GroupVec, @splat(std.math.floatMax(f32)));
+        return @reduce(.Max, @select(f32, finite, av, @as(GroupVec, @splat(0.0))));
+    }
+
+    /// Quantize a range of rows. Two passes, because every group's s_rel is stored relative
+    /// to the row's s_channel, and s_channel is not known until every group has been seen.
+    /// group_scales is scratch owned by the caller, one f32 per group.
+    fn quantizeAsymW4a8Rows(
+        rotated: []const f32,
+        weight: []u8,
+        s_rel: []u8,
+        s_channel: []f32,
+        group_scales: []f32,
+        cols: usize,
+        start_row: usize,
+        end_row: usize,
+    ) void {
+        const gs_n = w4a8_group_size;
+        const groups_per_row = cols / gs_n;
+        const packed_cols = cols / 2;
+        const cb = w4a8_codebook;
+
+        for (start_row..end_row) |r| {
+            const row = rotated[r * cols ..][0..cols];
+            const row_scales = group_scales[r * groups_per_row ..][0..groups_per_row];
+
+            // Pass 1: settle each group's scale and track the row's peak decoded magnitude,
+            // which sets s_channel.
+            var max_shifted: f32 = 0.0;
+
+            for (0..groups_per_row) |g| {
+                const grp = row[g * gs_n ..][0..gs_n];
+                const gv: GroupVec = grp.*;
+
+                var gs: f32 = @max(groupAmax(gv), 1e-8);
+                // Dividing a vector does the same thing to each lane as dividing one value,
+                // so this matches the reference. It is not a multiply by a reciprocal.
+                var idx: [gs_n]u8 = assignGroup(gv / @as(GroupVec, @splat(gs)), w4a8_codebook_mids);
+
+                // Two refit passes: fit the scale to the levels just chosen, then choose
+                // levels again. comfy_kitchen uses two.
+                //
+                // The sums stay scalar and in lane order. Adding f32 in a different order
+                // gives a different total, which would change gs, and gs decides the stored
+                // s_rel byte.
+                for (0..2) |_| {
+                    var num: f32 = 0.0;
+                    var den: f32 = 0.0;
+                    for (grp, 0..) |v, j| {
+                        const c = cb[idx[j]];
+                        num += v * c;
+                        den += c * c;
+                    }
+                    gs = @max(num / @max(den, 1e-8), 1e-8);
+                    idx = assignGroup(gv / @as(GroupVec, @splat(gs)), w4a8_codebook_mids);
+                }
+
+                row_scales[g] = gs;
+                // s_channel is taken from the magnitudes here, before the final assignment
+                // against the whole number grid. The order matters.
+                for (idx) |j| max_shifted = @max(max_shifted, @abs(cb[j] * gs));
+            }
+
+            const sc: f32 = @max(max_shifted / 127.0, 1e-8);
+            s_channel[r] = sc;
+
+            // Pass 2: store s_rel as fp8, rebuild the level grid, assign, and pack.
+            for (0..groups_per_row) |g| {
+                const gv: GroupVec = row[g * gs_n ..][0..gs_n].*;
+
+                // Read the fp8 back so the grid is built from what a loader will see.
+                const s_rel_byte = f32_to_fp8_e4m3(row_scales[g] / sc);
+                s_rel[r * groups_per_row + g] = s_rel_byte;
+                const s_rel_dec = fp8_e4m3_to_f32(s_rel_byte);
+
+                var levels: [16]f32 = undefined;
+                for (cb, 0..) |c, j| {
+                    levels[j] = std.math.clamp(roundHalfToEven(c * s_rel_dec), -127.0, 127.0);
+                }
+
+                const idx: [gs_n]u8 = assignGroup(gv / @as(GroupVec, @splat(sc)), levelMidpoints(levels));
+
+                // Element 2k goes in the low nibble of byte k, 2k+1 in the high nibble. The
+                // nibble is an unsigned codebook index from 0 to 15, so no sign handling.
+                const base = g * gs_n;
+                for (0..gs_n / 2) |p| {
+                    const flat = base + 2 * p;
+                    weight[r * packed_cols + flat / 2] = idx[2 * p] | (idx[2 * p + 1] << 4);
+                }
+            }
+        }
     }
 
     // -------------------------------------------------------------------------

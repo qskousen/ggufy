@@ -1,0 +1,7 @@
+{
+  "rows": 16,
+  "cols": 6144,
+  "group_size": 16,
+  "convrot_groupsize": 256,
+  "fixed_lut": true
+}
