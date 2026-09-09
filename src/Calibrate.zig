@@ -93,6 +93,11 @@ pub const Options = struct {
     /// names key the cache.
     dit_path: []const u8,
     text_encoder_path: []const u8,
+    /// SDXL's second text tower (CLIP-G). Empty means "look in `text_encoder_path`",
+    /// which is what a bundled SD checkpoint wants. See `Divergence.Options` for why
+    /// a DiT-only container cannot supply it.
+    text_encoder_2_path: []const u8 = "",
+    explicit_text_encoder_2: bool = false,
     vae_path: []const u8,
     /// Where the cache is written.
     output_path: []const u8,
@@ -227,6 +232,11 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, opts: Options, set: PromptSet) !S
         .vram_budget = opts.vram_budget,
         .dit_path = opts.dit_path,
         .text_encoder_path = opts.text_encoder_path,
+        .text_encoder_2_path = if (opts.text_encoder_2_path.len > 0)
+            opts.text_encoder_2_path
+        else
+            opts.text_encoder_path,
+        .explicit_text_encoder_2 = opts.explicit_text_encoder_2,
         .vae_path = opts.vae_path,
         .cancel = &cancel,
     };
@@ -240,8 +250,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, opts: Options, set: PromptSet) !S
     // avoid.
     if (opts.backend == .vulkan) {
         std.log.warn(
-            "backend 'vulkan': the activation probe has no Vulkan call site yet, so this " ++
-                "capture will miss the GEMMs that run on the device. Use --backend cpu or cuda.",
+            "backend 'vulkan': the DiT capture forces the f32 GEMM path, because the " ++
+                "cooperative-matrix fp8 fast path bypasses the probe's choke point and would " ++
+                "feed f16 activations. Coverage is complete; the run is just slower.",
             .{},
         );
     }
@@ -255,7 +266,15 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, opts: Options, set: PromptSet) !S
     // whole cache is defined as. What could be recorded there is a W4A4-shaped
     // number, and filing it as a weight-only statistic would silently corrupt every
     // §8 search that reads the cache (ACTIVATION_AWARE.md hygiene rule 4).
-    if (opts.backend.isCuda()) {
+    //
+    // ⚠️ **krea2 only, and the family test is load-bearing rather than tidiness.**
+    // `session.dit` is the krea2 model set; on an SD-family session those fields are
+    // never initialized, so reading them is not a wrong answer but a segfault — which
+    // is exactly how this was found, the first time `calibrate` was pointed at an SD
+    // checkpoint (2026-08-04). The guard is also unnecessary there: `sd_unet_cuda`'s
+    // GEMM switch is {f32, f16, bf16}, so an int8/int4 SD UNet cannot reach a CUDA
+    // capture at all — it fails earlier with `UnsupportedDType`.
+    if (opts.backend.isCuda() and session.family() == .krea2) {
         const dt = session.dit.blocks[0].attn.wq.dtype;
         if (dt == .i8 or dt == .i4) {
             std.log.err(
@@ -334,10 +353,40 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, opts: Options, set: PromptSet) !S
         CalibrationCache.validate(&cache, .{
             .model_hash = &model_hash,
             .checkpoint = &ck,
+            // The probe keys layers by the name the model uses; a bundled SD
+            // checkpoint stores those same tensors prefixed. Ask the session which
+            // prefix it opened the denoiser under rather than guessing.
+            .denoiser_prefix = session.denoiserPrefix(),
         }, &diag) catch |err| {
             std.log.err("the cache just written to '{s}' does not validate: {s}", .{ opts.output_path, diag.msg });
             return err;
         };
+
+        // `validate` checks that every cached layer is in the checkpoint. This is the
+        // other direction: how much of the denoiser the capture actually saw. A backend
+        // that quietly declines to probe some GEMMs still writes a cache that passes
+        // every check above, and the consumer then quantizes the un-captured tensors
+        // blind while the report says the capture succeeded. Measured once: an f16
+        // activation stream on the CUDA SD UNet dropped 733 of 834 layers this way,
+        // and the missing ones were the whole transformer stack.
+        const prefix = session.denoiserPrefix();
+        var want: usize = 0;
+        var got: usize = 0;
+        for (ck.names()) |full| {
+            if (!std.mem.startsWith(u8, full, prefix)) continue;
+            const v = ck.get(full) orelse continue;
+            if (v.info.shape.rank < 2) continue;
+            want += 1;
+            const bare = full[prefix.len..];
+            if (cache.bucket(bare, 0)) |_| got += 1 else |_| {}
+        }
+        if (want > 0 and got * 10 < want * 9) {
+            std.log.warn(
+                "capture covered {d} of {d} denoiser matrix tensors ({d}%) — the rest were never probed " ++
+                    "and any tensor missing here is quantized blind",
+                .{ got, want, got * 100 / want },
+            );
+        }
     }
 
     var tokens: u64 = 0;

@@ -98,6 +98,12 @@ fn formatDuration(ns: u64, buf: []u8) []const u8 {
 /// such a file the flags are not only unnecessary but misleading: TensorPencil loads
 /// the conditioner and decoder out of the same container.
 ///
+/// ⚠️ **SD1.5 and SDXL spell the text encoder differently**, and only the SD1.5
+/// spelling was recognized here until 2026-08-02: SD1.5 nests CLIP under
+/// `cond_stage_model.`, while SDXL carries two towers under `conditioner.embedders.`.
+/// A bundled SDXL checkpoint therefore read as *not* self-contained and demanded
+/// `-e`/`-v` it did not need. Both VAE spellings are the same (`first_stage_model.`).
+///
 /// Cheap: only the header is parsed. A GGUF (ggufy's own model-only output) never
 /// qualifies, which is correct — a quantized UNet does need the original checkpoint
 /// for CLIP and the VAE.
@@ -107,7 +113,8 @@ fn checkpointIsSelfContained(io: std.Io, allocator: std.mem.Allocator, arena_all
     var has_clip = false;
     var has_vae = false;
     for (f.tensors.items) |t| {
-        if (std.mem.startsWith(u8, t.name, "cond_stage_model.")) has_clip = true;
+        if (std.mem.startsWith(u8, t.name, "cond_stage_model.") or
+            std.mem.startsWith(u8, t.name, "conditioner.embedders.")) has_clip = true;
         if (std.mem.startsWith(u8, t.name, "first_stage_model.")) has_vae = true;
         if (has_clip and has_vae) return true;
     }
@@ -171,6 +178,8 @@ fn runCalibrate(
     const opts = calib.Options{
         .dit_path = path,
         .text_encoder_path = text_encoder,
+        .text_encoder_2_path = args.@"text-encoder-2" orelse "",
+        .explicit_text_encoder_2 = args.@"text-encoder-2" != null,
         .vae_path = vae,
         .output_path = out_path,
         .backend = backend,
@@ -238,6 +247,7 @@ fn runVerdict(
         .reference = path,
         .candidates = cands.items,
         .lpips_weights = args.lpips,
+        .diff_maps = args.@"diff-maps",
     }) catch |err| {
         std.log.err("verdict failed: {t}", .{err});
         return err;
@@ -333,16 +343,45 @@ fn runDivergence(
 
     const res = args.resolution orelse 512;
     const steps = args.steps orelse 8;
+
+    // The reference trajectory's sampler and sigma ladder. Both default to what
+    // every level-2 run before 2026-08-04 used (euler, family-default schedule), so
+    // omitting them reproduces the older measurements exactly.
+    const sampler_kind = if (args.sampler) |name|
+        dvg.SamplerKind.parse(name) orelse {
+            std.log.err("Unknown sampler '{s}'. Use one of: euler, dpmpp_2m_sde, dpmpp_2m_sde_heun", .{name});
+            return error.InvalidArgument;
+        }
+    else
+        .euler;
+    const scheduler_kind: ?dvg.Scheduler = if (args.scheduler) |name|
+        dvg.Scheduler.parse(name) orelse {
+            std.log.err(
+                "Unknown scheduler '{s}'. Use one of: normal, karras, exponential, " ++
+                    "sgm_uniform, simple, ddim_uniform, beta, linear_quadratic, kl_optimal",
+                .{name},
+            );
+            return error.InvalidArgument;
+        }
+    else
+        null;
     const opts = dvg.Options{
         .io = io,
         .reference = path,
         .candidates = cands.items,
         .text_encoder_path = text_encoder,
+        .text_encoder_2_path = args.@"text-encoder-2" orelse "",
+        .explicit_text_encoder_2 = args.@"text-encoder-2" != null,
         .vae_path = vae,
         .prompts = set.prompts,
         .width = res,
         .height = res,
         .steps = steps,
+        .cfg = args.cfg orelse 1.0,
+        .negative = args.negative orelse "",
+        .sampler = sampler_kind,
+        .scheduler = scheduler_kind,
+        .free_running = args.@"free-running" != 0,
         .seed = args.seed orelse 0,
         .backend = backend,
         .log = stdout,
@@ -789,6 +828,7 @@ pub fn main(init: std.process.Init) !void {
         \\-S, --shapes                   With names: emit {"name":…,"shape":[…]} objects instead of bare names, for architectures detected by shape.
         \\-b, --backend <BACKEND>        With calibrate: compute backend (cpu, vulkan, zig-cuda, cuda). Default cpu.
         \\-e, --text-encoder <FILENAME>  With calibrate: path to the text encoder checkpoint (required).
+        \\    --text-encoder-2 <FILENAME> With calibrate/divergence on SDXL: the second text tower (CLIP-G). Defaults to --text-encoder, which is right when that is a bundled checkpoint carrying both.
         \\-v, --vae <FILENAME>           With calibrate: path to the VAE checkpoint (required).
         \\-r, --resolution <INT>         With calibrate: square capture resolution in pixels, multiple of 16. Default 512.
         \\-p, --prompts <FILENAME>       With calibrate: prompt-set JSON ({"id":…,"prompts":[…]}). Default: the built-in set.
@@ -809,6 +849,10 @@ pub fn main(init: std.process.Init) !void {
         \\    --gptq-holdout <INT>       With --gptq: hold 1 row in N back from the Hessian and measure on those. Default 3; 2 splits the sample evenly.
         \\    --calib-eval <FILENAME>    With --gptq: score against this second cache (same checkpoint, disjoint prompts) instead of a held-out row split. The number that decides whether GPTQ generalizes.
         \\    --gptq-train-rows <INT>    With --gptq: fit the Hessian on at most this many token rows (evenly subsampled). Sweep it to see how the win scales with calibration data.
+        \\    --adaround                 With convert --gptq: pick the level by adaptive rounding (joint gradient descent over all weights) instead of GPTQ's greedy one-pass sweep. Same grid, same bytes, same tensors — only the up/down decision differs.
+        \\    --adaround-iters <INT>     With --adaround: optimizer steps per layer. Default 200. Cost is linear in it, and `lr x iters` is the total distance a weight can travel, so cutting it without raising --adaround-lr degenerates the arm toward round-to-nearest.
+        \\    --adaround-lr <FLOAT>      With --adaround: Adam step size. Default 1.0. Above ~2 the optimizer diverges (measured 52x worse than GPTQ at 4.0).
+        \\    --calib-rows <FILENAME>    With convert --gptq: take the Hessian's activation rows from this cache while -C keeps supplying the imatrix. Lets the compensation be fitted against activations captured from the QUANTIZED model without also moving the grid.
         \\    --convrot-group <INT>      With sensitivity: ConvRot rotation group for the rotating arms. Default 64 (the harness's); pass 256 to measure what convert actually writes.
         \\    --candidates <NAME>        With verdict: comma-separated candidate image dirs (or files) to compare against the reference. With divergence: candidate DiT checkpoints.
         \\    --per-tensor               With divergence: quantize ONE tensor at a time (format from -F) and measure the whole model's velocity error — the arm that checks whether level 1 ranks layers the way the model does. Refuses --candidates.
@@ -821,8 +865,14 @@ pub fn main(init: std.process.Init) !void {
         \\    --patch-dtype <NAME>       With --per-tensor: dtype the substituted tensor is written back as, "f32" (default, exact) or "bf16". bf16 is what makes this arm runnable on a GPU — the GPU DiTs need one weight class per model — at the cost of ~0.2% extra rounding.
         \\    --emit-sensitivities <FILENAME>  With --per-tensor: write a sensitivities JSON from the MEASURED per-layer damage, scored by src/LadderScore.zig (one bit per doubling of damage above the routable median — never a percentile rank), for convert to route on. This is the cheap form of the brute-force per-layer method the hand-built arch files came from.
         \\    --sets <NAME>              With --per-tensor: measure SETS of tensors instead of one at a time, as "label:file[,label:file...]" where each file lists tensor names. One arm per set, every member quantized together — the direct test of whether per-layer damages compose.
+        \\    --cfg <FLOAT>              With divergence: classifier-free guidance scale. Default 1.0 (one forward per point). ⚠️ 1.0 is NOT the operating point users render at — SD/SDXL want ~7 — and a level-2 number taken at 1.0 measures only the conditional branch, so it cannot see an error that guidance amplifies. Doubles the cost.
+        \\    --negative <TEXT>          With divergence: negative prompt for --cfg != 1. Match whatever the level-3 renders used, or the two levels are not comparable.
+        \\    --sampler <NAME>           With divergence: sampler for the REFERENCE trajectory (euler, dpmpp_2m_sde, dpmpp_2m_sde_heun). Default euler. Candidates are teacher-forced and never step, so this decides which latents are measured, not how an arm is scored at one.
+        \\    --scheduler <NAME>         With divergence: sigma ladder (normal, karras, exponential, sgm_uniform, simple, ddim_uniform, beta, linear_quadratic, kl_optimal). Default: the family's own. karras concentrates steps at low sigma, where quantization damage is largest, so it changes the mix of points a mean is taken over.
+        \\    --free-running             With divergence: let each arm walk its OWN trajectory from the same initial noise and measure how far its latent drifts, instead of teacher-forcing it onto the reference's latents. Same cost. This is the mode to use when the question is "how close to the original render does it stay" — teacher-forcing removes exactly that compounding by construction. Read the `final` column: it is the latent the VAE decodes.
         \\    --html <FILENAME>          With verdict: also write an HTML contact sheet here.
         \\    --lpips <FILENAME>         With verdict: LPIPS weights (AlexNet, from TensorPencil's tools/gen_lpips_fixtures.py). Adds the LPIPS column - the metric that tracks human judgement.
+        \\    --diff-maps <DIR>          With verdict: write a per-image difference heatmap into this directory (one PNG per arm per image). Shows WHERE an arm diverged: displacement paints the silhouettes, texture loss paints the interior — a distinction no scalar metric makes.
         \\<COMMAND>    Specify a command: header, tree, metadata, convert, template, calibrate, sensitivity, verdict, divergence, heterogeneity, version
         \\<FILENAME>   The file to use for input (not required for the version command)
     );
@@ -838,6 +888,8 @@ pub fn main(init: std.process.Init) !void {
         .NAME = clap.parsers.string,
         .SEED = clap.parsers.int(u64, 10),
         .BACKEND = clap.parsers.string,
+        .FLOAT = clap.parsers.float(f32),
+        .TEXT = clap.parsers.string,
     };
 
     // Initialize our diagnostics, which can be used for reporting useful errors.
@@ -939,6 +991,14 @@ pub fn main(init: std.process.Init) !void {
         std.log.err("--gptq needs a calibration cache: -C/--calib <path>", .{});
         return;
     }
+    if (res.args.adaround != 0 and !(want_gptq and command == .convert)) {
+        std.log.err("--adaround selects which algorithm --gptq uses to pick the level; pass both", .{});
+        return;
+    }
+    if (res.args.@"calib-rows" != null and !(want_gptq and command == .convert)) {
+        std.log.err("--calib-rows only means anything with convert --gptq: it redirects where the Hessian's rows come from", .{});
+        return;
+    }
     if (want_gptq and command == .convert and filetype == .gguf) {
         std.log.err(
             "--gptq applies to the int4/int8 cluster formats, which are safetensors-only; " ++
@@ -971,6 +1031,10 @@ pub fn main(init: std.process.Init) !void {
         .arch_override = arch_override,
         .stochastic_rounding = res.args.@"stochastic-rounding",
         .gptq = want_gptq and command == .convert,
+        .gptq_rows_path = res.args.@"calib-rows",
+        .adaround = res.args.adaround != 0 and command == .convert,
+        .adaround_iters = res.args.@"adaround-iters",
+        .adaround_lr = res.args.@"adaround-lr",
     };
 
     var arena = std.heap.ArenaAllocator.init(allocator);

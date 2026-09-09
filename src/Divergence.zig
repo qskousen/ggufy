@@ -68,6 +68,12 @@ const LadderScore = @import("LadderScore.zig");
 
 pub const Backend = tp.pipeline.Backend;
 pub const Format = ph.Format;
+/// Re-exported so the CLI can name a sampler and a sigma ladder without importing
+/// the full TensorPencil module (it links `tp_core` only). Both carry TensorPencil's
+/// own `parse`, which keeps the CLI spellings identical to `tp generate`'s — the two
+/// have to match or a level-2 run cannot be pointed at a level-3 operating point.
+pub const SamplerKind = tp.sampler.Kind;
+pub const Scheduler = tp.sampler.Scheduler;
 
 /// How far one arm's velocity prediction sits from the reference's, at one step.
 ///
@@ -158,6 +164,24 @@ pub const Report = struct {
     resolution: [2]usize,
     seed: u64,
     backend: []const u8,
+    /// The operating point, recorded because it is not recoverable from the numbers
+    /// and decides what the run is comparable to. `--cfg 1.0` measures only the
+    /// conditional branch; `karras` concentrates points at low sigma. A report that
+    /// omitted these is a table nobody can place.
+    cfg: f32,
+    sampler: []const u8,
+    scheduler: []const u8,
+    /// The negative prompt, which is part of the operating point exactly when
+    /// `cfg != 1` — it is encoded once and conditions the unconditional branch of
+    /// every guided step, so two runs that differ only here are not comparable.
+    /// Recorded for the same reason as `cfg` itself, and because the level-3 render
+    /// scripts do pass one: a level-2 run left at the default empty string is at a
+    /// *different* operating point than the images it is being compared against, and
+    /// nothing in the numbers says so.
+    negative: []const u8 = "",
+    /// Whether the arms walked their own trajectories. Recorded because the two modes
+    /// measure different quantities and their figures are not comparable.
+    free_running: bool = false,
     arms: []ArmResult,
 
     pub fn steps(self: *const Report) usize {
@@ -178,6 +202,19 @@ pub const Options = struct {
     /// reference on the reference's own trajectory.
     candidates: []const []const u8,
     text_encoder_path: []const u8,
+    /// SDXL's **second** text tower (CLIP-G). Empty means "look in
+    /// `text_encoder_path`", which is what a bundled SD checkpoint wants.
+    ///
+    /// ⚠️ This is not optional polish on SDXL, it is what makes a candidate arm
+    /// loadable at all. TensorPencil resolves `conditioner2` from the *denoiser's own
+    /// container* first and only then from this path — and every GGUF ggufy writes is
+    /// UNet-only (no `conditioner.` prefix at all), so a GGUF arm supplies neither
+    /// tower. The reference pass reads both out of the bundled checkpoint and
+    /// succeeds, so the failure shows up only once the first candidate loads.
+    text_encoder_2_path: []const u8 = "",
+    /// Set when the caller named `text_encoder_2_path` outright, so a path that
+    /// cannot be opened is an error rather than a silent fallback.
+    explicit_text_encoder_2: bool = false,
     vae_path: []const u8,
     /// Prompts to sample trajectories from. Each contributes `steps` points.
     prompts: []const []const u8,
@@ -194,6 +231,43 @@ pub const Options = struct {
     /// velocity, which is what a user running CFG actually gets.
     cfg: f32 = 1.0,
     negative: []const u8 = "",
+    /// Which sampler walks the **reference** trajectory. Candidates never step —
+    /// they are teacher-forced at the snapshots — so this changes only *which*
+    /// latents get measured, never how a candidate is scored at one.
+    ///
+    /// ⚠️ It still matters, for the same reason `shift` does: a level-2 number is
+    /// only comparable to a level-3 verdict if both visit the same trajectory
+    /// family. An SDE sampler re-injects noise every step, so its latents sit at a
+    /// different place in the distribution than Euler's at the same sigma.
+    sampler: tp.sampler.Kind = .euler,
+    /// Which sigma ladder. `null` is the family default (`simple` for SD), which is
+    /// what every measurement before 2026-08-04 used. This is the bigger of the two
+    /// knobs: `karras` concentrates steps at low sigma, where quantization damage is
+    /// largest, so it changes the *mix* of points a mean is taken over.
+    scheduler: ?tp.sampler.Scheduler = null,
+    /// SDE noise level and multiplier; ComfyUI's defaults. Read only when `sampler`
+    /// is an SDE variant.
+    sde_eta: f64 = 1.0,
+    sde_s_noise: f64 = 1.0,
+    /// Let each candidate walk its **own** trajectory from the same initial noise and
+    /// measure how far its latent drifts from the reference's, instead of
+    /// teacher-forcing it onto the reference's latents and scoring one-step velocity
+    /// error.
+    ///
+    /// ⚠️ **The two answer different questions, and the default answers the wrong one
+    /// if the goal is "reproduce the original render".** Teacher-forcing resets the
+    /// latent every step, so it measures per-step weight error with the compounding
+    /// deliberately removed. That is the right instrument for isolating a *mechanism*
+    /// — it is why §8A's gain is visible at all — and the wrong one for ranking
+    /// *candidates*: quantization moves the trajectory, and an arm that predicts
+    /// slightly worse everywhere can still land somewhere quite different. Measured
+    /// 2026-08-04, teacher-forced divergence mis-ranked four SDXL arms against their
+    /// rendered images, and the two policies it separated at |t| 10.9 tied in pixels.
+    ///
+    /// Free-running measures the compounding directly at the same cost — one forward
+    /// per step per arm — and its **final** point is the latent the VAE decodes, so it
+    /// is a pixel-distance proxy with no decode and no image metrics.
+    free_running: bool = false,
     backend: Backend = .cpu,
     vram_budget: u64 = 0,
     callbacks: cb.CaptureCallbacks = .{},
@@ -232,6 +306,15 @@ fn baseOpts(opts: Options, dit_path: []const u8, cancel: *std.atomic.Value(bool)
         .vram_budget = opts.vram_budget,
         .dit_path = dit_path,
         .text_encoder_path = opts.text_encoder_path,
+        // Falling back to the primary encoder path is the bundled-checkpoint case and
+        // covers every SDXL run driven the way the SD1.5 sweeps were (`-e $ckpt`).
+        // TensorPencil only opens this when the family is SDXL, so it is inert
+        // elsewhere, and a *defaulted* path that does not open is tolerated there.
+        .text_encoder_2_path = if (opts.text_encoder_2_path.len > 0)
+            opts.text_encoder_2_path
+        else
+            opts.text_encoder_path,
+        .explicit_text_encoder_2 = opts.explicit_text_encoder_2,
         .vae_path = opts.vae_path,
         .cancel = cancel,
     };
@@ -306,6 +389,16 @@ const Ref = struct {
     /// `prompts × steps`, prompt-major.
     snaps: []Snapshot,
     steps: usize,
+    /// The reference's latent **after the last step**, one per prompt — the state the
+    /// VAE decodes. `snaps` holds each step's *input*, so without this the endpoint,
+    /// which is the only state a free-running arm is finally judged on, is missing.
+    /// Empty unless `free_running`.
+    finals: [][]f32 = &.{},
+    /// `sigmas[0]` as it was before `SdeStepper.init` offset it. A free-running arm
+    /// must scale its initial latent by exactly what the reference did, or the two
+    /// trajectories start apart and every divergence below is measured from a
+    /// difference the weights did not cause.
+    sigma0_unoffset: f32 = 0,
 
     fn deinit(self: *Ref, gpa: std.mem.Allocator) void {
         for (self.conds) |*c| c.deinit(gpa);
@@ -316,6 +409,8 @@ const Ref = struct {
             gpa.free(s.v);
         }
         gpa.free(self.snaps);
+        for (self.finals) |f| gpa.free(f);
+        if (self.finals.len > 0) gpa.free(self.finals);
         self.* = undefined;
     }
 };
@@ -326,7 +421,7 @@ fn captureReference(
     gpa: std.mem.Allocator,
     sess: *tp.pipeline.Session,
     opts: Options,
-    sigmas: []const f32,
+    sigmas: []f32,
     lat_h: usize,
     lat_w: usize,
     cancel: *std.atomic.Value(bool),
@@ -334,11 +429,25 @@ fn captureReference(
     // Family-aware: krea2's Wan VAE has 16 latent channels, SD's AutoencoderKL 4.
     const lat_len = sess.latentChannels() * lat_h * lat_w;
 
+    // ⚠️ `SdeStepper.init` mutates `sigmas[0]` (`offsetFirstSigma`), and ComfyUI
+    // scales the initial latent by the sigma *before* that offset. Each prompt here
+    // is an independent trajectory that re-inits the stepper, so without capturing
+    // the unoffset value now, prompt 0 would scale by one number and prompts 1..n by
+    // another — a difference in the *inputs* of a measurement whose entire claim is
+    // that the inputs are identical. The offset is idempotent and a no-op for the SD
+    // family (`.eps`); it only bites on krea2, whose ladder starts at exactly 1.0.
+    const sigma0_unoffset = sigmas[0];
+
     var ref: Ref = .{
         .conds = try gpa.alloc(tp.pipeline.Cond, opts.prompts.len),
         .neg = null,
         .snaps = try gpa.alloc(Snapshot, opts.prompts.len * opts.steps),
         .steps = opts.steps,
+        .finals = if (opts.free_running) try gpa.alloc([]f32, opts.prompts.len) else &.{},
+        .sigma0_unoffset = sigma0_unoffset,
+    };
+    if (opts.free_running) for (ref.finals) |*f| {
+        f.* = &.{};
     };
     // Partial construction has to be unwound by hand: a Cond and a Snapshot both
     // own heap buffers, and this loop can fail (or be cancelled) halfway.
@@ -383,7 +492,31 @@ fn captureReference(
         // the flow-matching form on an SD arm starts every trajectory 0.23% off — which
         // is enough to move a render visibly, so it would move a divergence figure too.
         tp.sampler.fillNoise(x, opts.seed);
-        sess.scaleInitialNoise(x, sigmas[0]);
+        sess.scaleInitialNoise(x, sigma0_unoffset);
+
+        // Per prompt, not per run: an SDE stepper carries `old_denoised` and a
+        // Brownian path, and both belong to one trajectory. Seeded from `opts.seed`
+        // like the latent, exactly as `generate` does — and because torchsde's tree
+        // is `halfway_tree` (fixed by the seed alone, independent of query order),
+        // every prompt walks a reproducible path.
+        //
+        // Ordered deliberately: after `scaleInitialNoise` (which wants the unoffset
+        // first sigma) and before `denoiser` (which caches a timestep per schedule
+        // entry, so it must see the final array). See `sampler.SdeStepper`.
+        var sde: ?tp.sampler.SdeStepper = if (opts.sampler == .euler) null else try .init(
+            gpa,
+            sigmas,
+            lat_len,
+            sess.parameterization(),
+            .{
+                .eta = opts.sde_eta,
+                .s_noise = opts.sde_s_noise,
+                .solver = if (opts.sampler == .dpmpp_2m_sde) .midpoint else .heun,
+                .seed = opts.seed,
+            },
+            opts.shift,
+        );
+        defer if (sde) |*s| s.deinit();
 
         t_enc = std.Io.Clock.real.now(opts.io).nanoseconds;
         var den = try sess.denoiser(gpa, ref.conds[pi], ref.neg, opts.cfg, lat_h, lat_w, sigmas);
@@ -414,9 +547,16 @@ fn captureReference(
                 .v = try gpa.dupe(f32, v),
             };
             snaps_ready = pi * opts.steps + i + 1;
-            tp.sampler.eulerStep(x, v, sigmas[i], sigmas[i + 1]);
+            // Only the REFERENCE walks; candidates are teacher-forced at the
+            // snapshots above and never step, so the sampler choice decides which
+            // latents get measured and nothing about how an arm is scored at one.
+            if (sde) |*s| try s.step(x, v, i) else tp.sampler.eulerStep(x, v, sigmas[i], sigmas[i + 1]);
             opts.callbacks.reportProgress(@intCast(pi), @intCast(opts.prompts.len), @intCast(i + 1), @intCast(opts.steps));
         }
+        // The endpoint, kept only for the free-running arm: `snaps` holds step
+        // *inputs*, so the state after the final step — the one the VAE decodes — is
+        // not among them.
+        if (opts.free_running) ref.finals[pi] = try gpa.dupe(f32, x);
     }
 
     return ref;
@@ -457,6 +597,85 @@ fn measureArm(
     }
 }
 
+
+/// Walk a candidate's **own** trajectory from the reference's initial noise and
+/// measure how far its latent has drifted at each step.
+///
+/// The contrast with `measureArm` is the whole point: there, every step is re-seeded
+/// from the reference's latent, so the numbers are per-step weight error with the
+/// compounding removed. Here nothing is re-seeded after the first sample, so what
+/// accumulates is exactly what a user sees — the quantized model drawing a slightly
+/// different picture.
+///
+/// Point `i` is the divergence of the state **after** step `i`, so the last point is
+/// the final latent, the one the VAE decodes. Point 0 is one step's worth of drift,
+/// not zero; the two trajectories are identical only before any step has run, which
+/// is what makes "pass the reference as its own candidate" a usable control (it must
+/// read exactly 0 everywhere).
+///
+/// ⚠️ Everything that must match the reference matches by construction: the same
+/// conditioning objects (encoded once, on the reference session), the same sigma
+/// ladder, the same seed for both the initial noise and the SDE's Brownian path, and
+/// the same unoffset first sigma for the initial scaling. A difference in any of
+/// those would show up here as drift the weights did not cause.
+fn measureArmFreeRunning(
+    gpa: std.mem.Allocator,
+    sess: *tp.pipeline.Session,
+    opts: Options,
+    ref: Ref,
+    sigmas: []f32,
+    lat_h: usize,
+    lat_w: usize,
+    cancel: *std.atomic.Value(bool),
+    out: []Point,
+) !void {
+    const channels = sess.latentChannels();
+    const positions = lat_h * lat_w;
+    const lat_len = channels * positions;
+
+    const x = try gpa.alloc(f32, lat_len);
+    defer gpa.free(x);
+    const v = try gpa.alloc(f32, lat_len);
+    defer gpa.free(v);
+
+    for (0..ref.conds.len) |pi| {
+        tp.sampler.fillNoise(x, opts.seed);
+        sess.scaleInitialNoise(x, ref.sigma0_unoffset);
+
+        var sde: ?tp.sampler.SdeStepper = if (opts.sampler == .euler) null else try .init(
+            gpa,
+            sigmas,
+            lat_len,
+            sess.parameterization(),
+            .{
+                .eta = opts.sde_eta,
+                .s_noise = opts.sde_s_noise,
+                .solver = if (opts.sampler == .dpmpp_2m_sde) .midpoint else .heun,
+                .seed = opts.seed,
+            },
+            opts.shift,
+        );
+        defer if (sde) |*sp| sp.deinit();
+
+        var den = try sess.denoiser(gpa, ref.conds[pi], ref.neg, opts.cfg, lat_h, lat_w, sigmas);
+        defer den.deinit(gpa);
+
+        for (0..ref.steps) |i| {
+            try den.predict(gpa, v, x, sigmas[i], cancel);
+            if (sde) |*sp| try sp.step(x, v, i) else tp.sampler.eulerStep(x, v, sigmas[i], sigmas[i + 1]);
+
+            // The reference's state after the same step: the next step's recorded
+            // input, or the stored endpoint on the last one.
+            const want = if (i + 1 < ref.steps)
+                ref.snaps[pi * ref.steps + i + 1].x
+            else
+                ref.finals[pi];
+            out[pi * ref.steps + i] = point(i, sigmas[i + 1], want, x, positions, channels);
+            opts.callbacks.reportProgress(@intCast(pi), @intCast(ref.conds.len), @intCast(i + 1), @intCast(ref.steps));
+        }
+    }
+}
+
 pub fn run(gpa: std.mem.Allocator, opts: Options) !Report {
     if (opts.candidates.len == 0) return error.NoCandidates;
     if (opts.prompts.len == 0) return error.NoPrompts;
@@ -479,12 +698,14 @@ pub fn run(gpa: std.mem.Allocator, opts: Options) !Report {
     // reference session is built first and the sigmas outlive it in the arena — every
     // arm must sample the identical ladder or the comparison means nothing.
     var ref: Ref = undefined;
-    var sigmas: []const f32 = undefined;
+    // Mutable because `SdeStepper.init` offsets the first sigma in place; the
+    // offset array is then the one every arm predicts at, which is the point.
+    var sigmas: []f32 = undefined;
     {
         const ref_opts = baseOpts(opts, opts.reference, &cancel);
         var sess = try tp.pipeline.Session.init(opts.io, gpa, ref_opts, opts.log);
         defer sess.deinit();
-        const sched = try sess.schedule(gpa, opts.steps, opts.shift);
+        const sched = try sess.scheduleWith(gpa, opts.steps, opts.shift, opts.scheduler);
         defer gpa.free(sched);
         sigmas = try arena.dupe(f32, sched);
         ref = try captureReference(gpa, sess, opts, sigmas, lat_h, lat_w, &cancel);
@@ -505,7 +726,11 @@ pub fn run(gpa: std.mem.Allocator, opts: Options) !Report {
         defer cand.deinit();
 
         const points = try arena.alloc(Point, ref.snaps.len);
-        try measureArm(gpa, cand, opts, ref, sigmas, lat_h, lat_w, &cancel, points);
+        if (opts.free_running) {
+            try measureArmFreeRunning(gpa, cand, opts, ref, sigmas, lat_h, lat_w, &cancel, points);
+        } else {
+            try measureArm(gpa, cand, opts, ref, sigmas, lat_h, lat_w, &cancel, points);
+        }
 
         arms[ai] = .{
             .name = try arena.dupe(u8, basename(cand_path)),
@@ -526,6 +751,11 @@ pub fn run(gpa: std.mem.Allocator, opts: Options) !Report {
         .resolution = .{ opts.width, opts.height },
         .seed = opts.seed,
         .backend = @tagName(opts.backend),
+        .cfg = opts.cfg,
+        .sampler = opts.sampler.label(),
+        .scheduler = if (opts.scheduler) |sc| @tagName(sc) else "family default",
+        .negative = opts.negative,
+        .free_running = opts.free_running,
         .arms = arms,
     };
 }
@@ -729,6 +959,11 @@ pub const TensorReport = struct {
     resolution: [2]usize,
     seed: u64,
     backend: []const u8,
+    /// See `Report` — the operating point, so the artifact says what it measured.
+    cfg: f32,
+    sampler: []const u8,
+    scheduler: []const u8,
+    negative: []const u8 = "",
     /// 0–2 controls, then one arm per tensor.
     controls: []TensorArm,
     arms: []TensorArm,
@@ -873,7 +1108,7 @@ pub fn runPerTensor(gpa: std.mem.Allocator, opts: Options, pt: PerTensor) !Tenso
     defer sess.deinit();
 
     // Family-dependent, so it comes from the session (see the whole-checkpoint arm).
-    const sched = try sess.schedule(gpa, opts.steps, opts.shift);
+    const sched = try sess.scheduleWith(gpa, opts.steps, opts.shift, opts.scheduler);
     defer gpa.free(sched);
     const sigmas = try arena.dupe(f32, sched);
 
@@ -1097,6 +1332,10 @@ pub fn runPerTensor(gpa: std.mem.Allocator, opts: Options, pt: PerTensor) !Tenso
         .resolution = .{ opts.width, opts.height },
         .seed = opts.seed,
         .backend = @tagName(opts.backend),
+        .cfg = opts.cfg,
+        .sampler = opts.sampler.label(),
+        .scheduler = if (opts.scheduler) |sc| @tagName(sc) else "family default",
+        .negative = opts.negative,
         .controls = controls.items,
         .arms = arms,
         // Detected from the DiT's own names rather than taken as a flag: this
@@ -1113,8 +1352,26 @@ pub fn runPerTensor(gpa: std.mem.Allocator, opts: Options, pt: PerTensor) !Tenso
 // Report
 // ---------------------------------------------------------------------------
 
+/// The last step's figure, averaged over prompts. For a free-running run this is the
+/// **final latent** — the state the VAE decodes — and it is the number that mode
+/// exists to produce. The mean over all steps is not: early steps have barely
+/// diverged, so it mostly reports how many steps were taken.
+pub fn finalRelL2(a: ArmResult) f64 {
+    var sum: f64 = 0;
+    var n: usize = 0;
+    for (a.points) |p| {
+        if (p.step + 1 != a.steps) continue;
+        sum += p.rel_l2;
+        n += 1;
+    }
+    return if (n == 0) 0 else sum / @as(f64, @floatFromInt(n));
+}
+
 pub fn writeMarkdown(w: *std.Io.Writer, report: *const Report) !void {
-    try w.writeAll("# Level 2 — one-pass velocity divergence\n\n");
+    try w.writeAll(if (report.free_running)
+        "# Level 2 — free-running trajectory divergence\n\n"
+    else
+        "# Level 2 — one-pass velocity divergence\n\n");
     try w.print("- reference: `{s}`\n", .{report.reference});
     try w.print("- {d}x{d}, {d} steps, seed {d}, backend {s}, {d} prompt{s} — **{d} points per arm**\n", .{
         report.resolution[0],  report.resolution[1],
@@ -1123,15 +1380,43 @@ pub fn writeMarkdown(w: *std.Io.Writer, report: *const Report) !void {
         if (report.prompts.len == 1) "" else "s",
         report.prompts.len * report.steps(),
     });
-    try w.writeAll(
-        "- **teacher-forced**: every arm predicts from the reference's own latent at each step, so\n" ++
-            "  the two models see identical inputs and no trajectory drift enters the numbers.\n",
-    );
+    try w.print("- sampler **{s}**, scheduler **{s}**, cfg **{d:.2}**\n", .{
+        report.sampler, report.scheduler, report.cfg,
+    });
+    // Only under guidance: at cfg 1.0 the negative branch is never run, so printing a
+    // prompt that had no effect would misdescribe the run in the other direction.
+    if (report.cfg != 1.0) try w.print("- negative prompt: {s}\n", .{
+        if (report.negative.len > 0) report.negative else "_(empty)_",
+    });
+    if (report.free_running) {
+        try w.writeAll(
+            "- **free-running**: each arm walks its OWN trajectory from the same initial noise, and\n" ++
+                "  every figure is how far its latent has drifted from the reference's. **Read the\n" ++
+                "  `final` column** — that is the latent the VAE decodes. The mean over steps mostly\n" ++
+                "  reports the step count, since early steps have barely diverged.\n",
+        );
+    } else {
+        try w.writeAll(
+            "- **teacher-forced**: every arm predicts from the reference's own latent at each step, so\n" ++
+                "  the two models see identical inputs and no trajectory drift enters the numbers. That\n" ++
+                "  isolates weight error and REMOVES the compounding a user actually sees;\n" ++
+                "  `--free-running` measures the latter.\n",
+        );
+    }
 
     try w.writeAll("\n## Arms\n\n");
-    try w.writeAll("| arm | mean rel L2 | mean cos | worst rel L2 |\n|---|---:|---:|---:|\n");
-    for (report.arms) |a| {
-        try w.print("| {s} | {d:.5} | {d:.6} | {d:.5} |\n", .{ a.name, a.meanRelL2(), a.meanCos(), a.worstRelL2() });
+    if (report.free_running) {
+        try w.writeAll("| arm | **final rel L2** | mean rel L2 | mean cos | worst rel L2 |\n|---|---:|---:|---:|---:|\n");
+        for (report.arms) |a| {
+            try w.print("| {s} | **{d:.5}** | {d:.5} | {d:.6} | {d:.5} |\n", .{
+                a.name, finalRelL2(a), a.meanRelL2(), a.meanCos(), a.worstRelL2(),
+            });
+        }
+    } else {
+        try w.writeAll("| arm | mean rel L2 | mean cos | worst rel L2 |\n|---|---:|---:|---:|\n");
+        for (report.arms) |a| {
+            try w.print("| {s} | {d:.5} | {d:.6} | {d:.5} |\n", .{ a.name, a.meanRelL2(), a.meanCos(), a.worstRelL2() });
+        }
     }
 
     try w.writeAll("\n## Per step (mean rel L2 across prompts)\n\n");
@@ -1199,6 +1484,14 @@ pub fn writeTensorMarkdown(w: *std.Io.Writer, report: *const TensorReport, l1: ?
         if (report.prompts.len == 1) "" else "s",
         report.prompts.len * report.steps(),
         report.arms.len,
+    });
+    try w.print("- sampler **{s}**, scheduler **{s}**, cfg **{d:.2}**\n", .{
+        report.sampler, report.scheduler, report.cfg,
+    });
+    // Only under guidance: at cfg 1.0 the negative branch is never run, so printing a
+    // prompt that had no effect would misdescribe the run in the other direction.
+    if (report.cfg != 1.0) try w.print("- negative prompt: {s}\n", .{
+        if (report.negative.len > 0) report.negative else "_(empty)_",
     });
     try w.writeAll(
         "- each arm quantizes **exactly one tensor** of the reference checkpoint (dequantized back\n" ++
@@ -1861,7 +2154,8 @@ test "the sensitivities emitter keeps magnitude, so a long tail routes as a long
         .arena = std.heap.ArenaAllocator.init(gpa),
         .reference = "r", .format = .q4_k, .convrot_group = 256, .patch_dtype = .f32,
         .prompts = &.{}, .sigmas = &.{ 1.0, 0.0 }, .resolution = .{ 256, 256 },
-        .seed = 0, .backend = "cpu", .controls = &.{}, .arms = arms[0..],
+        .seed = 0, .backend = "cpu", .cfg = 1.0, .sampler = "euler", .scheduler = "family default",
+        .controls = &.{}, .arms = arms[0..],
     };
     defer report.arena.deinit();
 
@@ -1940,7 +2234,8 @@ test "the emitted scale ignores tensors the converter protects structurally" {
         .arena = std.heap.ArenaAllocator.init(gpa),
         .reference = "r", .format = .q4_k, .convrot_group = 256, .patch_dtype = .f32,
         .prompts = &.{}, .sigmas = &.{ 1.0, 0.0 }, .resolution = .{ 256, 256 },
-        .seed = 0, .backend = "cpu", .controls = &.{}, .arms = arms[0..],
+        .seed = 0, .backend = "cpu", .cfg = 1.0, .sampler = "euler", .scheduler = "family default",
+        .controls = &.{}, .arms = arms[0..],
     };
     defer report.arena.deinit();
     const thr = LadderScore.upgradeThreshold(50, LadderScore.default_ladder_levels).?;

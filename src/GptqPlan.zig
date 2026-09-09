@@ -36,6 +36,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 const Gptq = @import("Gptq.zig");
+const AdaRound = @import("AdaRound.zig");
 const Imatrix = @import("Imatrix.zig");
 const CalibrationCache = @import("CalibrationCache.zig");
 const TensorClusters = @import("TensorClusters.zig");
@@ -60,13 +61,26 @@ pub const Summary = struct {
     too_narrow: usize = 0,
     /// The sweep itself failed. Should be zero; counted so it cannot hide.
     failed: usize = 0,
+    /// AdaRound only: the layer objective it reached, and round-to-nearest's, summed
+    /// over compensated tensors. Their ratio is the **in-sample** gain — a check that
+    /// the optimizer converged, never evidence that the model improved.
+    ar_obj_final: f64 = 0,
+    ar_obj_rtn: f64 = 0,
 };
+
+/// Which algorithm picks the level inside the grid §8A chose. Both minimize the
+/// same per-layer objective; GPTQ does it greedily in one pass, AdaRound jointly
+/// by gradient descent. Everything else about the conversion is identical, which
+/// is what makes them comparable at all.
+pub const Method = enum { gptq, adaround };
 
 pub const Plan = struct {
     gpa: std.mem.Allocator,
     cache: *const CalibrationCache.Cache,
     imatrix: *const Imatrix.Imatrix,
     damp: f32 = Gptq.default_damp,
+    method: Method = .gptq,
+    adaround: AdaRound.Params = .{},
     summary: Summary = .{},
 
     /// Compensated cluster codes for `t`, or null when policy or shape declines it
@@ -144,16 +158,32 @@ pub const Plan = struct {
         };
         defer h.deinit();
 
+        var ar = self.adaround;
+        var ar_stats: AdaRound.Stats = .{};
+        ar.stats = &ar_stats;
+        defer if (self.method == .adaround) {
+            // In-sample only, and reported as such: it says the optimizer reached a
+            // lower point than round-to-nearest, not that the model got better.
+            self.summary.ar_obj_final += ar_stats.obj_final;
+            self.summary.ar_obj_rtn += ar_stats.obj_rtn;
+        };
+
         const codes: types.ClusterCodes = switch (kind) {
             .int4 => blk: {
-                const c = Gptq.quantizeInt4(gpa, &h, f32_data, rows, cols, weights, pool, .{ .damp = self.damp }) catch {
+                const c = (switch (self.method) {
+                    .gptq => Gptq.quantizeInt4(gpa, &h, f32_data, rows, cols, weights, pool, .{ .damp = self.damp }),
+                    .adaround => AdaRound.quantizeInt4(gpa, &h, f32_data, rows, cols, weights, pool, ar),
+                }) catch {
                     self.summary.failed += 1;
                     return null;
                 };
                 break :blk .{ .weight = c.weight, .scale = c.scale };
             },
             .int8 => blk: {
-                const c = Gptq.quantizeInt8(gpa, &h, f32_data, rows, cols, weights, pool, .{ .damp = self.damp }) catch {
+                const c = (switch (self.method) {
+                    .gptq => Gptq.quantizeInt8(gpa, &h, f32_data, rows, cols, weights, pool, .{ .damp = self.damp }),
+                    .adaround => AdaRound.quantizeInt8(gpa, &h, f32_data, rows, cols, weights, pool, ar),
+                }) catch {
                     self.summary.failed += 1;
                     return null;
                 };

@@ -321,6 +321,22 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(gptq_test).step);
 
+    // Adaptive rounding: the same objective as GPTQ solved jointly instead of
+    // greedily. Its tests assert the optimizer actually beats RTN in-sample,
+    // which is the precondition for any downstream number meaning anything.
+    const adaround_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/AdaRound.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "TensorPencil", .module = tp },
+                .{ .name = "tp_core", .module = tp_core },
+            },
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(adaround_test).step);
+
     // §8C convert-side policy: reads activation rows out of a calibration cache,
     // so it needs the umbrella like the other cache consumers.
     const gptq_plan_test = b.addTest(.{
@@ -432,13 +448,21 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "ggml.h", .module = ggml_h_module },
+                // ⚠️ Merge note (2026-08-02): this target arrived from master, where ggml is
+                // still vendored, and imported `ggml.h` + called `ggml.link`. Phase 0 of the
+                // activation-aware work deleted `vendor/ggml`, `build_ggml.zig` and
+                // `src/ggml_bindings.zig` and consumes ggml through TensorPencil instead, so
+                // those two references dangled and only `zig build test` caught it (`zig build
+                // cli` links a different module graph). The branch's equivalent is tp_core plus
+                // the umbrella, matching `convert_test` above — which is the right shape here
+                // anyway, since Safetensor.zig imports Convert.zig.
+                .{ .name = "tp_core", .module = tp_core },
+                .{ .name = "TensorPencil", .module = tp },
                 // Safetensor.zig imports Convert.zig, which imports build_options.
                 .{ .name = "build_options", .module = options_mod },
             },
         }),
     });
-    ggml.link(b, safetensor_test, target, optimize);
     test_step.dependOn(&b.addRunArtifact(safetensor_test).step);
 
     const precision_metrics_test = b.addTest(.{

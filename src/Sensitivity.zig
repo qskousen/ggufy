@@ -647,10 +647,72 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, opts: Options) !Report {
         null;
     defer if (imat) |*im| im.deinit();
 
+    // ⚠️ **The cache keys layers by the name TensorPencil's probe tagged, which is
+    // relative to the model it loaded; a *bundled* checkpoint prefixes the same
+    // tensor.** SDXL captures `input_blocks.4.1...attn1.to_q.weight` while the file on
+    // disk holds `model.diffusion_model.input_blocks.4.1...`. Every other consumer of a
+    // cache already handles this — `Imatrix.get` and `GptqPlan` both compare through
+    // `imagearch.stripPrefix` — but this harness looked the bare name up directly and
+    // so **could not run on any bundled SD-family checkpoint at all**, which is every
+    // SD1.5/SDXL checkpoint in normal use. Found 2026-08-05 when the cheapest
+    // diagnostic in the ladder turned out to be unavailable on SDXL.
+    //
+    // Built the same way round as `GptqPlan`: index the checkpoint by its *normalized*
+    // name, then look each cache layer up through the same normalization, so the two
+    // agree by construction rather than by matching prefix lists.
+    //
+    // ⚠️ **A bundled checkpoint also holds CLIP and the VAE, and the probe tags their
+    // matmuls too** — an SDXL capture is 834 layers of which 794 are the UNet and 40
+    // are the VAE decoder. Those are not tensors `convert` quantizes (it takes the
+    // denoiser), and scoring them would put confidently wrong rows in a sensitivities
+    // file rather than missing ones. This is the same trap `Divergence.selectTensors`
+    // hit and fixed by filtering to the denoiser's own prefix. So the index records
+    // which container each tensor came from and non-denoiser layers are skipped and
+    // counted, while a layer that resolves to *nothing* stays fatal — that one really
+    // is the wrong cache for this checkpoint.
+    const Resolved = struct { name: []const u8, denoiser: bool };
+    var resolved: std.StringHashMap(Resolved) = .init(gpa);
+    defer resolved.deinit();
+    for (ck.names()) |ck_name| {
+        // `stripPrefix` knows the denoiser containers (`model.diffusion_model.`,
+        // `model.`, `net.`); the sibling towers it deliberately does not, so they are
+        // matched here and marked.
+        const non_denoiser = [_][]const u8{ "first_stage_model.", "cond_stage_model.", "conditioner." };
+        var key = imagearch.stripPrefix(ck_name);
+        var is_denoiser = true;
+        for (non_denoiser) |p| {
+            if (std.mem.startsWith(u8, ck_name, p)) {
+                key = ck_name[p.len..];
+                is_denoiser = false;
+                break;
+            }
+        }
+        // Denoiser wins a collision: SDXL's VAE and UNet both carry a `decoder.`-ish
+        // subtree in some containers, and the denoiser is what level 1 is about.
+        if (resolved.get(key)) |prev| if (prev.denoiser or !is_denoiser) continue;
+        try resolved.put(key, .{ .name = ck_name, .denoiser = is_denoiser });
+    }
+    var skipped_non_denoiser: usize = 0;
+
     for (names[0..limit], 0..) |name, li| {
         if (opts.callbacks.isCancelled()) return error.Canceled;
 
-        const view = ck.get(name) orelse return error.LayerNotInCheckpoint;
+        const hit = resolved.get(name) orelse {
+            // A cache layer with no checkpoint tensor at all is a genuine mismatch
+            // (wrong checkpoint for this cache) and must stay fatal — but it used to
+            // fire on every bundled SD-family checkpoint for a reason that is not a
+            // mismatch, so say which layer before dying.
+            std.log.err(
+                "cache layer '{s}' matches no tensor in {s}",
+                .{ name, opts.model_path },
+            );
+            return error.LayerNotInCheckpoint;
+        };
+        if (!hit.denoiser) {
+            skipped_non_denoiser += 1;
+            continue;
+        }
+        const view = ck.get(hit.name) orelse return error.LayerNotInCheckpoint;
         if (view.info.shape.rank != 2) {
             // Level 1 is defined on a GEMM. A non-matrix tensor was tagged by
             // mistake; skipping it silently would leave a hole in the ranking,
@@ -843,6 +905,16 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, opts: Options) !Report {
             .{ limit, names.len },
         );
     }
+
+    // Said out loud rather than left to the layer count, because a capture taken over
+    // a full generate legitimately holds the VAE (and CLIP) as well as the denoiser —
+    // an SDXL cache is 834 layers of which 40 are the VAE decoder — and a reader
+    // comparing "834 captured" against "794 scored" should not have to guess why.
+    if (skipped_non_denoiser > 0) std.log.info(
+        "skipped {d} of {d} cache layers that belong to the VAE or text encoder rather " ++
+            "than the denoiser; level 1 scores the tensors convert quantizes",
+        .{ skipped_non_denoiser, names.len },
+    );
 
     const dt = ref_dtype orelse tp.DType.f32;
     return .{

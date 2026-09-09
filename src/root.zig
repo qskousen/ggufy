@@ -23,6 +23,7 @@ pub const sensitivity = @import("Sensitivity.zig");
 pub const imatrix = @import("Imatrix.zig");
 pub const equalize = @import("Equalize.zig");
 pub const gptq = @import("Gptq.zig");
+pub const adaround = @import("AdaRound.zig");
 pub const gptqPlan = @import("GptqPlan.zig");
 pub const verdict = @import("Verdict.zig");
 pub const divergence = @import("Divergence.zig");

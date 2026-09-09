@@ -13,6 +13,7 @@ const DataTransform = @import("DataTransform.zig");
 const CalibrationCache = @import("CalibrationCache.zig");
 const Imatrix = @import("Imatrix.zig");
 const GptqPlan = @import("GptqPlan.zig");
+const AdaRound = @import("AdaRound.zig");
 const LadderScore = @import("LadderScore.zig");
 const build_options = @import("build_options");
 
@@ -76,6 +77,29 @@ pub const ConvertOptions = struct {
     /// ~9% of layers regressing. Requires a cache, and costs several minutes on a
     /// large model. See `GptqPlan`.
     gptq: bool = false,
+    /// With `gptq`: take the Hessian's activation rows from this cache instead of
+    /// from `calibration_path`, which keeps supplying the imatrix. The two caches
+    /// must describe the same tensor names and widths; nothing requires them to
+    /// come from the same weights.
+    ///
+    /// What it is for: fitting the compensation against activations captured from
+    /// the *quantized* model rather than the original one, which is the difference
+    /// between AdaRound's symmetric and asymmetric reconstruction. Splitting the
+    /// sources is what keeps that a single-variable change — sharing one cache
+    /// would move the grid and the level together.
+    gptq_rows_path: ?[]const u8 = null,
+    /// Choose the level by adaptive rounding instead of GPTQ's greedy sweep. Same
+    /// grid, same bytes, same coverage — the two are interchangeable at this seam,
+    /// which is the only reason a pixel comparison between them means anything.
+    adaround: bool = false,
+    /// Overrides for the adaptive-rounding optimizer; null keeps `AdaRound.Params`'
+    /// defaults, which are the ones its tests pin against GPTQ.
+    adaround_iters: ?usize = null,
+    adaround_lr: ?f32 = null,
+    /// Run AdaRound's GEMMs on the CUDA backend. On by default when `adaround` is
+    /// set; the CPU path exists as the reference the device one is checked against,
+    /// not as a configuration anyone should choose.
+    adaround_gpu: bool = true,
     /// Optional GUI progress/cancel hooks.  No-ops when null.
     callbacks: cb.ConvertCallbacks = .{},
 };
@@ -1503,13 +1527,57 @@ fn writeSafetensors(
     // Stacks on §8A: the imatrix still picks each grid, GPTQ picks the level within
     // it. The cache stays open for the whole write, because unlike §8A this needs
     // the sampled activation rows and not just their per-channel energy.
+    const ar_defaults: AdaRound.Params = .{};
+    // AdaRound's two GEMMs are ~511/512 of its arithmetic, so they go to the device
+    // while the elementwise step stays here. Failing to reach the GPU is a warning,
+    // not an error: the CPU path is the same computation, just hours slower.
+    var ar_backend: ?*AdaRound.tp.gpu.cuda.Backend = null;
+    defer {
+        AdaRound.gpu_backend = null;
+        if (ar_backend) |b| b.deinit();
+    }
+    if (opts.adaround and opts.adaround_gpu) {
+        ar_backend = AdaRound.tp.gpu.cuda.Backend.initLibs(allocator) catch |err| blk: {
+            std.log.warn("AdaRound: no CUDA backend ({s}); falling back to CPU, which is ~100x slower", .{@errorName(err)});
+            break :blk null;
+        };
+        if (ar_backend) |b| {
+            b.bindThread();
+            AdaRound.gpu_backend = b;
+            std.log.info("AdaRound GEMMs on {s}", .{b.deviceName()});
+        }
+    }
     var gptq_cache: ?CalibrationCache.Cache = null;
     defer if (gptq_cache) |*c| c.deinit();
     var gptq_plan: GptqPlan.Plan = undefined;
     if (opts.gptq) {
         if (imatrix) |*im| {
-            gptq_cache = try CalibrationCache.Cache.open(allocator, opts.io, opts.calibration_path.?);
-            gptq_plan = .{ .gpa = allocator, .cache = &gptq_cache.?, .imatrix = im };
+            const rows_path = opts.gptq_rows_path orelse opts.calibration_path.?;
+            gptq_cache = try CalibrationCache.Cache.open(allocator, opts.io, rows_path);
+            if (opts.gptq_rows_path != null) {
+                // The imatrix cache was gated in `loadImatrix`; this one has not been,
+                // and it is the one the compensation is actually fitted against.
+                var diag: CalibrationCache.Diagnostic = .{};
+                CalibrationCache.validate(&gptq_cache.?, .{}, &diag) catch |err| {
+                    std.log.err("GPTQ row cache {s} failed its sanity check: {s} ({s})", .{
+                        rows_path, diag.msg, @errorName(err),
+                    });
+                    return err;
+                };
+                std.log.info("GPTQ Hessian rows from {s} ({d} rows/bucket, {d} buckets); imatrix still from {s}", .{
+                    rows_path, gptq_cache.?.prov.sample_rows, gptq_cache.?.prov.buckets, opts.calibration_path.?,
+                });
+            }
+            gptq_plan = .{
+                .gpa = allocator,
+                .cache = &gptq_cache.?,
+                .imatrix = im,
+                .method = if (opts.adaround) .adaround else .gptq,
+                .adaround = .{
+                    .iters = opts.adaround_iters orelse ar_defaults.iters,
+                    .lr = opts.adaround_lr orelse ar_defaults.lr,
+                },
+            };
             out_st.gptq = GptqPlan.lookup(&gptq_plan);
         } else {
             // Reachable only without --calib, which `Convert.run` rejects earlier;
@@ -1532,10 +1600,21 @@ fn writeSafetensors(
     if (opts.gptq) {
         const s = gptq_plan.summary;
         std.log.info(
-            "GPTQ error compensation (§8C): {d} tensors compensated, {d} unsupported type, " ++
+            "{s} level selection: {d} tensors compensated, {d} unsupported type, " ++
                 "{d} no calibration rows, {d} too narrow for the guard, {d} failed",
-            .{ s.use, s.unsupported_type, s.no_data, s.too_narrow, s.failed },
+            .{
+                if (opts.adaround) "AdaRound" else "GPTQ (§8C)",
+                s.use, s.unsupported_type, s.no_data, s.too_narrow, s.failed,
+            },
         );
+        if (opts.adaround and s.ar_obj_rtn > 0) {
+            // The optimizer's own report card. It is measured on the calibration
+            // rows the levels were fitted to, so it says the search converged and
+            // nothing whatsoever about held-out quality.
+            std.log.info("AdaRound in-sample layer objective: {d:.4} of round-to-nearest", .{
+                s.ar_obj_final / s.ar_obj_rtn,
+            });
+        }
         if (s.use == 0) {
             std.log.warn("No tensor was compensated — this conversion is identical to --calib alone", .{});
         }

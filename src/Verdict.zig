@@ -18,22 +18,38 @@
 //!
 //! ### On the metrics
 //!
-//! **PSNR here is confounded, and the report says so.** Two arms of a diffusion
-//! model with the same seed do not merely differ in fidelity — quantization
-//! perturbs the denoising trajectory, so composition drifts, and a pixel metric
-//! mixes "drew a different picture" with "drew the same picture worse". Those call
-//! for different responses, so `detail` (per-image gradient energy, from
-//! `tp.image.detailEnergy`) is reported alongside: it says whether fine texture
-//! survived *independently* of whether the image matched. A candidate that keeps
-//! the reference's detail energy while scoring poorly on PSNR drifted; one that
-//! loses detail energy degraded.
+//! ⚠️ **Which metric is "right" here depends on a goal this file cannot choose, so
+//! it reports both families and says which answers which question.**
 //!
-//! **LPIPS is the metric that actually tracks human judgement**, and it is here
-//! now (`tp.models.lpips`, validated against the `lpips` pip package to 1e-5).
-//! It is opt-in only because it needs a weights file: pass `--lpips <path>` and
-//! every pair gets an LPIPS column. Prefer it over PSNR for a verdict — PSNR's
-//! standard error at n=12 was 0.26–0.51 dB against effects of 0.08–0.43 dB,
-//! which is why the §8C conclusion needed a metric with more power.
+//! Two arms of a diffusion model with the same seed do not merely differ in
+//! fidelity — quantization perturbs the denoising trajectory, so composition
+//! drifts, and an arm can draw a *different* picture rather than a worse one.
+//!
+//!   - If the goal is **"is it still a good image"**, that drift is a confound.
+//!     PSNR mixes it with real damage; `detail` (per-image gradient energy, from
+//!     `tp.image.detailEnergy`) cancels it deliberately, saying whether fine
+//!     texture survived independently of whether the image matched; LPIPS is the
+//!     best judge, being trained on human preference.
+//!   - If the goal is **"is it the SAME image"** — stay as close to the source as
+//!     possible while compressing — then drift is not a confound, it *is* the
+//!     damage, and the ordering inverts. `mean_abs` and `changed` (the
+//!     changed-pixel fractions) are the objective; `detail` measures the wrong
+//!     thing by construction; and LPIPS's tolerance for a plausible substitution
+//!     becomes a liability rather than a virtue.
+//!
+//! Measured on an SDXL sweep (2026-08-04, n=36): the two families ranked four arms
+//! differently, and the arm that won on drift-removed level-2 divergence placed
+//! third of four on changed pixels. `--diff-maps` is what makes the difference
+//! legible — displacement paints every silhouette edge, texture loss paints the
+//! interior, and no scalar separates those.
+//!
+//! **LPIPS is the metric that actually tracks human judgement** (`tp.models.lpips`,
+//! validated against the `lpips` pip package to 1e-5). It is opt-in only because it
+//! needs a weights file: pass `--lpips <path>` and every pair gets an LPIPS column.
+//! Prefer it over PSNR **for the "is it still good" question** — PSNR's standard
+//! error at n=12 was 0.26–0.51 dB against effects of 0.08–0.43 dB, which is why the
+//! §8C conclusion needed a metric with more power. For the "is it the same" question
+//! read the changed-pixel columns first; see the caveat above.
 //!
 //! SSIM (`tp.image.ssim`, scikit-image's 7x7 uniform convention, fixture-pinned)
 //! is reported unconditionally now that it can be pinned against an external
@@ -57,6 +73,22 @@ pub const ImageResult = struct {
     lpips: ?f64,
     /// Gradient energy of the candidate itself, comparable to the reference's.
     detail: ?f64,
+    /// Mean |candidate − reference| over every channel of every pixel, in 0–255.
+    ///
+    /// ⚠️ **This and `changed` answer a different question from PSNR/SSIM/LPIPS,
+    /// and it is the question "how close to the source did we stay" actually asks.**
+    /// Quantization moves the denoising trajectory, so an arm can draw a *different*
+    /// picture rather than a worse one. The perceptual metrics forgive that — LPIPS
+    /// especially, since a substituted-but-plausible face is perceptually cheap —
+    /// and `detail` was built to cancel it outright. If the goal is that the
+    /// quantized model reproduce the original render, drift is not a confound to be
+    /// removed: it IS the damage, and a changed pixel counts however plausible its
+    /// new value is.
+    mean_abs: ?f64,
+    /// Fraction of pixels (0–1) whose RGB-magnitude difference from the reference
+    /// exceeds each of `change_thresholds`. The literal reading of "keep the number
+    /// of changed pixels small".
+    changed: ?[change_thresholds.len]f64,
     /// The file actually compared, so a report can point at it.
     path: []const u8,
     /// The `parameters` tEXt chunk, when the renderer wrote one.
@@ -64,6 +96,126 @@ pub const ImageResult = struct {
     /// Set when the file exists but could not be compared (size mismatch, etc.).
     note: ?[]const u8 = null,
 };
+
+/// A perceptually-ordered blue→white→red ramp for the difference heatmaps.
+/// Five anchors, linearly interpolated: dark (no change) through blue and white to
+/// red (large). Hand-rolled rather than pulled in, because a colormap is five
+/// numbers and a lerp.
+const heat_anchors = [_][3]f64{
+    .{ 0, 0, 0 },
+    .{ 59, 76, 192 },
+    .{ 221, 221, 221 },
+    .{ 247, 148, 50 },
+    .{ 180, 4, 38 },
+};
+
+/// Full-scale of the heatmap, in the same 0–255 magnitude units as
+/// `change_thresholds`. 32 rather than 255 because a raw difference between two
+/// renders is nearly black — at full scale every arm looks identical and perfect,
+/// which is exactly the mistake the map exists to prevent.
+const heat_full_scale: f64 = 32;
+
+fn heatColor(mag: f64) [3]u8 {
+    const t = std.math.clamp(mag / heat_full_scale, 0, 1) * (heat_anchors.len - 1);
+    const i: usize = @min(@as(usize, @intFromFloat(t)), heat_anchors.len - 2);
+    const f = t - @as(f64, @floatFromInt(i));
+    var out: [3]u8 = undefined;
+    for (0..3) |c| {
+        const v = heat_anchors[i][c] * (1 - f) + heat_anchors[i + 1][c] * f;
+        out[c] = @intFromFloat(std.math.clamp(v, 0, 255));
+    }
+    return out;
+}
+
+/// Write a difference heatmap for one (arm, image) pair.
+///
+/// The scalar metrics cannot separate "the subject moved" from "the texture
+/// degraded" — both just lower PSNR. The map does, at a glance: displacement
+/// paints every silhouette edge, while texture loss paints the interior. Measured
+/// on an SDXL arm whose PSNR said it was the *worst* of four, the map showed a
+/// perfectly good picture drawn a few pixels off.
+fn writeDiffMap(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    maps_dir: []const u8,
+    arm: []const u8,
+    image_name: []const u8,
+    ref: []const u8,
+    cand: []const u8,
+    width: usize,
+    height: usize,
+) !void {
+    const px = try gpa.alloc(u8, width * height * 3);
+    defer gpa.free(px);
+    for (0..width * height) |i| {
+        const c = heatColor(pixelMagnitude(ref, cand, i));
+        px[i * 3] = c[0];
+        px[i * 3 + 1] = c[1];
+        px[i * 3 + 2] = c[2];
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try tp.image.encodePngRgb(gpa, &out, px, width, height);
+
+    dir.createDirPath(io, maps_dir) catch {};
+    const stem = if (std.mem.lastIndexOfScalar(u8, image_name, '.')) |d| image_name[0..d] else image_name;
+    const name = try std.fmt.allocPrint(gpa, "{s}__{s}.png", .{ arm, stem });
+    defer gpa.free(name);
+    const path = try std.fs.path.join(gpa, &.{ maps_dir, name });
+    defer gpa.free(path);
+
+    const f = try dir.createFile(io, path, .{ .truncate = true });
+    defer f.close(io);
+    var buf: [1 << 16]u8 = undefined;
+    var fw = f.writer(io, &buf);
+    try fw.interface.writeAll(out.items);
+    try fw.interface.flush();
+}
+
+/// Per-pixel difference thresholds, in 0–255 units of RGB magnitude. 2/255 is
+/// about where a difference becomes visible in a smooth gradient; 16/255 is
+/// unmistakable. Three of them because one number cannot distinguish "everything
+/// moved a little" from "part of the image was redrawn" — the diff maps show that
+/// directly, and these are its scalar summary.
+pub const change_thresholds = [_]f64{ 2, 8, 16 };
+
+/// RMS difference over the three channels of one pixel, in 0–255.
+fn pixelMagnitude(a: []const u8, b: []const u8, i: usize) f64 {
+    var acc: f64 = 0;
+    for (0..3) |c| {
+        const d = @as(f64, @floatFromInt(a[i * 3 + c])) - @as(f64, @floatFromInt(b[i * 3 + c]));
+        acc += d * d;
+    }
+    return @sqrt(acc / 3.0);
+}
+
+/// Mean |Δ| per channel and the fraction of pixels past each threshold.
+///
+/// Lives here rather than in `tp.image` (which owns PSNR/SSIM/detailEnergy) on the
+/// grounds that it is a report statistic over two already-decoded buffers, not a
+/// reusable image primitive pinned against an external reference. If a second
+/// consumer ever wants it, that judgement should be revisited.
+fn changedPixels(ref: []const u8, cand: []const u8) struct { mean_abs: f64, frac: [change_thresholds.len]f64 } {
+    const n = ref.len / 3;
+    var sum_abs: f64 = 0;
+    var counts = [_]usize{0} ** change_thresholds.len;
+    for (0..n) |i| {
+        for (0..3) |c| {
+            const d = @as(f64, @floatFromInt(ref[i * 3 + c])) - @as(f64, @floatFromInt(cand[i * 3 + c]));
+            sum_abs += @abs(d);
+        }
+        const m = pixelMagnitude(ref, cand, i);
+        for (change_thresholds, 0..) |t, k| {
+            if (m > t) counts[k] += 1;
+        }
+    }
+    var frac: [change_thresholds.len]f64 = undefined;
+    const fn_: f64 = @floatFromInt(n);
+    for (counts, 0..) |c, k| frac[k] = @as(f64, @floatFromInt(c)) / fn_;
+    return .{ .mean_abs = sum_abs / (fn_ * 3.0), .frac = frac };
+}
 
 pub const ArmResult = struct {
     name: []const u8,
@@ -104,6 +256,22 @@ pub const ArmResult = struct {
 
     pub fn meanLpips(self: ArmResult) ?f64 {
         return self.meanOf("lpips");
+    }
+
+    pub fn meanAbs(self: ArmResult) ?f64 {
+        return self.meanOf("mean_abs");
+    }
+
+    /// Mean fraction of changed pixels at `change_thresholds[k]`.
+    pub fn meanChanged(self: ArmResult, k: usize) ?f64 {
+        var sum: f64 = 0;
+        var n: usize = 0;
+        for (self.images) |im| {
+            const c = im.changed orelse continue;
+            sum += c[k];
+            n += 1;
+        }
+        return if (n == 0) null else sum / @as(f64, @floatFromInt(n));
     }
 
     /// Mean of one optional per-image field over the images that produced it.
@@ -172,6 +340,10 @@ pub const Options = struct {
     /// Which SSIM convention to report. scikit-image's default, so the number is
     /// comparable to what most tools print.
     ssim_window: tp.image.SsimWindow = .uniform7,
+    /// When set, write a per-image difference heatmap into this directory.
+    /// Opt-in because it is one PNG per (arm, image) — a 5-arm, 36-image sweep at
+    /// 1024² is 144 files.
+    diff_maps: ?[]const u8 = null,
 };
 
 fn strLessThan(_: void, a: []const u8, b: []const u8) bool {
@@ -310,6 +482,9 @@ pub fn run(gpa: std.mem.Allocator, opts: Options) !Report {
         // image. Silently pairing it with the first of many would compare
         // unrelated renders and report a confident number for it.
         if (!cand_is_dir and names.len != 1) return error.CandidateFileNeedsSingleReference;
+        // Hoisted out of the `arms[ai] = ...` below because the diff-map writer
+        // names its files after the arm.
+        const arm_name = try armLabel(arena, cand);
         const images = try arena.alloc(ImageResult, names.len);
 
         for (names, 0..) |n, i| {
@@ -321,6 +496,8 @@ pub fn run(gpa: std.mem.Allocator, opts: Options) !Report {
                 .ssim = null,
                 .lpips = null,
                 .detail = null,
+                .mean_abs = null,
+                .changed = null,
                 .params = null,
                 .path = path,
             };
@@ -348,6 +525,12 @@ pub fn run(gpa: std.mem.Allocator, opts: Options) !Report {
             images[i].psnr = try tp.image.psnr(ref_px[i], l.dec.pixels);
             images[i].mse = try tp.image.mse(ref_px[i], l.dec.pixels);
             images[i].detail = try tp.image.detailEnergy(l.dec.pixels, l.dec.width, l.dec.height);
+            const ch = changedPixels(ref_px[i], l.dec.pixels);
+            images[i].mean_abs = ch.mean_abs;
+            images[i].changed = ch.frac;
+            if (opts.diff_maps) |maps_dir| {
+                try writeDiffMap(gpa, opts.io, opts.dir, maps_dir, arm_name, n, ref_px[i], l.dec.pixels, l.dec.width, l.dec.height);
+            }
             // An image below the window / the AlexNet tower's floor is reported as
             // a missing figure, not as a failed run: the other metrics still hold.
             images[i].ssim = tp.image.ssim(ref_px[i], l.dec.pixels, l.dec.width, l.dec.height, opts.ssim_window) catch |err| switch (err) {
@@ -362,7 +545,7 @@ pub fn run(gpa: std.mem.Allocator, opts: Options) !Report {
             }
         }
 
-        arms[ai] = .{ .name = try armLabel(arena, cand), .dir = cdir, .images = images };
+        arms[ai] = .{ .name = arm_name, .dir = cdir, .images = images };
     }
 
     return .{
@@ -440,18 +623,43 @@ pub fn writeMarkdown(w: *std.Io.Writer, report: *const Report) !void {
         try w.writeByte('\n');
     }
 
+    try w.writeAll("\n## Fidelity to the source — how many pixels changed\n\n");
+    try w.writeAll("| arm | mean \\|Δ\\| (0–255) |");
+    for (change_thresholds) |t| try w.print(" > {d:.0}/255 |", .{t});
+    try w.writeAll("\n|---|---:|");
+    for (change_thresholds) |_| try w.writeAll("---:|");
+    try w.writeByte('\n');
+    for (report.arms) |a| {
+        try w.print("| {s} | ", .{a.name});
+        try printOpt(w, a.meanAbs(), "{d:.3}");
+        try w.writeAll(" | ");
+        for (change_thresholds, 0..) |_, k| {
+            if (a.meanChanged(k)) |f| try w.print("{d:.1}%", .{f * 100}) else try w.writeAll("—");
+            try w.writeAll(" | ");
+        }
+        try w.writeByte('\n');
+    }
+
     try w.writeAll(
-        "\n> **PSNR between two diffusion renders is confounded.** Quantization perturbs the denoising\n" ++
-            "> trajectory, so an arm can draw a *different* picture rather than a worse one, and PSNR\n" ++
-            "> cannot tell those apart. `detail` is per-image gradient energy: an arm holding the\n" ++
-            "> reference's detail while scoring badly on PSNR drifted in composition; one losing detail\n" ++
-            "> degraded. Neither is a substitute for looking at the contact sheet.\n",
+        "\n> **These are the columns to read if the goal is \"reproduce the original\", and they can\n" ++
+            "> rank the arms differently from everything above.** PSNR/SSIM/LPIPS and `detail` all\n" ++
+            "> tolerate — `detail` by design, LPIPS most of all — an arm that drew a *different* but\n" ++
+            "> equally plausible picture. Quantization perturbs the denoising trajectory, so that is a\n" ++
+            "> real and common outcome, not an edge case. If a changed pixel counts as damage however\n" ++
+            "> convincing its new value, mean |Δ| and the changed-pixel fractions are the objective and\n" ++
+            "> the perceptual metrics are a second opinion.\n" ++
+            ">\n> **`detail` measures the opposite thing on purpose.** It is per-image gradient energy, so\n" ++
+            "> an arm holding the reference's detail while scoring badly on PSNR drifted in composition,\n" ++
+            "> and one losing detail degraded. That distinction is useful for diagnosis and misleading as\n" ++
+            "> a score. `--diff-maps` shows it directly: displacement paints the silhouettes, texture\n" ++
+            "> loss paints the interior.\n",
     );
     if (any_lpips) {
         try w.writeAll(
-            ">\n> **LPIPS (lower is better) is the metric to weight most heavily** — it is the one\n" ++
-                "> trained against human judgement, and it has more power at small n than PSNR, whose\n" ++
-                "> standard error over a 12-image set was measured at 0.26–0.51 dB.\n",
+            ">\n> **LPIPS (lower is better) is the metric to weight most heavily _for \"is it still a good\n" ++
+                "> image\"_** — it is the one trained against human judgement, and it has more power at\n" ++
+                "> small n than PSNR, whose standard error over a 12-image set was measured at\n" ++
+                "> 0.26–0.51 dB. For _\"is it the same image\"_ its perceptual tolerance is a liability.\n",
         );
     } else {
         try w.writeAll(
@@ -461,15 +669,19 @@ pub fn writeMarkdown(w: *std.Io.Writer, report: *const Report) !void {
     }
 
     try w.writeAll("\n## Per image\n\n");
+    // `mean |Δ|` is per-image and was being summarized but never listed, which made
+    // the fidelity family the only one a reader could not paired-t-test out of a
+    // report — and it is the column the section above calls the objective one. Same
+    // arm-major layout as the rest of the row so the table stays parseable.
     try w.writeAll("| image |");
     for (report.arms) |a| {
         try w.print(" {s} PSNR | {s} SSIM |", .{ a.name, a.name });
         if (any_lpips) try w.print(" {s} LPIPS |", .{a.name});
-        try w.print(" {s} detail |", .{a.name});
+        try w.print(" {s} detail | {s} mean \\|Δ\\| |", .{ a.name, a.name });
     }
     try w.writeAll("\n|---|");
     for (report.arms) |_| {
-        try w.writeAll("---:|---:|---:|");
+        try w.writeAll("---:|---:|---:|---:|");
         if (any_lpips) try w.writeAll("---:|");
     }
     try w.writeByte('\n');
@@ -492,6 +704,8 @@ pub fn writeMarkdown(w: *std.Io.Writer, report: *const Report) !void {
                 try w.writeAll(" | ");
             }
             try printOpt(w, im.detail, "{d:.2}");
+            try w.writeAll(" | ");
+            try printOpt(w, im.mean_abs, "{d:.3}");
             try w.writeAll(" |");
         }
         try w.writeByte('\n');
@@ -564,6 +778,8 @@ pub fn writeHtml(w: *std.Io.Writer, report: *const Report, out_dir: []const u8) 
             if (im.ssim) |s| try w.print(" · ssim {d:.4}", .{s});
             if (im.lpips) |l| try w.print(" · <b>lpips {d:.4}</b>", .{l});
             if (im.detail) |d| try w.print(" · detail {d:.2}", .{d});
+            if (im.mean_abs) |m| try w.print(" · <b>|\u{394}| {d:.2}</b>", .{m});
+            if (im.changed) |c| try w.print(" · {d:.1}% changed", .{c[1] * 100});
             try w.writeAll("</figcaption></figure>\n");
         }
         try w.writeAll("</div>\n");
@@ -679,12 +895,19 @@ test "a verdict run scores each arm and survives a missing candidate" {
     try testing.expectEqualStrings("Steps: 16, Seed: 80085", report.ref_params[0].?);
     try testing.expect(report.ref_params[1] == null);
 
-    // Both report forms must render without erroring, and must mention the
-    // confound rather than presenting PSNR bare.
+    // Both report forms must render without erroring, and must carry the
+    // changed-pixel section rather than presenting PSNR bare — the two families
+    // can rank arms differently, so a report showing only one is misleading.
     var md: std.Io.Writer.Allocating = .init(gpa);
     defer md.deinit();
     try writeMarkdown(&md.writer, &report);
-    try testing.expect(std.mem.indexOf(u8, md.written(), "confounded") != null);
+    try testing.expect(std.mem.indexOf(u8, md.written(), "Fidelity to the source") != null);
+    try testing.expect(std.mem.indexOf(u8, md.written(), "drew a *different*") != null);
+    // And the changed-pixel family must appear PER IMAGE, not only averaged: without
+    // the per-image column a reader can paired-test PSNR/SSIM/LPIPS out of a report
+    // but not the one metric the section above calls the objective measure of
+    // "reproduce the original". Regression-pins the 2026-08-05 addition.
+    try testing.expect(std.mem.indexOf(u8, md.written(), "mean \\|Δ\\| |") != null);
     try testing.expect(std.mem.indexOf(u8, md.written(), "missing") != null);
     try testing.expect(std.mem.indexOf(u8, md.written(), "identical") != null);
 
@@ -892,4 +1115,98 @@ test "the lpips column is populated when weights are supplied" {
     defer html.deinit();
     try writeHtml(&html.writer, &report, ".");
     try testing.expect(std.mem.indexOf(u8, html.written(), "lpips") != null);
+}
+
+test "changed-pixel metrics count what PSNR blends together" {
+    // The point of these columns is that they answer "is it the SAME image" where
+    // PSNR/detail answer "is it still a GOOD image", so the test pins the two cases
+    // where those disagree rather than just checking arithmetic:
+    //   - an identical arm changes exactly zero pixels;
+    //   - an arm perturbed by a known amount reports exactly that amount, and lands
+    //     on the correct side of each threshold.
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = tmp.dir;
+
+    try root.createDirPath(io, "ref");
+    try root.createDirPath(io, "same");
+    try root.createDirPath(io, "off5");
+
+    var ref_d = try root.openDir(io, "ref", .{});
+    defer ref_d.close(io);
+    var same_d = try root.openDir(io, "same", .{});
+    defer same_d.close(io);
+    var off_d = try root.openDir(io, "off5", .{});
+    defer off_d.close(io);
+
+    // fill 100 vs 105: every pixel differs by exactly 5/255 on every channel, so
+    // the magnitude is 5 — above the 2 threshold, below 8 and 16.
+    try writeTestPng(gpa, ref_d, io, "a.png", 8, 8, 100, false, null);
+    try writeTestPng(gpa, same_d, io, "a.png", 8, 8, 100, false, null);
+    try writeTestPng(gpa, off_d, io, "a.png", 8, 8, 105, false, null);
+
+    var report = try run(gpa, .{
+        .io = io,
+        .dir = root,
+        .reference = "ref",
+        .candidates = &.{ "same", "off5" },
+    });
+    defer report.deinit();
+
+    const same = report.arms[0];
+    try testing.expectEqual(@as(f64, 0), same.meanAbs().?);
+    for (change_thresholds, 0..) |_, k| try testing.expectEqual(@as(f64, 0), same.meanChanged(k).?);
+
+    const off5 = report.arms[1];
+    try testing.expectApproxEqAbs(@as(f64, 5), off5.meanAbs().?, 1e-9);
+    // thresholds are {2, 8, 16}: a uniform 5 clears the first and nothing else.
+    try testing.expectEqual(@as(f64, 1), off5.meanChanged(0).?);
+    try testing.expectEqual(@as(f64, 0), off5.meanChanged(1).?);
+    try testing.expectEqual(@as(f64, 0), off5.meanChanged(2).?);
+
+    // The identical arm is the one that separates these columns from `detail`:
+    // detail is a property of the candidate alone, so a *drifted* arm can match the
+    // reference's detail exactly while changing every pixel. Here both arms hold
+    // full detail and only the changed-pixel columns tell them apart.
+    try testing.expect(same.meanDetail().? == off5.meanDetail().?);
+}
+
+test "the difference heatmap is written per arm per image and is dark where nothing changed" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = tmp.dir;
+
+    try root.createDirPath(io, "ref");
+    try root.createDirPath(io, "cand");
+    var ref_d = try root.openDir(io, "ref", .{});
+    defer ref_d.close(io);
+    var cand_d = try root.openDir(io, "cand", .{});
+    defer cand_d.close(io);
+
+    try writeTestPng(gpa, ref_d, io, "a.png", 8, 8, 100, false, null);
+    try writeTestPng(gpa, cand_d, io, "a.png", 8, 8, 100, false, null);
+
+    var report = try run(gpa, .{
+        .io = io,
+        .dir = root,
+        .reference = "ref",
+        .candidates = &.{"cand"},
+        .diff_maps = "maps",
+    });
+    defer report.deinit();
+
+    const bytes = try root.readFileAlloc(io, "maps/cand__a.png", gpa, .unlimited);
+    defer gpa.free(bytes);
+    const dec = try tp.image.decodePngRgb(gpa, bytes);
+    defer gpa.free(dec.pixels);
+    try testing.expectEqual(@as(usize, 8), dec.width);
+    // Zero difference must map to the ramp's dark end. A map that came out bright
+    // for an identical pair would read as damage everywhere.
+    for (dec.pixels) |p| try testing.expectEqual(@as(u8, 0), p);
 }

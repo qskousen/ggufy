@@ -588,6 +588,16 @@ pub const ValidateOptions = struct {
     /// width. This is the check that catches a cache captured from a differently
     /// shaped variant of the same architecture.
     checkpoint: ?*const tp.safetensors.SafeTensors = null,
+    /// Prefix the denoiser's tensors carry inside `checkpoint`, or "" when they
+    /// are stored bare.
+    ///
+    /// ⚠️ **Not cosmetic: without it a bundled SD checkpoint fails validation
+    /// outright.** The probe keys the cache by the name the *model* uses
+    /// (`input_blocks.1.0.emb_layers.1.weight`), while a full SD1.5/SDXL checkpoint
+    /// stores that same tensor under `model.diffusion_model.`-prefixed. krea2 never
+    /// hit this because its DiT checkpoint is bare. The lookup tries the bare name
+    /// first and this prefix second, so a model-only container keeps working.
+    denoiser_prefix: []const u8 = "",
     /// Scan every element of `rows` for non-finite values. On by default: a
     /// single NaN in the sample poisons every metric computed from it, and the
     /// scan is linear in data we are about to read anyway.
@@ -633,6 +643,9 @@ pub fn validate(cache: *const Cache, opts: ValidateOptions, diag: ?*Diagnostic) 
 
     const gpa = cache.gpa;
     var total_tokens: u64 = 0;
+    // Cache layers with no matching checkpoint tensor under any prefix — expected
+    // when the encoder or VAE lives in a separate file, suspicious in bulk.
+    var unmatched: usize = 0;
 
     for (cache.layer_names) |name| {
         var layer_tokens: u64 = 0;
@@ -690,12 +703,50 @@ pub fn validate(cache: *const Cache, opts: ValidateOptions, diag: ?*Diagnostic) 
         total_tokens += layer_tokens;
 
         if (opts.checkpoint) |ck| {
-            const v = ck.get(name) orelse
-                return fail(diag, error.LayerNotInCheckpoint, "{s} is not in the checkpoint", .{name});
+            const v = ck.get(name) orelse blk: {
+                if (opts.denoiser_prefix.len > 0) {
+                    var pbuf: [512]u8 = undefined;
+                    if (opts.denoiser_prefix.len + name.len <= pbuf.len) {
+                        const full = std.fmt.bufPrint(&pbuf, "{s}{s}", .{ opts.denoiser_prefix, name }) catch unreachable;
+                        if (ck.get(full)) |hit| break :blk hit;
+                    }
+                }
+                // ⚠️ A cache legitimately spans THREE components — the denoiser, the
+                // text encoder (runs before step 0) and the VAE (after the last step) —
+                // and a bundled checkpoint stores each under its own prefix
+                // (`model.diffusion_model.`, `cond_stage_model.`/`conditioner.`,
+                // `first_stage_model.`). Rather than hardcode that list, fall back to a
+                // suffix match on a component boundary, which self-configures to any
+                // container layout. Linear, but only on a miss.
+                for (ck.names()) |cand| {
+                    if (cand.len > name.len + 1 and
+                        cand[cand.len - name.len - 1] == '.' and
+                        std.mem.endsWith(u8, cand, name))
+                    {
+                        if (ck.get(cand)) |hit| break :blk hit;
+                    }
+                }
+                // Still not found. That is legitimate when the encoder or VAE came from
+                // a SEPARATE file (`-e` / `-v`), so it cannot be fatal — but the width
+                // check is what catches a cache captured from a differently shaped
+                // variant, so skip only this layer and keep checking the rest.
+                unmatched += 1;
+                continue;
+            };
             const rank = v.info.shape.rank;
             if (rank == 0) return fail(diag, error.ShapeMismatch, "{s}: checkpoint tensor is rank 0", .{name});
-            // A linear's weight is [out, in]; the GEMM input width is the last dim.
-            const want = v.info.shape.dims[rank - 1];
+            // The GEMM input width is everything but the output dim: `in` for a linear
+            // `[out, in]`, and `ci*kh*kw` for a convolution `[co, ci, kh, kw]`.
+            //
+            // ⚠️ **This used to read the last dim only, which is right for a linear and
+            // wrong for every conv.** It went unnoticed while only krea2 (a pure
+            // transformer) was captured; the first SD capture failed here with "cache
+            // cols 36, checkpoint 3" — 3 being a 3x3 kernel's width. A UNet is mostly
+            // convolutions, so the check was rejecting correct caches. Row-major
+            // `[co][ci][kh][kw]` IS `[co][ci*kh*kw]`, which is how im2col feeds the GEMM
+            // and how `convert` flattens the weight, so the product is the right width.
+            var want: usize = 1;
+            for (v.info.shape.dims[1..rank]) |d| want *= d;
             if (want != cols.?) {
                 return fail(diag, error.ShapeMismatch, "{s}: cache cols {d}, checkpoint {d}", .{ name, cols.?, want });
             }
@@ -703,6 +754,11 @@ pub fn validate(cache: *const Cache, opts: ValidateOptions, diag: ?*Diagnostic) 
     }
 
     if (total_tokens == 0) return fail(diag, error.EmptyCache, "no tokens accumulated anywhere", .{});
+    // Loud, because "most layers were not in the checkpoint" means the cache and the
+    // checkpoint are probably not the same model — the case the width check exists for.
+    if (opts.checkpoint != null and unmatched * 2 > cache.layer_names.len) {
+        return fail(diag, error.LayerNotInCheckpoint, "{d} of {d} layers matched no checkpoint tensor", .{ unmatched, cache.layer_names.len });
+    }
 }
 
 // ---------------------------------------------------------------------------

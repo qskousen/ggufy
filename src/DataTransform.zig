@@ -108,24 +108,64 @@ pub const Quantizer = struct {
                 try dequantizeSimple(input_bytes, output_f32, pool, .F64);
             },
             else => {
-                // Generic GGUF block-type dequantization via GGML type traits
+                // Generic GGUF block-type dequantization via GGML type traits.
+                //
+                // ⚠️ **Threaded over blocks, and it must stay that way.** Until 2026-08-03 this
+                // branch alone called `dequantRow` once on the whole tensor while every sibling
+                // above (`dequantizeSimple`, `dequantizeFP4`, `dequantizeMXFP4Gguf`) spread its
+                // work across `pool` — so a `convert <arm>.gguf -d f16` ran **single-threaded on
+                // one core** over essentially the entire model. That is the k-quant path, i.e.
+                // the one every GGUF-sourced conversion takes, including the f16 twins the GPU
+                // measurement ladder depends on.
+                //
+                // ggml's `to_float` is per-block and stateless, so chunking is a pure
+                // regrouping: each chunk is a whole number of blocks, and byte and element
+                // offsets are exact multiples of the block geometry. Identical bytes out.
                 if (src_type.formatType() != .gguf) return error.UnsupportedSourceType;
                 const gguf_type = gguf.GgmlType.fromString(@tagName(src_type)) catch
                     return error.UnsupportedSourceType;
                 const expected_size: usize = @intCast(src_type.calcSizeInBytes(@intCast(output_f32.len)));
                 if (input_bytes.len != expected_size) return error.InputSizeMismatch;
-                tp.quants.raw.dequantRow(
-                    @intFromEnum(gguf_type),
-                    input_bytes,
-                    output_f32.len,
-                    output_f32,
-                ) catch |err| return switch (err) {
+                const id = @intFromEnum(gguf_type);
+                const mapErr = struct {
                     // Keep this function's error surface as it was: callers
                     // (precision_realdata, the converter) match on these names.
-                    error.UnknownGgmlType, error.UnsupportedGgmlType => error.UnsupportedSourceType,
-                    error.NotBlockAligned, error.BufferSizeMismatch => error.InputSizeMismatch,
-                    else => err,
-                };
+                    fn f(err: anyerror) anyerror {
+                        return switch (err) {
+                            error.UnknownGgmlType, error.UnsupportedGgmlType => error.UnsupportedSourceType,
+                            error.NotBlockAligned, error.BufferSizeMismatch => error.InputSizeMismatch,
+                            else => err,
+                        };
+                    }
+                }.f;
+                const blk = tp.quants.raw.blockElems(id) catch |err| return mapErr(err);
+                const blk_bytes = tp.quants.raw.blockBytes(id) catch |err| return mapErr(err);
+                if (blk == 0 or output_f32.len % blk != 0) return error.InputSizeMismatch;
+                const block_count = output_f32.len / blk;
+                const threads_count = @min(pool.threads.len, block_count);
+                if (threads_count <= 1) {
+                    tp.quants.raw.dequantRow(id, input_bytes, output_f32.len, output_f32) catch |err|
+                        return mapErr(err);
+                    return;
+                }
+                const per_thread = block_count / threads_count;
+                const leftover = block_count - per_thread * threads_count;
+                // Every precondition dequantRow checks is established above *except*
+                // whether the type has a `to_float` kernel at all, which only ggml knows.
+                // A worker cannot return an error, so it records one here.
+                var failed = std.atomic.Value(bool).init(false);
+                var wg: thread_pool_mod.WaitGroup = .{};
+                var i: usize = 0;
+                while (i < threads_count) : (i += 1) {
+                    const start_block = i * per_thread;
+                    const end_block = start_block + per_thread +
+                        (if (i == threads_count - 1) leftover else 0);
+                    pool.spawnWg(&wg, processDequantizeGgufBlocks, .{
+                        id, input_bytes, output_f32, start_block, end_block, blk, blk_bytes, &failed,
+                    });
+                }
+                wg.wait();
+                if (failed.load(.acquire)) return error.UnsupportedSourceType;
             },
         }
     }
@@ -2104,6 +2144,29 @@ pub const Quantizer = struct {
         wg.wait();
     }
 
+    /// One thread's share of a generic GGUF block-quant dequantization. `to_float` is
+    /// per-block and stateless, so a chunk of whole blocks is byte-identical to the same
+    /// blocks inside a whole-tensor call — which is what the "row-major decomposition is
+    /// a pure regrouping" style of test pins for the quantize direction.
+    fn processDequantizeGgufBlocks(
+        id: u32,
+        input_bytes: []const u8,
+        output_f32: []f32,
+        start_block: usize,
+        end_block: usize,
+        blk: usize,
+        blk_bytes: usize,
+        failed: *std.atomic.Value(bool),
+    ) void {
+        const elems = (end_block - start_block) * blk;
+        if (elems == 0) return;
+        const src = input_bytes[start_block * blk_bytes ..][0 .. (end_block - start_block) * blk_bytes];
+        const dst = output_f32[start_block * blk ..][0..elems];
+        tp.quants.raw.dequantRow(id, src, elems, dst) catch {
+            failed.store(true, .release);
+        };
+    }
+
     fn processDequantizeMXFP4Gguf(input_bytes: []const u8, output_f32: []f32, start_block: usize, end_block: usize) void {
         for (start_block..end_block) |b| {
             const scale = e8m0_to_f32(input_bytes[b * 17]);
@@ -2843,6 +2906,61 @@ fn weightedSqErr(a: []const f32, b: []const f32, weights: []const f32) f64 {
         acc += @as(f64, weights[i % weights.len]) * d * d;
     }
     return acc;
+}
+
+test "threaded GGUF block dequantization is bit-identical at any thread count" {
+    // The generic k-quant dequantize path was single-threaded until 2026-08-03, which
+    // made every `convert <x>.gguf -d f16` run on one core. Threading it is only safe
+    // because ggml's `to_float` is per-block and stateless — so this pins the property
+    // that makes the optimization legitimate: the values must not depend on how the
+    // blocks were split across threads. A regression here would silently change every
+    // GGUF-sourced conversion.
+    const allocator = std.testing.allocator;
+    const n = 256 * 12; // twelve q4_k blocks, so several distinct chunkings exist
+
+    const w = try allocator.alloc(f32, n);
+    defer allocator.free(w);
+    fillDeterministicWeights(w);
+
+    var pool1: thread_pool_mod.ThreadPool = .{};
+    try pool1.init(.{ .allocator = allocator, .n_jobs = 1 });
+    defer pool1.deinit();
+
+    // Quantize once, then dequantize the same bytes at several thread counts.
+    const q = try Quantizer.convertTensorDataWeighted(
+        allocator,
+        std.mem.sliceAsBytes(w),
+        .F32,
+        .q4_k,
+        n,
+        &pool1,
+        null,
+    );
+    defer allocator.free(q);
+
+    const ref = try allocator.alloc(f32, n);
+    defer allocator.free(ref);
+    try Quantizer.dequantizeToF32(q, ref, .q4_k, &pool1);
+
+    for ([_]usize{ 2, 3, 5, 8, 16, 64 }) |jobs| {
+        var pool: thread_pool_mod.ThreadPool = .{};
+        try pool.init(.{ .allocator = allocator, .n_jobs = jobs });
+        defer pool.deinit();
+
+        const got = try allocator.alloc(f32, n);
+        defer allocator.free(got);
+        try Quantizer.dequantizeToF32(q, got, .q4_k, &pool);
+
+        for (ref, got, 0..) |a, b, i| {
+            if (a != b) {
+                std.debug.print(
+                    "thread count {d}: element {d} differs: {d} vs {d}\n",
+                    .{ jobs, i, a, b },
+                );
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
 }
 
 test "row-major decomposition is a pure regrouping: same bytes as block-at-a-time" {
