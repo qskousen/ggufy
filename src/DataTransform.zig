@@ -1366,42 +1366,6 @@ pub const Quantizer = struct {
         return excess > w4a8_gate_kurtosis;
     }
 
-    /// Index of the first entry >= v, or sorted.len if every entry is below it. Same as
-    /// torch.searchsorted with right=false.
-    ///
-    /// That index is just the count of entries below v, so the 16 entry case counts lanes
-    /// with one vector compare instead of branching through a binary search.
-    fn lowerBoundF32(sorted: []const f32, v: f32) usize {
-        if (sorted.len == 16) {
-            const V = @Vector(16, f32);
-            const vec: V = sorted[0..16].*;
-            const less = vec < @as(V, @splat(v));
-            const ones: @Vector(16, u8) = @splat(1);
-            const zeros: @Vector(16, u8) = @splat(0);
-            return @reduce(.Add, @select(u8, less, ones, zeros));
-        }
-        var lo: usize = 0;
-        var hi: usize = sorted.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (sorted[mid] < v) lo = mid + 1 else hi = mid;
-        }
-        return lo;
-    }
-
-    /// Nearest entry of an ascending table, ties going to the lower index, which is what
-    /// comfy_kitchen does. The table may contain duplicates, because rounding the levels to
-    /// whole numbers can collapse several codebook entries onto one value at a small s_rel.
-    fn nearestIndex(sorted: []const f32, v: f32) u8 {
-        const last = sorted.len - 1;
-        const pos = lowerBoundF32(sorted, v);
-        const lo_i = if (pos == 0) 0 else @min(pos - 1, last);
-        const hi_i = @min(pos, last);
-        const d_lo = @abs(v - sorted[lo_i]);
-        const d_hi = @abs(v - sorted[hi_i]);
-        return @intCast(if (d_hi < d_lo) hi_i else lo_i);
-    }
-
     /// One scale group as a single vector. Every per-element step of the sweep does the same
     /// thing to all 16 lanes, so the group is the natural unit to vectorize over.
     const GroupVec = @Vector(w4a8_group_size, f32);
@@ -1413,11 +1377,10 @@ pub const Quantizer = struct {
     /// count. Ties still fall to the lower level, since a value sitting exactly on a boundary
     /// is not below it.
     ///
-    /// This matches nearestIndex in exact arithmetic but not always in f32, because averaging
-    /// two levels rounds. A value within one ulp of a boundary can land on either side, which
-    /// changes about one code in a million by a single level and does not measurably change
-    /// the error. nearestIndex stays the reference definition and is what the dequantizer and
-    /// any table that is not 16 wide use.
+    /// This matches comfy_kitchen's searchsorted-then-closer-neighbour rule in exact arithmetic
+    /// but not always in f32, because averaging two levels rounds. A value within one ulp of a
+    /// boundary can land on either side, which changes about one code in a million by a single
+    /// level and does not measurably change the error.
     fn levelMidpoints(levels: [16]f32) [15]f32 {
         var mids: [15]f32 = undefined;
         for (0..15) |j| mids[j] = (levels[j] + levels[j + 1]) * 0.5;
@@ -1427,22 +1390,27 @@ pub const Quantizer = struct {
     /// Boundaries for the fixed codebook. Same for every group, so computed once.
     const w4a8_codebook_mids: [15]f32 = levelMidpoints(w4a8_codebook);
 
-    /// Assign every lane to its nearest level, given that table's boundaries.
-    fn assignGroup(vals: GroupVec, mids: [15]f32) GroupIdx {
-        const ones: GroupIdx = @splat(1);
-        const zeros: GroupIdx = @splat(0);
-        var count: GroupIdx = @splat(0);
+    /// Assign every lane to its nearest level, given that table's boundaries, which must be
+    /// finite. Same result as counting `mid < val` with vector compares, which a Debug build
+    /// runs about 5x slower: the sign bit of mid - val decides it, since distinct floats never
+    /// subtract to zero, the + 0.0 turns a -0 mid into +0 so equal values give +0, and a NaN
+    /// lane is forced to 0 as a compare would leave it.
+    inline fn assignGroup(vals: GroupVec, mids: [15]f32) GroupIdx {
+        const U = @Vector(w4a8_group_size, u32);
+        var count: U = @splat(0);
         inline for (0..15) |j| {
-            const below = @as(GroupVec, @splat(mids[j])) < vals;
-            count += @select(u8, below, ones, zeros);
+            const d = @as(GroupVec, @splat(mids[j] + 0.0)) - vals;
+            count +%= @as(U, @bitCast(d)) >> @splat(31);
         }
-        return count;
+        const bits: U = @bitCast(vals);
+        const not_nan = ((bits & @as(U, @splat(0x7FFF_FFFF))) -% @as(U, @splat(0x7F80_0001))) >> @splat(31);
+        return @truncate(count *% not_nan);
     }
 
     /// Largest finite magnitude in the group. Max does not depend on the order it is taken
     /// in, so this matches a scalar loop exactly. NaN and infinity are masked to zero first;
     /// both compare false against a finite bound, so one comparison covers them.
-    fn groupAmax(gv: GroupVec) f32 {
+    inline fn groupAmax(gv: GroupVec) f32 {
         const av = @abs(gv);
         const finite = av < @as(GroupVec, @splat(std.math.floatMax(f32)));
         return @reduce(.Max, @select(f32, finite, av, @as(GroupVec, @splat(0.0))));
@@ -1465,6 +1433,17 @@ pub const Quantizer = struct {
         const groups_per_row = cols / gs_n;
         const packed_cols = cols / 2;
         const cb = w4a8_codebook;
+
+        // The pass 2 grid depends only on the stored s_rel byte, so build all 256 once.
+        var mids_by_s_rel: [256][15]f32 = undefined;
+        for (&mids_by_s_rel, 0..) |*mids, b| {
+            const s_rel_dec = fp8_e4m3_to_f32(@intCast(b));
+            var levels: [16]f32 = undefined;
+            for (cb, 0..) |c, j| {
+                levels[j] = std.math.clamp(roundHalfToEven(c * s_rel_dec), -127.0, 127.0);
+            }
+            mids.* = levelMidpoints(levels);
+        }
 
         for (start_row..end_row) |r| {
             const row = rotated[r * cols ..][0..cols];
@@ -1514,17 +1493,11 @@ pub const Quantizer = struct {
             for (0..groups_per_row) |g| {
                 const gv: GroupVec = row[g * gs_n ..][0..gs_n].*;
 
-                // Read the fp8 back so the grid is built from what a loader will see.
+                // The grid comes from the fp8 byte, not the f32 scale, so it is what a loader sees.
                 const s_rel_byte = f32_to_fp8_e4m3(row_scales[g] / sc);
                 s_rel[r * groups_per_row + g] = s_rel_byte;
-                const s_rel_dec = fp8_e4m3_to_f32(s_rel_byte);
 
-                var levels: [16]f32 = undefined;
-                for (cb, 0..) |c, j| {
-                    levels[j] = std.math.clamp(roundHalfToEven(c * s_rel_dec), -127.0, 127.0);
-                }
-
-                const idx: [gs_n]u8 = assignGroup(gv / @as(GroupVec, @splat(sc)), levelMidpoints(levels));
+                const idx: [gs_n]u8 = assignGroup(gv / @as(GroupVec, @splat(sc)), mids_by_s_rel[s_rel_byte]);
 
                 // Element 2k goes in the low nibble of byte k, 2k+1 in the high nibble. The
                 // nibble is an unsigned codebook index from 0 to 15, so no sign handling.
@@ -1532,6 +1505,359 @@ pub const Quantizer = struct {
                 for (0..gs_n / 2) |p| {
                     const flat = base + 2 * p;
                     weight[r * packed_cols + flat / 2] = idx[2 * p] | (idx[2 * p + 1] << 4);
+                }
+            }
+        }
+    }
+
+    // asym_w4a8_int8 in its asymmetric form: uniform codes over each group's own [min, max],
+    // and a per-group correction that puts the zero point back. Matches comfy_kitchen
+    // quantize_w4a8_int8_weight(symmetric=False, codebook=False) on the rotated weight:
+    //
+    //   group_scale = max((max(group) - min(group)) / 15, 1e-8)
+    //   code        = clamp(round((w - min(group)) / group_scale), 0, 15)
+    //   s_channel   = max(amax_row((code - 8) * group_scale) / 127, 1e-8)
+    //   s_rel       = fp8_e4m3(group_scale / s_channel)
+    //   correction  = 8 * group_scale + min(group)
+    //
+    // The codes are not reassigned against the rounded int8 grid, unlike the codebook form.
+    // correction is laid out [group][row], as ComfyUI stores it.
+
+    pub const AsymW4a8ZpData = struct {
+        weight: []u8, // packed 4-bit codes, [rows * cols / 2]
+        s_rel: []u8, // per-group scale, raw fp8 e4m3 bytes, [rows * cols / group_size]
+        s_channel: []f32, // per-output-row scale, [rows]
+        correction: []f32, // [cols / group_size * rows]
+    };
+
+    /// A convrot_group_size of 0 skips the rotation, which only tests want.
+    pub fn quantizeToAsymW4a8Zp(
+        allocator: std.mem.Allocator,
+        input: []const f32,
+        rows: usize,
+        cols: usize,
+        convrot_group_size: usize,
+        pool: *thread_pool_mod.ThreadPool,
+    ) !AsymW4a8ZpData {
+        if (input.len != rows * cols) return error.InputSizeMismatch;
+        if (cols % w4a8_group_size != 0) return error.ColsNotDivisibleByGroupSize;
+        if (convrot_group_size != 0 and cols % convrot_group_size != 0) return error.ColsNotDivisibleByGroupSize;
+
+        const rotated = try allocator.alloc(f32, input.len);
+        defer allocator.free(rotated);
+        @memcpy(rotated, input);
+        if (convrot_group_size != 0) try rotateGroupwiseInPlace(rotated, rows, cols, convrot_group_size, pool);
+
+        const groups_per_row = cols / w4a8_group_size;
+
+        const weight = try allocator.alloc(u8, rows * (cols / 2));
+        errdefer allocator.free(weight);
+        const s_rel = try allocator.alloc(u8, rows * groups_per_row);
+        errdefer allocator.free(s_rel);
+        const s_channel = try allocator.alloc(f32, rows);
+        errdefer allocator.free(s_channel);
+        const correction = try allocator.alloc(f32, rows * groups_per_row);
+        errdefer allocator.free(correction);
+
+        const group_scales = try allocator.alloc(f32, rows * groups_per_row);
+        defer allocator.free(group_scales);
+
+        const threads_u64: u64 = @intCast(pool.threads.len);
+        const rows_u64: u64 = @intCast(rows);
+        const rows_per_thread = @divTrunc(rows_u64, threads_u64);
+        const leftover = rows_u64 - (rows_per_thread * threads_u64);
+
+        var wg: thread_pool_mod.WaitGroup = .{};
+        var i: u64 = 0;
+        while (i < threads_u64) : (i += 1) {
+            const start = i * rows_per_thread;
+            var end = start + rows_per_thread;
+            if (i == threads_u64 - 1) end += leftover;
+            if (start == end) continue;
+            pool.spawnWg(&wg, quantizeAsymW4a8ZpRows, .{ rotated, weight, s_rel, s_channel, correction, group_scales, rows, cols, @as(usize, @intCast(start)), @as(usize, @intCast(end)) });
+        }
+        wg.wait();
+
+        return .{ .weight = weight, .s_rel = s_rel, .s_channel = s_channel, .correction = correction };
+    }
+
+    fn quantizeAsymW4a8ZpRows(
+        rotated: []const f32,
+        weight: []u8,
+        s_rel: []u8,
+        s_channel: []f32,
+        correction: []f32,
+        group_scales: []f32,
+        rows: usize,
+        cols: usize,
+        start_row: usize,
+        end_row: usize,
+    ) void {
+        const gs_n = w4a8_group_size;
+        const groups_per_row = cols / gs_n;
+        const packed_cols = cols / 2;
+
+        for (start_row..end_row) |r| {
+            const row = rotated[r * cols ..][0..cols];
+            const row_scales = group_scales[r * groups_per_row ..][0..groups_per_row];
+
+            var max_shifted: f32 = 0.0;
+            for (0..groups_per_row) |g| {
+                const grp = row[g * gs_n ..][0..gs_n];
+                const gv: GroupVec = grp.*;
+                const mn = @reduce(.Min, gv);
+                const gs: f32 = @max((@reduce(.Max, gv) - mn) / 15.0, 1e-8);
+                row_scales[g] = gs;
+                correction[g * rows + r] = 8.0 * gs + mn;
+
+                var codes: [gs_n]u8 = undefined;
+                for (&codes, 0..) |*c, j| {
+                    const q = std.math.clamp(roundHalfToEven((grp[j] - mn) / gs), 0.0, 15.0);
+                    c.* = @intFromFloat(q);
+                    max_shifted = @max(max_shifted, @abs((q - 8.0) * gs));
+                }
+                const base = g * gs_n;
+                for (0..gs_n / 2) |p| {
+                    weight[r * packed_cols + (base + 2 * p) / 2] = codes[2 * p] | (codes[2 * p + 1] << 4);
+                }
+            }
+
+            const sc: f32 = @max(max_shifted / 127.0, 1e-8);
+            s_channel[r] = sc;
+            for (0..groups_per_row) |g| s_rel[r * groups_per_row + g] = f32_to_fp8_e4m3(row_scales[g] / sc);
+        }
+    }
+
+    // w6a8_int8: the same ComfyUI layout as asym_w4a8_int8 at bits=6. Uniform levels -31..31
+    // instead of a codebook, stored as code q+32, and the fp8 group scale is then searched over
+    // its e4m3 neighbours for the one whose rounded int8 grid fits the group best. Matches
+    // comfy_kitchen quantize_w4a8_int8_weight(bits=6):
+    //
+    //   group_scale = max(amax(group) / 31, 1e-8)
+    //   q           = clamp(round(w / group_scale), -31, 31)
+    //   twice:
+    //       group_scale = max(dot(w, q) / max(dot(q, q), 1e-8), 1e-8)
+    //       q           = clamp(round(w / group_scale), -31, 31)
+    //   s_channel   = max(amax_row(q * group_scale) / 127, 1e-8)
+    //   for b in fp8(group_scale / s_channel), b - 1, b + 1:
+    //       levels[j] = clamp(round(j * fp8_decode(b)), -127, 127)   for j in -31..31
+    //       q         = nearest(levels, w / s_channel)
+    //   keep the first b with the smallest sum((levels[q] - w / s_channel)^2)
+    //
+    // A row is 3*cols/4 bytes: cols/2 bytes of low nibbles (even column low), then cols/4 bytes
+    // holding each code's top two bits, column c at bits 2*(c%4) of byte c/4.
+
+    pub const w6a8_levels: i32 = 31;
+    const w6a8_n_levels: usize = 2 * w6a8_levels + 1;
+    /// Largest finite e4m3fn byte; 0x7F is NaN.
+    const e4m3_max_finite_byte: u8 = 0x7E;
+
+    pub const W6a8Data = struct {
+        weight: []u8, // [rows * 3 * cols / 4]
+        s_rel: []u8, // per-group scale, raw fp8 e4m3 bytes, [rows * cols / group_size]
+        s_channel: []f32, // per-output-row scale, [rows]
+    };
+
+    /// The int8 grid every s_rel byte decodes to, indexed [byte][level index].
+    const W6a8Grids = [256][w6a8_n_levels]f32;
+
+    /// comfy_kitchen's nearest-level rule for a whole group against one ascending grid: the
+    /// lower bound (torch.searchsorted) is the count of levels below t, then the closer of the
+    /// two neighbours wins, ties going low. Rounding can repeat a level at a small s_rel, and
+    /// this still picks the index the search would. A NaN lane gets 0. Also returns the chosen
+    /// level for each lane.
+    inline fn w6a8NearestGroup(levels: *const [w6a8_n_levels]f32, t: GroupVec, idx_out: *GroupIdx) GroupVec {
+        const I = @Vector(w4a8_group_size, i32);
+        var pos: I = @splat(0);
+        for (levels) |l| {
+            pos += @select(i32, @as(GroupVec, @splat(l)) < t, @as(I, @splat(1)), @as(I, @splat(0)));
+        }
+        const lo_i = @max(pos - @as(I, @splat(1)), @as(I, @splat(0)));
+        const hi_i = @min(pos, @as(I, @splat(w6a8_n_levels - 1)));
+        var below: GroupVec = undefined;
+        var above: GroupVec = undefined;
+        inline for (0..w4a8_group_size) |j| {
+            below[j] = levels[@intCast(lo_i[j])];
+            above[j] = levels[@intCast(hi_i[j])];
+        }
+        const take_hi = @abs(t - above) < @abs(t - below);
+        idx_out.* = @intCast(@select(i32, take_hi, hi_i, lo_i));
+        return @select(f32, take_hi, above, below);
+    }
+
+    /// A convrot_group_size of 0 skips the rotation, which only tests want.
+    pub fn quantizeToW6a8(
+        allocator: std.mem.Allocator,
+        input: []const f32,
+        rows: usize,
+        cols: usize,
+        convrot_group_size: usize,
+        pool: *thread_pool_mod.ThreadPool,
+    ) !W6a8Data {
+        if (input.len != rows * cols) return error.InputSizeMismatch;
+        // cols % 32 keeps the two-bit plane whole bytes and both planes 8-byte aligned.
+        if (cols % 32 != 0 or cols % w4a8_group_size != 0) return error.ColsNotDivisibleByGroupSize;
+        if (convrot_group_size != 0 and cols % convrot_group_size != 0) return error.ColsNotDivisibleByGroupSize;
+
+        const rotated = try allocator.alloc(f32, input.len);
+        defer allocator.free(rotated);
+        @memcpy(rotated, input);
+        if (convrot_group_size != 0) try rotateGroupwiseInPlace(rotated, rows, cols, convrot_group_size, pool);
+
+        const groups_per_row = cols / w4a8_group_size;
+
+        const weight = try allocator.alloc(u8, rows * (cols / 4 * 3));
+        errdefer allocator.free(weight);
+        const s_rel = try allocator.alloc(u8, rows * groups_per_row);
+        errdefer allocator.free(s_rel);
+        const s_channel = try allocator.alloc(f32, rows);
+        errdefer allocator.free(s_channel);
+
+        const group_scales = try allocator.alloc(f32, rows * groups_per_row);
+        defer allocator.free(group_scales);
+
+        const grids = try allocator.create(W6a8Grids);
+        defer allocator.destroy(grids);
+        for (grids, 0..) |*levels, b| {
+            const s = fp8_e4m3_to_f32(@intCast(b));
+            for (levels, 0..) |*l, j| {
+                const q: f32 = @floatFromInt(@as(i32, @intCast(j)) - w6a8_levels);
+                l.* = std.math.clamp(roundHalfToEven(q * s), -127.0, 127.0);
+            }
+        }
+
+        const threads_u64: u64 = @intCast(pool.threads.len);
+        const rows_u64: u64 = @intCast(rows);
+        const rows_per_thread = @divTrunc(rows_u64, threads_u64);
+        const leftover = rows_u64 - (rows_per_thread * threads_u64);
+
+        var wg: thread_pool_mod.WaitGroup = .{};
+        var i: u64 = 0;
+        while (i < threads_u64) : (i += 1) {
+            const start = i * rows_per_thread;
+            var end = start + rows_per_thread;
+            if (i == threads_u64 - 1) end += leftover;
+            if (start == end) continue;
+            pool.spawnWg(&wg, quantizeW6a8Rows, .{ rotated, weight, s_rel, s_channel, group_scales, grids, cols, @as(usize, @intCast(start)), @as(usize, @intCast(end)) });
+        }
+        wg.wait();
+
+        return .{ .weight = weight, .s_rel = s_rel, .s_channel = s_channel };
+    }
+
+    /// Level index 0..62 of round(v), clamped to -31..31.
+    /// Adding and subtracting 1.5 * 2^23 rounds half to even like roundHalfToEven for
+    /// |v| < 2^22. Anything larger clamps to the same end either way, and a NaN lane comes out
+    /// as +31, as roundHalfToEven then std.math.clamp would give.
+    inline fn w6a8AssignUniform(vals: GroupVec) [w4a8_group_size]u8 {
+        const lim: GroupVec = @splat(@floatFromInt(w6a8_levels));
+        const magic: GroupVec = @splat(12582912.0);
+        const in_range = @abs(vals) < @as(GroupVec, @splat(4194304.0));
+        const rounded = @select(f32, in_range, (vals + magic) - magic, vals);
+        const q = @max(@min(rounded, lim), -lim);
+        const idx: GroupIdx = @intFromFloat(q + lim);
+        return idx;
+    }
+
+    fn quantizeW6a8Rows(
+        rotated: []const f32,
+        weight: []u8,
+        s_rel: []u8,
+        s_channel: []f32,
+        group_scales: []f32,
+        grids: *const W6a8Grids,
+        cols: usize,
+        start_row: usize,
+        end_row: usize,
+    ) void {
+        const gs_n = w4a8_group_size;
+        const groups_per_row = cols / gs_n;
+        const row_bytes = cols / 4 * 3;
+        const hi_off = cols / 2;
+        const lim: f32 = @floatFromInt(w6a8_levels);
+
+        for (start_row..end_row) |r| {
+            const row = rotated[r * cols ..][0..cols];
+            const row_scales = group_scales[r * groups_per_row ..][0..groups_per_row];
+
+            var max_shifted: f32 = 0.0;
+            for (0..groups_per_row) |g| {
+                const grp = row[g * gs_n ..][0..gs_n];
+                const gv: GroupVec = grp.*;
+
+                var gs: f32 = @max(groupAmax(gv) / lim, 1e-8);
+                var idx = w6a8AssignUniform(gv / @as(GroupVec, @splat(gs)));
+                // Scalar sums in lane order, as in quantizeAsymW4a8Rows.
+                for (0..2) |_| {
+                    var num: f32 = 0.0;
+                    var den: f32 = 0.0;
+                    for (grp, 0..) |v, j| {
+                        const q: f32 = @as(f32, @floatFromInt(idx[j])) - lim;
+                        num += v * q;
+                        den += q * q;
+                    }
+                    gs = @max(num / @max(den, 1e-8), 1e-8);
+                    idx = w6a8AssignUniform(gv / @as(GroupVec, @splat(gs)));
+                }
+                row_scales[g] = gs;
+                for (idx) |j| max_shifted = @max(max_shifted, @abs((@as(f32, @floatFromInt(j)) - lim) * gs));
+            }
+
+            const sc: f32 = @max(max_shifted / 127.0, 1e-8);
+            s_channel[r] = sc;
+
+            const out = weight[r * row_bytes ..][0..row_bytes];
+            for (0..groups_per_row) |g| {
+                const gv: GroupVec = row[g * gs_n ..][0..gs_n].*;
+                const target = gv / @as(GroupVec, @splat(sc));
+
+                // Candidates in comfy's order, ties keeping the earlier one. Below byte 2 the
+                // lower neighbour is either the base again or, wrapped, a NaN scale; neither
+                // can win, so it is skipped. The upper one saturates at the largest finite.
+                const base = f32_to_fp8_e4m3(row_scales[g] / sc);
+                var cands: [3]u8 = undefined;
+                var n_cands: usize = 0;
+                cands[n_cands] = base;
+                n_cands += 1;
+                if (base >= 2) {
+                    cands[n_cands] = base - 1;
+                    n_cands += 1;
+                }
+                cands[n_cands] = @min(base +| 1, e4m3_max_finite_byte);
+                n_cands += 1;
+
+                var best_byte = base;
+                var best_err: f32 = std.math.inf(f32);
+                var best_idx: [gs_n]u8 = undefined;
+                for (cands[0..n_cands]) |b| {
+                    var cand_idx: GroupIdx = undefined;
+                    const chosen: [gs_n]f32 = w6a8NearestGroup(&grids[b], target, &cand_idx);
+                    // Summed in lane order, as the reference does.
+                    var err: f32 = 0.0;
+                    const target_arr: [gs_n]f32 = target;
+                    for (chosen, target_arr) |l, t| {
+                        const d = l - t;
+                        err += d * d;
+                    }
+                    if (err < best_err) {
+                        best_err = err;
+                        best_byte = b;
+                        best_idx = cand_idx;
+                    }
+                }
+                s_rel[r * groups_per_row + g] = best_byte;
+
+                // Level index 0..62 is stored as code 1..63.
+                var codes: [gs_n]u8 = undefined;
+                for (&codes, best_idx) |*c, k| c.* = k + 1;
+                const col0 = g * gs_n;
+                for (0..gs_n / 2) |p| {
+                    out[(col0 + 2 * p) / 2] = (codes[2 * p] & 0x0F) | ((codes[2 * p + 1] & 0x0F) << 4);
+                }
+                for (0..gs_n / 4) |p| {
+                    var hi: u8 = 0;
+                    inline for (0..4) |s| hi |= ((codes[4 * p + s] >> 4) & 0x3) << (2 * s);
+                    out[hi_off + (col0 + 4 * p) / 4] = hi;
                 }
             }
         }
@@ -2415,6 +2741,53 @@ test "the GGUF block tables agree with ggml's own for every type we emit" {
                 .{ @tagName(dt), t.getBlockSize(), want_block, t.getBytesPerBlock(), want_bytes },
             );
             return error.BlockTableMismatch;
+        }
+    }
+}
+
+test "W4A8 assignGroup counts boundaries below each lane exactly as a float compare does" {
+    const Q = Quantizer;
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const rnd = prng.random();
+    const inf = std.math.inf(f32);
+    const specials = [_]f32{
+        0.0,                         -0.0,                           inf, -inf,
+        std.math.nan(f32),           -std.math.nan(f32),             std.math.floatTrueMin(f32),
+        -std.math.floatTrueMin(f32), std.math.floatMax(f32),         -std.math.floatMax(f32),
+        127.0,                       -127.0,
+    };
+
+    for (0..50_000) |it| {
+        // Tables shaped like the real ones: the fixed codebook, a scaled whole-number grid with
+        // collapsed duplicates and signed zeros, and the all-zero grid of a zero s_rel byte.
+        var levels: [16]f32 = undefined;
+        for (&levels, Q.w4a8_codebook) |*l, c| {
+            l.* = switch (it % 3) {
+                0 => c,
+                1 => std.math.clamp(Q.roundHalfToEven(c * rnd.float(f32) * 140.0), -127.0, 127.0),
+                else => c * 0.0,
+            };
+        }
+        const mids = Q.levelMidpoints(levels);
+
+        var vals: [16]f32 = undefined;
+        for (&vals, 0..) |*v, j| {
+            const m = mids[j % 15];
+            v.* = switch (rnd.uintLessThan(u8, 5)) {
+                0 => specials[rnd.uintLessThan(usize, specials.len)],
+                1 => m,
+                2 => std.math.nextAfter(f32, m, inf),
+                3 => std.math.nextAfter(f32, m, -inf),
+                else => rnd.floatNorm(f32) * 60.0,
+            };
+        }
+
+        const got: [16]u8 = Q.assignGroup(vals, mids);
+        for (vals, got) |v, g| {
+            var want: u8 = 0;
+            for (mids) |m| want += @intFromBool(m < v);
+            if (g != want) std.debug.print("assignGroup({e}) = {d}, compare gives {d}, mids {any}\n", .{ v, g, want, mids });
+            try std.testing.expectEqual(want, g);
         }
     }
 }

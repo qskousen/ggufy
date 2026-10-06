@@ -3,7 +3,7 @@ const types = @import("types.zig");
 const DataTransform = @import("DataTransform.zig");
 const thread_pool_mod = @import("ThreadPool.zig");
 
-pub const ComfyQuantScheme = enum { nvfp4, float8_e4m3fn, mxfp4, mxfp8_e4m3fn, int8_convrot, convrot_w4a4, asym_w4a8_int8, unknown };
+pub const ComfyQuantScheme = enum { nvfp4, float8_e4m3fn, mxfp4, mxfp8_e4m3fn, int8_convrot, convrot_w4a4, asym_w4a8_int8, w6a8_int8, unknown };
 
 pub const Fp4Cluster = struct {
     base_name: []const u8,
@@ -80,16 +80,19 @@ pub const Int4Cluster = struct {
     group_size: usize,
 };
 
-/// asym_w4a8_int8 cluster, always rotated. Holds unsigned 4-bit codebook indices packed two
-/// per byte, an fp8 scale per group, an f32 scale per row, and the 16 entry codebook.
-/// Decoding is round(codebook[i] * s_rel) * s_channel, then un-rotated. The rounding is part
-/// of the format, not a shortcut.
+/// asym_w4a8_int8 or w6a8_int8 cluster, always rotated. Holds unsigned codes, an fp8 scale per
+/// group and an f32 scale per row. The level is codebook[code] when there is a codebook, else
+/// code - 2^(bits-1). Decoding is round(level * s_rel) * s_channel, plus the group's correction
+/// when there is one, then un-rotated. The rounding is part of the format, not a shortcut.
+/// Only the 4-bit format can carry a codebook or a correction.
 pub const AsymW4a8Cluster = struct {
     base_name: []const u8,
-    weight: types.Tensor,            // I8, [rows, cols/2] (two unsigned 4-bit indices per byte)
+    weight: types.Tensor,            // I8, [rows, cols * bits / 8]
     weight_s_rel: types.Tensor,      // F8_E4M3, [rows, cols/group_size]
     weight_s_channel: types.Tensor,  // F32, [rows]
-    weight_codebook: types.Tensor,   // F32, [16]
+    weight_codebook: ?types.Tensor,  // F32, [16]; null when the levels are uniform
+    weight_correction: ?types.Tensor, // float, [cols/group_size, rows]; asymmetric 4-bit only
+    bits: u8,                        // 4 (asym_w4a8_int8) or 6 (w6a8_int8)
     // Per-tensor comfy_quant marker, or null when the identity came from the file level
     // _quantization_metadata header, which is what most files of this format use.
     comfy_quant: ?types.Tensor,
@@ -144,6 +147,7 @@ pub fn parseComfyQuantScheme(data: []const u8) ComfyQuantScheme {
     // Like convrot_w4a4 the name implies the rotation. group_size in the same JSON picks the
     // scale group, defaulting to 16.
     if (std.mem.eql(u8, fmt_str, "asym_w4a8_int8")) return .asym_w4a8_int8;
+    if (std.mem.eql(u8, fmt_str, "w6a8_int8")) return .w6a8_int8;
     return .unknown;
 }
 
@@ -348,13 +352,21 @@ fn appendInt4Cluster(
     return true;
 }
 
-/// Build an asym_w4a8_int8 cluster. Like int4 the weight is packed as [rows, cols/2], but it
-/// carries three scale tensors instead of one, and all three must be present and the right
-/// shape or the layer cannot be decoded.
+/// The tensor `base_name ++ suffix`, or null when the file has none.
+fn optionalSidecar(source: anytype, name_map: *std.StringHashMap(usize), base_name: []const u8, suffix: []const u8, allocator: std.mem.Allocator) !?types.Tensor {
+    const name = try std.fmt.allocPrint(allocator, "{s}{s}", .{ base_name, suffix });
+    defer allocator.free(name);
+    const idx = name_map.get(name) orelse return null;
+    return source.tensors.items[idx];
+}
+
+/// Build an asym_w4a8_int8 (bits 4) or w6a8_int8 (bits 6) cluster. Every scale tensor the
+/// format carries must be present and the right shape or the layer cannot be decoded.
 fn appendAsymW4a8Cluster(
     source: anytype,
     name_map: *std.StringHashMap(usize),
     base_name: []const u8,
+    bits: u8,
     group_size: usize,
     convrot_group_size: usize,
     comfy_quant: ?types.Tensor,
@@ -369,7 +381,7 @@ fn appendAsymW4a8Cluster(
         .{ .suffix = ".weight_s_channel", .idx = 0 },
         .{ .suffix = ".weight_codebook", .idx = 0 },
     };
-    for (&found) |*f| {
+    for (found[0..3]) |*f| {
         const name = try std.fmt.allocPrint(allocator, "{s}{s}", .{ base_name, f.suffix });
         defer allocator.free(name);
         f.idx = name_map.get(name) orelse {
@@ -381,14 +393,31 @@ fn appendAsymW4a8Cluster(
     const weight = source.tensors.items[found[0].idx];
     const s_rel = source.tensors.items[found[1].idx];
     const s_channel = source.tensors.items[found[2].idx];
-    const codebook = source.tensors.items[found[3].idx];
+    // Codebook and correction are both optional at 4 bits and both refused at 6, as
+    // comfy_kitchen's validate_w4a8_operands does.
+    const codebook = try optionalSidecar(source, name_map, base_name, ".weight_codebook", allocator);
+    const correction = try optionalSidecar(source, name_map, base_name, ".weight_correction", allocator);
+    if (bits == 6 and (codebook != null or correction != null)) {
+        std.log.warn("TensorClusters: w6a8 cluster {s} carries a codebook or correction, which 6-bit storage never has; skipping", .{base_name});
+        return false;
+    }
 
     if (weight.dims.len != 2) {
         std.log.warn("TensorClusters: asym_w4a8 cluster {s} weight is not 2-D; skipping", .{base_name});
         return false;
     }
     const rows = weight.dims[0];
-    const cols = weight.dims[1] * 2; // nibble-packed: two logical columns per stored byte
+    // The bit width is fixed by the format name, so the stored width gives the logical one.
+    if (weight.dims[1] * 8 % bits != 0) {
+        std.log.warn("TensorClusters: asym_w4a8 cluster {s} packed width {} is not whole {}-bit codes; skipping", .{ base_name, weight.dims[1], bits });
+        return false;
+    }
+    const cols = weight.dims[1] * 8 / bits;
+    // A 6-bit row is a nibble plane then a two-bit plane, both whole bytes and 16-column vectors.
+    if (bits == 6 and (cols % 32 != 0 or group_size % 16 != 0)) {
+        std.log.warn("TensorClusters: w6a8 cluster {s} needs cols % 32 and group_size % 16, got cols {} group_size {}; skipping", .{ base_name, cols, group_size });
+        return false;
+    }
 
     if (group_size == 0 or cols % group_size != 0) {
         std.log.warn("TensorClusters: asym_w4a8 cluster {s} has incompatible group_size {} for cols {}; skipping", .{ base_name, group_size, cols });
@@ -404,9 +433,17 @@ fn appendAsymW4a8Cluster(
         std.log.warn("TensorClusters: asym_w4a8 cluster {s} has wrong s_channel size ({} bytes, expected {}); skipping", .{ base_name, s_channel.size, rows * 4 });
         return false;
     }
-    if (codebook.size != 16 * 4) {
-        std.log.warn("TensorClusters: asym_w4a8 cluster {s} has wrong codebook size ({} bytes, expected 64); skipping", .{ base_name, codebook.size });
+    if (codebook) |cb| if (cb.size != 16 * 4) {
+        std.log.warn("TensorClusters: asym_w4a8 cluster {s} has wrong codebook size ({} bytes, expected 64); skipping", .{ base_name, cb.size });
         return false;
+    };
+    if (correction) |corr| {
+        const dt = types.DataType.fromString(corr.type) catch null;
+        const ok = dt != null and dt.?.isFloatType() and corr.size == dt.?.calcSizeInBytes(n_groups * rows);
+        if (!ok) {
+            std.log.warn("TensorClusters: asym_w4a8 cluster {s} has a correction that is not {} floats; skipping", .{ base_name, n_groups * rows });
+            return false;
+        }
     }
     if (!DataTransform.Quantizer.isValidHadamardSize(convrot_group_size) or cols % convrot_group_size != 0) {
         std.log.warn("TensorClusters: asym_w4a8 cluster {s} has incompatible convrot_groupsize {} for cols {}; skipping", .{ base_name, convrot_group_size, cols });
@@ -419,14 +456,16 @@ fn appendAsymW4a8Cluster(
         .weight_s_rel = s_rel,
         .weight_s_channel = s_channel,
         .weight_codebook = codebook,
+        .weight_correction = correction,
+        .bits = bits,
         .comfy_quant = comfy_quant,
         .rows = rows,
         .cols = cols,
         .group_size = group_size,
         .convrot_group_size = convrot_group_size,
     });
-    std.log.debug("TensorClusters: grouped asym_w4a8 cluster {s} [{}, {}] gs={} convrot_gs={}", .{
-        base_name, rows, cols, group_size, convrot_group_size,
+    std.log.debug("TensorClusters: grouped asym_w4a8 cluster {s} [{}, {}] bits={} gs={} convrot_gs={}", .{
+        base_name, rows, cols, bits, group_size, convrot_group_size,
     });
     return true;
 }
@@ -742,11 +781,12 @@ fn groupFromQuantMetadata(
                 const group_size = comfyQuantInt(layer_json, "convrot_groupsize", 256);
                 break :blk try appendInt4Cluster(source, name_map, base_name, true, group_size, null, int4_list, arena_alloc, allocator);
             },
-            .asym_w4a8_int8 => blk: {
+            .asym_w4a8_int8, .w6a8_int8 => blk: {
                 // Two separate group sizes: the scale group and the rotation group.
                 const group_size = comfyQuantInt(layer_json, "group_size", asym_w4a8_group_size);
                 const convrot_gs = comfyQuantInt(layer_json, "convrot_groupsize", asym_w4a8_convrot_group_size);
-                break :blk try appendAsymW4a8Cluster(source, name_map, base_name, group_size, convrot_gs, null, asym_w4a8_list, arena_alloc, allocator);
+                const bits: u8 = if (scheme == .w6a8_int8) 6 else 4;
+                break :blk try appendAsymW4a8Cluster(source, name_map, base_name, bits, group_size, convrot_gs, null, asym_w4a8_list, arena_alloc, allocator);
             },
             .unknown => unreachable, // handled above
         };
@@ -811,11 +851,12 @@ pub fn groupClusters(
                 const group_size = comfyQuantInt(data, "convrot_groupsize", 256);
                 break :blk try appendInt4Cluster(source, &name_map, base_name, true, group_size, t, &int4_list, arena_alloc, allocator);
             },
-            .asym_w4a8_int8 => blk: {
+            .asym_w4a8_int8, .w6a8_int8 => blk: {
                 // Two separate group sizes: the scale group and the rotation group.
                 const group_size = comfyQuantInt(data, "group_size", asym_w4a8_group_size);
                 const convrot_gs = comfyQuantInt(data, "convrot_groupsize", asym_w4a8_convrot_group_size);
-                break :blk try appendAsymW4a8Cluster(source, &name_map, base_name, group_size, convrot_gs, t, &asym_w4a8_list, arena_alloc, allocator);
+                const bits: u8 = if (scheme == .w6a8_int8) 6 else 4;
+                break :blk try appendAsymW4a8Cluster(source, &name_map, base_name, bits, group_size, convrot_gs, t, &asym_w4a8_list, arena_alloc, allocator);
             },
             .unknown => false,
         };
@@ -1228,18 +1269,22 @@ fn signExtendNibble(nibble: u8) i8 {
     return if (nibble >= 8) @as(i8, @intCast(nibble)) - 16 else @intCast(nibble);
 }
 
-/// Dequantize an asym_w4a8_int8 weight to f32:
+/// Dequantize an asym_w4a8_int8 (bits 4) or w6a8_int8 (bits 6) weight to f32:
 ///
-///   value = round(codebook[nibble] * s_rel[row, col/group_size]).clamp(-127, 127) * s_channel[row]
+///   value = round(level[code] * s_rel[row, g]).clamp(-127, 127) * s_channel[row] + correction[g, row]
 ///
-/// then un-rotated. The nibbles are unsigned indices from 0 to 15, so sign extending them the
-/// way the int4 path does would produce garbage. The rounding is part of the stored value and
-/// has to be applied here too. Caller owns the returned slice.
+/// with g = col / group_size, then un-rotated, where level is codebook[code] when there is a
+/// codebook and code - 2^(bits-1) when there is not, and the correction term is there only for
+/// asymmetric storage. Codes are unsigned, so sign extending them the way the
+/// int4 path does would produce garbage. The rounding is part of the stored value and has to
+/// be applied here too. Caller owns the returned slice.
 pub fn dequantizeAsymW4a8Raw(
     weight_bytes: []const u8,
     s_rel_bytes: []const u8,
     s_channel: []const f32,
-    codebook: []const f32,
+    codebook: ?[]const f32,
+    correction: ?[]const f32,
+    bits: u8,
     rows: usize,
     cols: usize,
     group_size: usize,
@@ -1247,33 +1292,43 @@ pub fn dequantizeAsymW4a8Raw(
     allocator: std.mem.Allocator,
     pool: *thread_pool_mod.ThreadPool,
 ) ![]f32 {
-    if (cols % 2 != 0) return error.InvalidClusterShape;
+    if (bits != 4 and bits != 6) return error.InvalidClusterShape;
+    // 6-bit rows split into a nibble plane and a two-bit plane, each whole bytes.
+    if (cols % (if (bits == 6) @as(usize, 4) else 2) != 0) return error.InvalidClusterShape;
     if (group_size == 0 or cols % group_size != 0) return error.InvalidClusterShape;
-    const packed_cols = cols / 2;
+    const row_bytes = cols * bits / 8;
+    const hi_off = cols / 2;
     const n_groups = cols / group_size;
-    if (weight_bytes.len != rows * packed_cols) return error.InvalidClusterShape;
+    if (weight_bytes.len != rows * row_bytes) return error.InvalidClusterShape;
     if (s_rel_bytes.len != rows * n_groups) return error.InvalidClusterShape;
     if (s_channel.len != rows) return error.InvalidClusterShape;
-    if (codebook.len != 16) return error.InvalidClusterShape;
+    if (codebook) |cb| if (bits != 4 or cb.len != 16) return error.InvalidClusterShape;
+    if (correction) |corr| if (bits != 4 or corr.len != n_groups * rows) return error.InvalidClusterShape;
 
     const out = try allocator.alloc(f32, rows * cols);
     errdefer allocator.free(out);
 
+    const n_levels: usize = @as(usize, 1) << @intCast(bits);
+    const zero_point: f32 = @floatFromInt(n_levels / 2);
     const Q = DataTransform.Quantizer;
     for (0..rows) |row| {
         const sc = s_channel[row];
+        const packed_row = weight_bytes[row * row_bytes ..][0..row_bytes];
         for (0..n_groups) |g| {
             const s_rel = Q.fp8_e4m3_to_f32(s_rel_bytes[row * n_groups + g]);
-            // The 16 levels this group's codes index into, shared by every element in it.
-            var levels: [16]f32 = undefined;
-            for (codebook, 0..) |c, j| {
-                levels[j] = std.math.clamp(Q.roundHalfToEven(c * s_rel), -127.0, 127.0) * sc;
+            const offset: f32 = if (correction) |corr| corr[g * rows + row] else 0.0;
+            // The levels this group's codes index into, shared by every element in it.
+            var levels: [64]f32 = undefined;
+            for (levels[0..n_levels], 0..) |*l, j| {
+                const level = if (codebook) |cb| cb[j] else @as(f32, @floatFromInt(j)) - zero_point;
+                l.* = std.math.clamp(Q.roundHalfToEven(level * s_rel), -127.0, 127.0) * sc + offset;
             }
             for (0..group_size) |j| {
                 const col = g * group_size + j;
-                const byte = weight_bytes[row * packed_cols + col / 2];
-                const idx: u8 = if (col % 2 == 0) (byte & 0x0F) else (byte >> 4);
-                out[row * cols + col] = levels[idx];
+                const byte = packed_row[col / 2];
+                var code: u8 = if (col % 2 == 0) (byte & 0x0F) else (byte >> 4);
+                if (bits == 6) code |= ((packed_row[hi_off + col / 4] >> @intCast(2 * (col % 4))) & 0x3) << 4;
+                out[row * cols + col] = levels[code];
             }
         }
     }
@@ -1297,17 +1352,30 @@ pub fn dequantizeAsymW4a8Cluster(
     defer allocator.free(s_rel_bytes);
     const s_channel_raw = try readTensorBytes(source, cluster.weight_s_channel, allocator);
     defer allocator.free(s_channel_raw);
-    const codebook_raw = try readTensorBytes(source, cluster.weight_codebook, allocator);
-    defer allocator.free(codebook_raw);
+    const codebook_raw: ?[]u8 = if (cluster.weight_codebook) |cb| try readTensorBytes(source, cb, allocator) else null;
+    defer if (codebook_raw) |raw| allocator.free(raw);
+
+    // The correction is stored in the weight's own dtype, so bring it to f32 first.
+    var correction_f32: ?[]u8 = null;
+    defer if (correction_f32) |c| allocator.free(c);
+    if (cluster.weight_correction) |corr| {
+        const raw = try readTensorBytes(source, corr, allocator);
+        defer allocator.free(raw);
+        const n: u64 = @intCast(cluster.rows * (cluster.cols / cluster.group_size));
+        correction_f32 = try DataTransform.Quantizer.convertTensorData(allocator, raw, try types.DataType.fromString(corr.type), .F32, n, pool);
+    }
 
     const s_channel: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(s_channel_raw)));
-    const codebook: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(codebook_raw)));
+    const codebook: ?[]const f32 = if (codebook_raw) |raw| std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(raw))) else null;
+    const correction: ?[]const f32 = if (correction_f32) |raw| std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(raw))) else null;
 
     return dequantizeAsymW4a8Raw(
         weight_bytes,
         s_rel_bytes,
         s_channel,
         codebook,
+        correction,
+        cluster.bits,
         cluster.rows,
         cluster.cols,
         cluster.group_size,
@@ -1669,17 +1737,18 @@ pub fn collapseModelTensors(
                 if (nameSuffixMatch(cluster.weight.name, t.name)) {
                     var new_t = t;
                     new_t.dims = try arena_alloc.dupe(usize, &[_]usize{ cluster.rows, cluster.cols });
-                    new_t.type = if (mode == .preserve_quant) "ASYM_W4A8_INT8" else "BF16";
+                    new_t.type = if (mode != .preserve_quant) "BF16" else if (cluster.bits == 6) "W6A8_INT8" else if (cluster.weight_correction != null) "ASYM_W4A8_INT8_ZP" else "ASYM_W4A8_INT8";
                     new_t.size = cluster.rows * cluster.cols * 2;
                     try new_tensors.append(arena_alloc, new_t);
                     handled = true;
                     break;
                 }
-                // Three scale tensors to drop, not one. Missing any leaves a stray tensor in
+                // Up to four side tensors to drop, not one. Missing any leaves a stray tensor in
                 // the output that nothing knows how to read.
                 if (nameSuffixMatch(cluster.weight_s_rel.name, t.name) or
                     nameSuffixMatch(cluster.weight_s_channel.name, t.name) or
-                    nameSuffixMatch(cluster.weight_codebook.name, t.name) or
+                    (if (cluster.weight_codebook) |cb| nameSuffixMatch(cb.name, t.name) else false) or
+                    (if (cluster.weight_correction) |corr| nameSuffixMatch(corr.name, t.name) else false) or
                     (if (cluster.comfy_quant) |cq| nameSuffixMatch(cq.name, t.name) else false))
                 {
                     handled = true;
@@ -1721,6 +1790,7 @@ pub const int4_convrot_comfy_json = "{\"format\": \"convrot_w4a4\", \"convrot_gr
 pub const int4_convrot_group_size: u64 = 256;
 // Keys and order match what ComfyUI writes for this format.
 pub const asym_w4a8_comfy_json = "{\"format\": \"asym_w4a8_int8\", \"group_size\": 16, \"convrot_groupsize\": 256}";
+pub const w6a8_comfy_json = "{\"format\": \"w6a8_int8\", \"group_size\": 16, \"convrot_groupsize\": 256}";
 pub const asym_w4a8_convrot_group_size: u64 = 256;
 pub const asym_w4a8_group_size: u64 = DataTransform.Quantizer.w4a8_group_size;
 /// Seed used for INT4_CONVROT_SR stochastic rounding when no `--stochastic-rounding`
@@ -1731,7 +1801,7 @@ pub const default_stochastic_seed: u64 = 0xC0FFEE;
 /// comfy_quant sub-tensors on disk).
 pub fn isClusterType(dtype: types.DataType) bool {
     return switch (dtype) {
-        .SCALED_F8_E4M3, .MXFP4, .MXFP8_E4M3, .NVFP4, .INT8, .INT8_CONVROT, .INT4_CONVROT, .INT4_CONVROT_SR, .ASYM_W4A8_INT8 => true,
+        .SCALED_F8_E4M3, .MXFP4, .MXFP8_E4M3, .NVFP4, .INT8, .INT8_CONVROT, .INT4_CONVROT, .INT4_CONVROT_SR, .ASYM_W4A8_INT8, .ASYM_W4A8_INT8_ZP, .W6A8_INT8 => true,
         else => false,
     };
 }
@@ -1818,6 +1888,24 @@ pub fn clusterWriteLayout(arena: std.mem.Allocator, dtype: types.DataType, dims:
             try list.append(arena, .{ .suffix = ".weight_s_channel", .dtype = "F32", .dims = try arena.dupe(usize, &.{rows}), .bytes = rows * 4 });
             try list.append(arena, .{ .suffix = ".weight_codebook", .dtype = "F32", .dims = try arena.dupe(usize, &.{16}), .bytes = 16 * 4 });
             try list.append(arena, try comfy.spec(arena, asym_w4a8_comfy_json));
+        },
+        .ASYM_W4A8_INT8_ZP => {
+            // No codebook; the correction instead, in BF16. comfy_kitchen stores it in the
+            // weight's dtype, but F32 would cost two bits a weight, as much as W6A8's extra.
+            const n_groups = cols / asym_w4a8_group_size;
+            try list.append(arena, .{ .suffix = ".weight", .dtype = "I8", .dims = try arena.dupe(usize, &.{ rows, cols / 2 }), .bytes = rows * (cols / 2) });
+            try list.append(arena, .{ .suffix = ".weight_s_rel", .dtype = "F8_E4M3", .dims = try arena.dupe(usize, &.{ rows, n_groups }), .bytes = rows * n_groups });
+            try list.append(arena, .{ .suffix = ".weight_s_channel", .dtype = "F32", .dims = try arena.dupe(usize, &.{rows}), .bytes = rows * 4 });
+            try list.append(arena, .{ .suffix = ".weight_correction", .dtype = "BF16", .dims = try arena.dupe(usize, &.{ n_groups, rows }), .bytes = n_groups * rows * 2 });
+            try list.append(arena, try comfy.spec(arena, asym_w4a8_comfy_json));
+        },
+        .W6A8_INT8 => {
+            // ASYM_W4A8_INT8's tensors minus the codebook, with a 3*cols/4 byte weight row.
+            const n_groups = cols / asym_w4a8_group_size;
+            try list.append(arena, .{ .suffix = ".weight", .dtype = "I8", .dims = try arena.dupe(usize, &.{ rows, cols / 4 * 3 }), .bytes = rows * (cols / 4 * 3) });
+            try list.append(arena, .{ .suffix = ".weight_s_rel", .dtype = "F8_E4M3", .dims = try arena.dupe(usize, &.{ rows, n_groups }), .bytes = rows * n_groups });
+            try list.append(arena, .{ .suffix = ".weight_s_channel", .dtype = "F32", .dims = try arena.dupe(usize, &.{rows}), .bytes = rows * 4 });
+            try list.append(arena, try comfy.spec(arena, w6a8_comfy_json));
         },
         else => return null,
     }
@@ -1966,6 +2054,30 @@ pub fn writeClusterData(
             try writer.writeAll(std.mem.sliceAsBytes(cluster.s_channel));
             try writer.writeAll(std.mem.sliceAsBytes(&DataTransform.Quantizer.w4a8_codebook));
             try writer.writeAll(asym_w4a8_comfy_json);
+        },
+        .ASYM_W4A8_INT8_ZP => {
+            const cluster = try Q.quantizeToAsymW4a8Zp(allocator, f32_data, @intCast(rows), @intCast(cols), @intCast(asym_w4a8_convrot_group_size), pool);
+            defer allocator.free(cluster.weight);
+            defer allocator.free(cluster.s_rel);
+            defer allocator.free(cluster.s_channel);
+            defer allocator.free(cluster.correction);
+            const corr_bf16 = try Q.convertTensorData(allocator, std.mem.sliceAsBytes(cluster.correction), .F32, .BF16, cluster.correction.len, pool);
+            defer allocator.free(corr_bf16);
+            try writer.writeAll(cluster.weight);
+            try writer.writeAll(cluster.s_rel);
+            try writer.writeAll(std.mem.sliceAsBytes(cluster.s_channel));
+            try writer.writeAll(corr_bf16);
+            try writer.writeAll(asym_w4a8_comfy_json);
+        },
+        .W6A8_INT8 => {
+            const cluster = try Q.quantizeToW6a8(allocator, f32_data, @intCast(rows), @intCast(cols), @intCast(asym_w4a8_convrot_group_size), pool);
+            defer allocator.free(cluster.weight);
+            defer allocator.free(cluster.s_rel);
+            defer allocator.free(cluster.s_channel);
+            try writer.writeAll(cluster.weight);
+            try writer.writeAll(cluster.s_rel);
+            try writer.writeAll(std.mem.sliceAsBytes(cluster.s_channel));
+            try writer.writeAll(w6a8_comfy_json);
         },
         else => return error.NotAClusterType,
     }
@@ -2177,8 +2289,40 @@ test "groupFromQuantMetadata: routes every supported header scheme to its cluste
     var d_full = [_]usize{ 4, 8 };  // fp8 / mxfp8 / int8 store [rows, cols]
     var d_half = [_]usize{ 4, 4 };  // nvfp4 stores [rows, cols/2] -> logical cols = 8
     var d_scale = [_]usize{ 4, 1 };
+    // 256 logical columns, one rotation group: 4 bits store cols/2 bytes a row, 6 bits 3*cols/4.
+    var d_w4 = [_]usize{ 4, 128 };
+    var d_w6 = [_]usize{ 4, 192 };
+    var d_srel = [_]usize{ 4, 16 };
+    var d_rows = [_]usize{4};
+    var d_cb = [_]usize{16};
+    var d_corr = [_]usize{ 16, 4 };
 
     var tensors = [_]T{
+        .{ .name = "w4.weight", .type = "I8", .dims = &d_w4, .size = 512, .offset = 0 },
+        .{ .name = "w4.weight_s_rel", .type = "F8_E4M3", .dims = &d_srel, .size = 64, .offset = 0 },
+        .{ .name = "w4.weight_s_channel", .type = "F32", .dims = &d_rows, .size = 16, .offset = 0 },
+        .{ .name = "w4.weight_codebook", .type = "F32", .dims = &d_cb, .size = 64, .offset = 0 },
+        .{ .name = "w6.weight", .type = "I8", .dims = &d_w6, .size = 768, .offset = 0 },
+        .{ .name = "w6.weight_s_rel", .type = "F8_E4M3", .dims = &d_srel, .size = 64, .offset = 0 },
+        .{ .name = "w6.weight_s_channel", .type = "F32", .dims = &d_rows, .size = 16, .offset = 0 },
+        // A codebook on a 6-bit layer is malformed, and the layer must be skipped.
+        .{ .name = "w6cb.weight", .type = "I8", .dims = &d_w6, .size = 768, .offset = 0 },
+        .{ .name = "w6cb.weight_s_rel", .type = "F8_E4M3", .dims = &d_srel, .size = 64, .offset = 0 },
+        .{ .name = "w6cb.weight_s_channel", .type = "F32", .dims = &d_rows, .size = 16, .offset = 0 },
+        .{ .name = "w6cb.weight_codebook", .type = "F32", .dims = &d_cb, .size = 64, .offset = 0 },
+        // 4-bit without a codebook (uniform), and asymmetric with a bf16 [groups, rows] correction.
+        .{ .name = "w4u.weight", .type = "I8", .dims = &d_w4, .size = 512, .offset = 0 },
+        .{ .name = "w4u.weight_s_rel", .type = "F8_E4M3", .dims = &d_srel, .size = 64, .offset = 0 },
+        .{ .name = "w4u.weight_s_channel", .type = "F32", .dims = &d_rows, .size = 16, .offset = 0 },
+        .{ .name = "w4a.weight", .type = "I8", .dims = &d_w4, .size = 512, .offset = 0 },
+        .{ .name = "w4a.weight_s_rel", .type = "F8_E4M3", .dims = &d_srel, .size = 64, .offset = 0 },
+        .{ .name = "w4a.weight_s_channel", .type = "F32", .dims = &d_rows, .size = 16, .offset = 0 },
+        .{ .name = "w4a.weight_correction", .type = "BF16", .dims = &d_corr, .size = 128, .offset = 0 },
+        // A correction on a 6-bit layer is malformed too.
+        .{ .name = "w6c.weight", .type = "I8", .dims = &d_w6, .size = 768, .offset = 0 },
+        .{ .name = "w6c.weight_s_rel", .type = "F8_E4M3", .dims = &d_srel, .size = 64, .offset = 0 },
+        .{ .name = "w6c.weight_s_channel", .type = "F32", .dims = &d_rows, .size = 16, .offset = 0 },
+        .{ .name = "w6c.weight_correction", .type = "BF16", .dims = &d_corr, .size = 128, .offset = 0 },
         .{ .name = "fp8.weight", .type = "F8_E4M3", .dims = &d_full, .size = 32, .offset = 0 },
         .{ .name = "fp8.weight_scale", .type = "F32", .dims = &d_scale, .size = 4, .offset = 0 },
         .{ .name = "nv.weight", .type = "U8", .dims = &d_half, .size = 16, .offset = 0 },
@@ -2217,6 +2361,12 @@ test "groupFromQuantMetadata: routes every supported header scheme to its cluste
         \\  "nv":  {"format": "nvfp4"},
         \\  "mx":  {"format": "mxfp8"},
         \\  "i8":  {"format": "int8_tensorwise", "convrot": true, "convrot_groupsize": 4},
+        \\  "w4":  {"format": "asym_w4a8_int8", "group_size": 16, "convrot_groupsize": 256},
+        \\  "w6":  {"format": "w6a8_int8", "group_size": 16, "convrot_groupsize": 256},
+        \\  "w6cb": {"format": "w6a8_int8", "group_size": 16, "convrot_groupsize": 256},
+        \\  "w4u": {"format": "asym_w4a8_int8", "group_size": 16, "convrot_groupsize": 256},
+        \\  "w4a": {"format": "asym_w4a8_int8", "group_size": 16, "convrot_groupsize": 256},
+        \\  "w6c": {"format": "w6a8_int8", "group_size": 16, "convrot_groupsize": 256},
         \\  "norm": {"format": "bf16"}
         \\}}
     ;
@@ -2237,6 +2387,17 @@ test "groupFromQuantMetadata: routes every supported header scheme to its cluste
     try testing.expectEqual(@as(?types.Tensor, null), int8_list.items[0].comfy_quant);
     try testing.expect(int8_list.items[0].convrot);
     try testing.expectEqual(@as(usize, 4), int8_list.items[0].group_size);
+
+    // Both bit widths share one list; the format name sets the width the stored row decodes at.
+    // w6cb and w6c are refused.
+    try testing.expectEqual(@as(usize, 4), w4a8_list.items.len);
+    for (w4a8_list.items) |c| {
+        try testing.expectEqual(@as(usize, 256), c.cols);
+        const want_bits: u8 = if (std.mem.eql(u8, c.base_name, "w6")) 6 else 4;
+        try testing.expectEqual(want_bits, c.bits);
+        try testing.expectEqual(std.mem.eql(u8, c.base_name, "w4"), c.weight_codebook != null);
+        try testing.expectEqual(std.mem.eql(u8, c.base_name, "w4a"), c.weight_correction != null);
+    }
 }
 
 test "groupFromQuantMetadata: skips bases already grouped via a per-tensor marker" {
@@ -2610,9 +2771,9 @@ test "W4A8 quantize: matches comfy_kitchen asym_w4a8_int8" {
     // assignment is also only one level off. So decode both and require ours to reconstruct
     // the original at least as well. This is what catches a bad refit or an s_channel taken
     // at the wrong point.
-    const ours_out = try dequantizeAsymW4a8Raw(enc.weight, enc.s_rel, enc.s_channel, ref_cb, rows, cols, @intCast(asym_w4a8_group_size), @intCast(asym_w4a8_convrot_group_size), allocator, &pool);
+    const ours_out = try dequantizeAsymW4a8Raw(enc.weight, enc.s_rel, enc.s_channel, ref_cb, null, 4, rows, cols, @intCast(asym_w4a8_group_size), @intCast(asym_w4a8_convrot_group_size), allocator, &pool);
     defer allocator.free(ours_out);
-    const theirs_out = try dequantizeAsymW4a8Raw(ref_w, ref_s_rel, ref_sc, ref_cb, rows, cols, @intCast(asym_w4a8_group_size), @intCast(asym_w4a8_convrot_group_size), allocator, &pool);
+    const theirs_out = try dequantizeAsymW4a8Raw(ref_w, ref_s_rel, ref_sc, ref_cb, null, 4, rows, cols, @intCast(asym_w4a8_group_size), @intCast(asym_w4a8_convrot_group_size), allocator, &pool);
     defer allocator.free(theirs_out);
 
     var num_ours: f64 = 0;
@@ -2663,6 +2824,8 @@ test "W4A8 dequant: matches comfy_kitchen asym_w4a8_int8" {
         ref_s_rel,
         ref_sc,
         ref_cb,
+        null,
+        4,
         rows,
         cols,
         @intCast(asym_w4a8_group_size),
@@ -2673,6 +2836,165 @@ test "W4A8 dequant: matches comfy_kitchen asym_w4a8_int8" {
     defer allocator.free(got);
 
     for (got, expected) |ours, theirs| try testing.expectApproxEqAbs(theirs, ours, 1e-5);
+}
+
+fn expectW4a8VariantDecodes(prefix: []const u8, with_correction: bool) !void {
+    const allocator = std.testing.allocator;
+    var name_buf: [64]u8 = undefined;
+    const load = struct {
+        fn f(a: std.mem.Allocator, buf: []u8, p: []const u8, suffix: []const u8) !?[]u8 {
+            return loadFixture(a, try std.fmt.bufPrint(buf, "{s}{s}", .{ p, suffix }));
+        }
+    }.f;
+    const ref_w = (try load(allocator, &name_buf, prefix, "weight.u8")) orelse return error.SkipZigTest;
+    defer allocator.free(ref_w);
+    const ref_s_rel = (try load(allocator, &name_buf, prefix, "s_rel.u8")) orelse return error.SkipZigTest;
+    defer allocator.free(ref_s_rel);
+    const ref_sc_raw = (try load(allocator, &name_buf, prefix, "s_channel.f32")) orelse return error.SkipZigTest;
+    defer allocator.free(ref_sc_raw);
+    const expected_raw = (try load(allocator, &name_buf, prefix, "expected.f32")) orelse return error.SkipZigTest;
+    defer allocator.free(expected_raw);
+
+    const rows: usize = 16;
+    const cols: usize = 6144;
+    const n_groups = cols / @as(usize, @intCast(asym_w4a8_group_size));
+
+    var pool: thread_pool_mod.ThreadPool = undefined;
+    try pool.init(.{ .allocator = allocator, .n_jobs = 4 });
+    defer pool.deinit();
+
+    // The bf16 correction goes through the same conversion the file reader uses.
+    var corr_f32: ?[]u8 = null;
+    defer if (corr_f32) |c| allocator.free(c);
+    if (with_correction) {
+        const raw = (try load(allocator, &name_buf, prefix, "correction.bf16")) orelse return error.SkipZigTest;
+        defer allocator.free(raw);
+        corr_f32 = try DataTransform.Quantizer.convertTensorData(allocator, raw, .BF16, .F32, rows * n_groups, &pool);
+    }
+
+    const ref_sc: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(ref_sc_raw)));
+    const expected: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(expected_raw)));
+    const correction: ?[]const f32 = if (corr_f32) |c| std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(c))) else null;
+
+    const got = try dequantizeAsymW4a8Raw(ref_w, ref_s_rel, ref_sc, null, correction, 4, rows, cols, @intCast(asym_w4a8_group_size), @intCast(asym_w4a8_convrot_group_size), allocator, &pool);
+    defer allocator.free(got);
+    try testing.expectEqual(expected.len, got.len);
+    for (got, expected) |ours, theirs| try testing.expectApproxEqAbs(theirs, ours, 1e-5);
+}
+
+test "W4A8 without a codebook decodes as code - 8, like comfy_kitchen" {
+    try expectW4a8VariantDecodes("w4a8_uniform_", false);
+}
+
+test "W4A8 asymmetric storage adds its per-group correction, like comfy_kitchen" {
+    try expectW4a8VariantDecodes("w4a8_asym_", true);
+}
+
+fn expectW4a8ZpEncodeMatches(prefix: []const u8, cgs: usize) !void {
+    const allocator = std.testing.allocator;
+    var name_buf: [64]u8 = undefined;
+    const load = struct {
+        fn f(a: std.mem.Allocator, buf: []u8, p: []const u8, suffix: []const u8) !?[]u8 {
+            return loadFixture(a, try std.fmt.bufPrint(buf, "{s}{s}", .{ p, suffix }));
+        }
+    }.f;
+    const input_raw = (try loadFixture(allocator, "convrot_expected.f32")) orelse return error.SkipZigTest;
+    defer allocator.free(input_raw);
+    const ref_w = (try load(allocator, &name_buf, prefix, "weight.u8")) orelse return error.SkipZigTest;
+    defer allocator.free(ref_w);
+    const ref_s_rel = (try load(allocator, &name_buf, prefix, "s_rel.u8")) orelse return error.SkipZigTest;
+    defer allocator.free(ref_s_rel);
+    const ref_sc_raw = (try load(allocator, &name_buf, prefix, "s_channel.f32")) orelse return error.SkipZigTest;
+    defer allocator.free(ref_sc_raw);
+    const ref_corr_raw = (try load(allocator, &name_buf, prefix, "correction.f32")) orelse return error.SkipZigTest;
+    defer allocator.free(ref_corr_raw);
+
+    const rows: usize = 16;
+    const cols: usize = 6144;
+    const input: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(input_raw)));
+    const ref_sc: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(ref_sc_raw)));
+    const ref_corr: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(ref_corr_raw)));
+
+    var pool: thread_pool_mod.ThreadPool = undefined;
+    try pool.init(.{ .allocator = allocator, .n_jobs = 4 });
+    defer pool.deinit();
+
+    const Q = DataTransform.Quantizer;
+    const enc = try Q.quantizeToAsymW4a8Zp(allocator, input, rows, cols, cgs, &pool);
+    defer allocator.free(enc.weight);
+    defer allocator.free(enc.s_rel);
+    defer allocator.free(enc.s_channel);
+    defer allocator.free(enc.correction);
+
+    try testing.expectEqual(ref_w.len, enc.weight.len);
+    try testing.expectEqual(ref_s_rel.len, enc.s_rel.len);
+    try testing.expectEqual(ref_corr.len, enc.correction.len);
+
+    if (cgs == 0) {
+        // Same input, no rotation: every output is the same arithmetic, so it must be exact.
+        try testing.expectEqualSlices(u8, ref_w, enc.weight);
+        try testing.expectEqualSlices(u8, ref_s_rel, enc.s_rel);
+        try testing.expectEqualSlices(f32, ref_sc, enc.s_channel);
+        try testing.expectEqualSlices(f32, ref_corr, enc.correction);
+        return;
+    }
+
+    // Rotated: our rotation and comfy's dense one differ in the last bit, which can move a
+    // value across a rounding midpoint or a group's min or max. Compare what a loader sees:
+    // the decoded weight, with our correction rounded to the bf16 the file stores.
+    const corr_bf16 = try Q.convertTensorData(allocator, std.mem.sliceAsBytes(enc.correction), .F32, .BF16, enc.correction.len, &pool);
+    defer allocator.free(corr_bf16);
+    const corr_back = try Q.convertTensorData(allocator, corr_bf16, .BF16, .F32, enc.correction.len, &pool);
+    defer allocator.free(corr_back);
+    const ours_corr: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(corr_back)));
+
+    const gs: usize = @intCast(asym_w4a8_group_size);
+    const ours_out = try dequantizeAsymW4a8Raw(enc.weight, enc.s_rel, enc.s_channel, null, ours_corr, 4, rows, cols, gs, cgs, allocator, &pool);
+    defer allocator.free(ours_out);
+    const theirs_out = try dequantizeAsymW4a8Raw(ref_w, ref_s_rel, ref_sc, null, ref_corr, 4, rows, cols, gs, cgs, allocator, &pool);
+    defer allocator.free(theirs_out);
+
+    var code_mismatch: usize = 0;
+    for (enc.weight, ref_w) |o, t| {
+        if (o & 0x0F != t & 0x0F) code_mismatch += 1;
+        if (o >> 4 != t >> 4) code_mismatch += 1;
+    }
+    var num_ours: f64 = 0;
+    var num_theirs: f64 = 0;
+    var den: f64 = 0;
+    for (input, ours_out, theirs_out) |ref, a, b| {
+        num_ours += (a - ref) * (a - ref);
+        num_theirs += (b - ref) * (b - ref);
+        den += ref * ref;
+    }
+    const rel_ours = @sqrt(num_ours / den);
+    const rel_theirs = @sqrt(num_theirs / den);
+    if (code_mismatch * 100 > rows * cols or rel_ours > rel_theirs * 1.01) {
+        std.debug.print("W4A8 ZP {s}: {}/{} codes differ, rel L2 ours {d:.6} comfy {d:.6}\n", .{ prefix, code_mismatch, rows * cols, rel_ours, rel_theirs });
+    }
+    try testing.expect(code_mismatch * 100 <= rows * cols);
+    try testing.expect(rel_ours <= rel_theirs * 1.01);
+}
+
+test "W4A8 asymmetric encode matches comfy_kitchen exactly without the rotation" {
+    try expectW4a8ZpEncodeMatches("w4a8_zp_norot_", 0);
+}
+
+test "W4A8 asymmetric encode, rotated, decodes as well as comfy_kitchen's" {
+    try expectW4a8ZpEncodeMatches("w4a8_zp_", @intCast(asym_w4a8_convrot_group_size));
+}
+
+test "W4A8 asymmetric cluster layout: no codebook, bf16 [groups, rows] correction" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const dims = [_]usize{ 8, 512 };
+    const specs = (try clusterWriteLayout(arena.allocator(), .ASYM_W4A8_INT8_ZP, &dims)).?;
+    try testing.expectEqual(@as(usize, 5), specs.len);
+    try testing.expectEqualSlices(usize, &.{ 8, 256 }, specs[0].dims);
+    try testing.expectEqualStrings(".weight_correction", specs[3].suffix);
+    try testing.expectEqualStrings("BF16", specs[3].dtype);
+    try testing.expectEqualSlices(usize, &.{ 32, 8 }, specs[3].dims);
+    try testing.expectEqualStrings(".comfy_quant", specs[4].suffix);
 }
 
 test "W4A8 nibbles are unsigned codebook indices, not two's complement" {
@@ -2706,6 +3028,8 @@ test "W4A8 nibbles are unsigned codebook indices, not two's complement" {
         &s_rel,
         &s_channel,
         &DataTransform.Quantizer.w4a8_codebook,
+        null,
+        4,
         rows,
         cols,
         @intCast(asym_w4a8_group_size),
@@ -2753,6 +3077,8 @@ test "W4A8 round-trip is markedly more accurate than int4 ConvRot on the same we
         w4a8.s_rel,
         w4a8.s_channel,
         &DataTransform.Quantizer.w4a8_codebook,
+        null,
+        4,
         rows,
         cols,
         @intCast(asym_w4a8_group_size),
@@ -2967,6 +3293,295 @@ test "MXFP8 dequant: fixture from real ComfyUI model (128×128 slice)" {
         }
     }
     try testing.expectEqual(@as(usize, 0), mismatches);
+}
+
+/// Code at `col` of one packed 6-bit row: low nibble plane, then the two-bit plane.
+fn w6a8Code(row: []const u8, cols: usize, col: usize) u8 {
+    const byte = row[col / 2];
+    const lo: u8 = if (col % 2 == 0) (byte & 0x0F) else (byte >> 4);
+    const hi: u8 = (row[cols / 2 + col / 4] >> @intCast(2 * (col % 4))) & 0x3;
+    return lo | (hi << 4);
+}
+
+/// Squared error of a rotated group against the int8 grid the s_rel byte `b` decodes to,
+/// assigning each value its nearest level, written independently of the quantizer.
+fn w6a8GridError(group: []const f32, b: u8, s_channel: f32) f64 {
+    const Q = DataTransform.Quantizer;
+    const s = Q.fp8_e4m3_to_f32(b);
+    var err: f64 = 0;
+    for (group) |v| {
+        const t = v / s_channel;
+        var best: f32 = std.math.inf(f32);
+        var q: i32 = -31;
+        while (q <= 31) : (q += 1) {
+            const level = std.math.clamp(Q.roundHalfToEven(@as(f32, @floatFromInt(q)) * s), -127.0, 127.0);
+            best = @min(best, @abs(level - t));
+        }
+        err += @as(f64, best) * best;
+    }
+    return err;
+}
+
+/// `cgs` 0 compares against comfy's post-rotation quantizer, which must match exactly up to
+/// genuine ties. With a rotation, comfy's dense rotation and our fast one differ in the last
+/// bit, which can flip a code in the refit and move that group's scale byte; comfy itself
+/// moves about 0.1% of the bytes on this slice between an f32 and an f64 rotation.
+fn expectW6a8EncodeMatches(input_name: []const u8, prefix: []const u8, rows: usize, cols: usize, cgs: usize) !void {
+    const allocator = std.testing.allocator;
+    var name_buf: [64]u8 = undefined;
+
+    const input_raw = (try loadFixture(allocator, input_name)) orelse return error.SkipZigTest;
+    defer allocator.free(input_raw);
+    const ref_w = (try loadFixture(allocator, try std.fmt.bufPrint(&name_buf, "{s}weight.u8", .{prefix}))) orelse return error.SkipZigTest;
+    defer allocator.free(ref_w);
+    const ref_s_rel = (try loadFixture(allocator, try std.fmt.bufPrint(&name_buf, "{s}s_rel.u8", .{prefix}))) orelse return error.SkipZigTest;
+    defer allocator.free(ref_s_rel);
+    const ref_sc_raw = (try loadFixture(allocator, try std.fmt.bufPrint(&name_buf, "{s}s_channel.f32", .{prefix}))) orelse return error.SkipZigTest;
+    defer allocator.free(ref_sc_raw);
+
+    const input: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(input_raw)));
+    const ref_sc: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(ref_sc_raw)));
+
+    var pool: thread_pool_mod.ThreadPool = undefined;
+    try pool.init(.{ .allocator = allocator, .n_jobs = 4 });
+    defer pool.deinit();
+
+    const enc = try DataTransform.Quantizer.quantizeToW6a8(allocator, input, rows, cols, cgs, &pool);
+    defer allocator.free(enc.weight);
+    defer allocator.free(enc.s_rel);
+    defer allocator.free(enc.s_channel);
+
+    try testing.expectEqual(ref_w.len, enc.weight.len);
+    try testing.expectEqual(ref_s_rel.len, enc.s_rel.len);
+    try testing.expectEqual(ref_sc.len, enc.s_channel.len);
+
+    for (enc.s_channel, ref_sc) |ours, theirs| {
+        try testing.expect(@abs(ours - theirs) <= @abs(theirs) * 1e-5);
+    }
+
+    // A differing scale byte is a tie when both candidates fit the group equally well, which
+    // f32 summation order can decide either way. Codes are compared where the scale agrees.
+    const gs: usize = @intCast(asym_w4a8_group_size);
+    const rotated = try allocator.dupe(f32, input);
+    defer allocator.free(rotated);
+    if (cgs != 0) try DataTransform.Quantizer.rotateGroupwiseInPlace(rotated, rows, cols, cgs, &pool);
+
+    const groups_per_row = cols / gs;
+    const row_bytes = cols / 4 * 3;
+    var ties: usize = 0;
+    var non_ties: usize = 0;
+    var code_mismatch: usize = 0;
+    var over_one: usize = 0;
+    var bad_code: usize = 0;
+    for (0..rows) |r| {
+        const ours_row = enc.weight[r * row_bytes ..][0..row_bytes];
+        const theirs_row = ref_w[r * row_bytes ..][0..row_bytes];
+        for (0..groups_per_row) |g| {
+            const ours_b = enc.s_rel[r * groups_per_row + g];
+            const theirs_b = ref_s_rel[r * groups_per_row + g];
+            if (ours_b != theirs_b) {
+                const target = rotated[r * cols + g * gs ..][0..gs];
+                const e_ours = w6a8GridError(target, ours_b, enc.s_channel[r]);
+                const e_theirs = w6a8GridError(target, theirs_b, enc.s_channel[r]);
+                if (@abs(e_ours - e_theirs) <= 1e-4 * @max(e_theirs, 1e-30)) ties += 1 else non_ties += 1;
+                continue;
+            }
+            for (g * gs..(g + 1) * gs) |c| {
+                const o: i16 = w6a8Code(ours_row, cols, c);
+                const t: i16 = w6a8Code(theirs_row, cols, c);
+                if (o == 0) bad_code += 1; // codes are q+32 with q in -31..31, never 0
+                const d = @abs(o - t);
+                if (d != 0) code_mismatch += 1;
+                if (d > 1) over_one += 1;
+            }
+        }
+    }
+    const n_codes = rows * cols;
+    const n_groups = rows * groups_per_row;
+
+    const allowed_non_ties: usize = if (cgs == 0) 0 else n_groups / 500;
+    const allowed_codes: usize = if (cgs == 0) 0 else n_codes / 1000;
+
+    if (code_mismatch > allowed_codes or over_one != 0 or non_ties > allowed_non_ties or ties * 1000 > n_groups or bad_code != 0) {
+        std.debug.print(
+            "W6A8 {s} vs comfy_kitchen: {}/{} codes differ ({} by more than one level, {} zero), s_rel differs in {} tied and {} untied of {} groups\n",
+            .{ prefix, code_mismatch, n_codes, over_one, bad_code, ties, non_ties, n_groups },
+        );
+    }
+    try testing.expectEqual(@as(usize, 0), bad_code);
+    try testing.expect(non_ties <= allowed_non_ties);
+    try testing.expect(ties * 1000 <= n_groups);
+    // Same scale byte and, without a rotation, the same input: the assignment is then a pure
+    // function of the two. A rotated input can still land a value on the other side of a
+    // level midpoint.
+    try testing.expect(code_mismatch <= allowed_codes);
+    try testing.expectEqual(@as(usize, 0), over_one);
+
+    // Quality is judged after the round trip the file sees, so without a rotation neither side
+    // un-rotates.
+    const ours_out = try dequantizeAsymW4a8Raw(enc.weight, enc.s_rel, enc.s_channel, null, null, 6, rows, cols, gs, cgs, allocator, &pool);
+    defer allocator.free(ours_out);
+    const theirs_out = try dequantizeAsymW4a8Raw(ref_w, ref_s_rel, ref_sc, null, null, 6, rows, cols, gs, cgs, allocator, &pool);
+    defer allocator.free(theirs_out);
+
+    var num_ours: f64 = 0;
+    var num_theirs: f64 = 0;
+    var den: f64 = 0;
+    for (input, ours_out, theirs_out) |ref, a, b| {
+        num_ours += (a - ref) * (a - ref);
+        num_theirs += (b - ref) * (b - ref);
+        den += ref * ref;
+    }
+    const rel_ours = @sqrt(num_ours / den);
+    const rel_theirs = @sqrt(num_theirs / den);
+    if (rel_ours > rel_theirs * 1.001) {
+        std.debug.print("W6A8 {s} encode quality: ours rel L2 {d:.6} vs comfy {d:.6}\n", .{ prefix, rel_ours, rel_theirs });
+    }
+    try testing.expect(rel_ours <= rel_theirs * 1.001);
+}
+
+fn expectW6a8DecodeMatches(prefix: []const u8, rows: usize, cols: usize) !void {
+    const allocator = std.testing.allocator;
+    var name_buf: [64]u8 = undefined;
+
+    const ref_w = (try loadFixture(allocator, try std.fmt.bufPrint(&name_buf, "{s}weight.u8", .{prefix}))) orelse return error.SkipZigTest;
+    defer allocator.free(ref_w);
+    const ref_s_rel = (try loadFixture(allocator, try std.fmt.bufPrint(&name_buf, "{s}s_rel.u8", .{prefix}))) orelse return error.SkipZigTest;
+    defer allocator.free(ref_s_rel);
+    const ref_sc_raw = (try loadFixture(allocator, try std.fmt.bufPrint(&name_buf, "{s}s_channel.f32", .{prefix}))) orelse return error.SkipZigTest;
+    defer allocator.free(ref_sc_raw);
+    const expected_raw = (try loadFixture(allocator, try std.fmt.bufPrint(&name_buf, "{s}expected.f32", .{prefix}))) orelse return error.SkipZigTest;
+    defer allocator.free(expected_raw);
+
+    const ref_sc: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(ref_sc_raw)));
+    const expected: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(expected_raw)));
+
+    var pool: thread_pool_mod.ThreadPool = undefined;
+    try pool.init(.{ .allocator = allocator, .n_jobs = 4 });
+    defer pool.deinit();
+
+    const got = try dequantizeAsymW4a8Raw(ref_w, ref_s_rel, ref_sc, null, null, 6, rows, cols, @intCast(asym_w4a8_group_size), @intCast(asym_w4a8_convrot_group_size), allocator, &pool);
+    defer allocator.free(got);
+
+    // Only the un-rotation differs, and its rounding scales with the row: the edge fixture has
+    // a row holding a 40.0 outlier.
+    try testing.expectEqual(expected.len, got.len);
+    for (0..rows) |r| {
+        const want = expected[r * cols ..][0..cols];
+        var amax: f32 = 0;
+        for (want) |v| amax = @max(amax, @abs(v));
+        const tol = 1e-6 * @max(amax, 10.0);
+        for (got[r * cols ..][0..cols], want) |ours, theirs| try testing.expectApproxEqAbs(theirs, ours, tol);
+    }
+}
+
+test "W6A8 quantize: matches comfy_kitchen w6a8_int8 exactly without the rotation" {
+    try expectW6a8EncodeMatches("convrot_expected.f32", "w6a8_norot_", 16, 6144, 0);
+}
+
+test "W6A8 quantize: matches comfy_kitchen w6a8_int8" {
+    try expectW6a8EncodeMatches("convrot_expected.f32", "w6a8_", 16, 6144, @intCast(asym_w4a8_convrot_group_size));
+}
+
+test "W6A8 quantize: zero groups and a dominant outlier match comfy_kitchen's scale search" {
+    // Drives s_rel to 0 and to subnormals, where comfy's lower candidate wraps to NaN and its
+    // upper one is the smallest subnormal.
+    try expectW6a8EncodeMatches("w6a8_edge_input.f32", "w6a8_edge_", 8, 512, @intCast(asym_w4a8_convrot_group_size));
+}
+
+test "W6A8 dequant: matches comfy_kitchen w6a8_int8" {
+    try expectW6a8DecodeMatches("w6a8_", 16, 6144);
+    try expectW6a8DecodeMatches("w6a8_edge_", 8, 512);
+}
+
+test "W6A8 planes: code c of column k lands in nibble k and two-bit slot k" {
+    // Hand-packed row of 32 columns, no rotation, s_rel 1.0 and s_channel 1.0, so each decoded
+    // value is the level itself: code - 32.
+    const allocator = std.testing.allocator;
+    const cols: usize = 32;
+    var codes: [cols]u8 = undefined;
+    for (&codes, 0..) |*c, k| c.* = @intCast((k * 37 + 5) % 64);
+    var row = [_]u8{0} ** (cols / 4 * 3);
+    for (codes, 0..) |c, k| {
+        row[k / 2] |= (c & 0x0F) << @intCast(4 * (k % 2));
+        row[cols / 2 + k / 4] |= (c >> 4) << @intCast(2 * (k % 4));
+    }
+    const one_fp8 = DataTransform.Quantizer.f32_to_fp8_e4m3(1.0);
+    const s_rel = [_]u8{ one_fp8, one_fp8 };
+    const s_channel = [_]f32{1.0};
+
+    var pool: thread_pool_mod.ThreadPool = undefined;
+    try pool.init(.{ .allocator = allocator, .n_jobs = 1 });
+    defer pool.deinit();
+
+    const got = try dequantizeAsymW4a8Raw(&row, &s_rel, &s_channel, null, null, 6, 1, cols, 16, 0, allocator, &pool);
+    defer allocator.free(got);
+    for (got, codes) |v, c| {
+        try testing.expectEqual(@as(f32, @floatFromInt(@as(i32, c) - 32)), v);
+    }
+}
+
+test "W6A8 round-trip is markedly more accurate than W4A8 on the same weight" {
+    // comfy_kitchen measures about 3x lower weight error. Require 2x, so a broken scale search
+    // or a mis-packed plane cannot hide behind the extra two bits.
+    const allocator = std.testing.allocator;
+    const input_raw = (try loadFixture(allocator, "convrot_expected.f32")) orelse return error.SkipZigTest;
+    defer allocator.free(input_raw);
+    const input: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(input_raw)));
+    const rows: usize = 16;
+    const cols: usize = 6144;
+    const gs: usize = @intCast(asym_w4a8_group_size);
+    const cgs: usize = @intCast(asym_w4a8_convrot_group_size);
+
+    var pool: thread_pool_mod.ThreadPool = undefined;
+    try pool.init(.{ .allocator = allocator, .n_jobs = 4 });
+    defer pool.deinit();
+
+    const Q = DataTransform.Quantizer;
+    const w6 = try Q.quantizeToW6a8(allocator, input, rows, cols, cgs, &pool);
+    defer allocator.free(w6.weight);
+    defer allocator.free(w6.s_rel);
+    defer allocator.free(w6.s_channel);
+    const w6_out = try dequantizeAsymW4a8Raw(w6.weight, w6.s_rel, w6.s_channel, null, null, 6, rows, cols, gs, cgs, allocator, &pool);
+    defer allocator.free(w6_out);
+
+    const w4 = try Q.quantizeToAsymW4a8(allocator, input, rows, cols, cgs, &pool);
+    defer allocator.free(w4.weight);
+    defer allocator.free(w4.s_rel);
+    defer allocator.free(w4.s_channel);
+    const w4_out = try dequantizeAsymW4a8Raw(w4.weight, w4.s_rel, w4.s_channel, &Q.w4a8_codebook, null, 4, rows, cols, gs, cgs, allocator, &pool);
+    defer allocator.free(w4_out);
+
+    var num6: f64 = 0;
+    var num4: f64 = 0;
+    var den: f64 = 0;
+    for (input, w6_out, w4_out) |ref, a, b| {
+        num6 += (a - ref) * (a - ref);
+        num4 += (b - ref) * (b - ref);
+        den += ref * ref;
+    }
+    const rel6 = @sqrt(num6 / den);
+    const rel4 = @sqrt(num4 / den);
+    if (rel6 * 2.0 >= rel4) {
+        std.debug.print("W6A8 rel L2 {d:.5} vs W4A8 {d:.5} (expected W6A8 at least 2x lower)\n", .{ rel6, rel4 });
+    }
+    try testing.expect(rel6 * 2.0 < rel4);
+}
+
+test "W6A8 cluster layout: 3*cols/4 byte weight, no codebook, w6a8_int8 marker" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const dims = [_]usize{ 8, 512 };
+    const specs = (try clusterWriteLayout(arena.allocator(), .W6A8_INT8, &dims)).?;
+    try testing.expectEqual(@as(usize, 4), specs.len);
+    try testing.expectEqualStrings(".weight", specs[0].suffix);
+    try testing.expectEqualSlices(usize, &.{ 8, 384 }, specs[0].dims);
+    try testing.expectEqualStrings(".weight_s_rel", specs[1].suffix);
+    try testing.expectEqualSlices(usize, &.{ 8, 32 }, specs[1].dims);
+    try testing.expectEqualStrings(".weight_s_channel", specs[2].suffix);
+    try testing.expectEqualStrings(".comfy_quant", specs[3].suffix);
+    try testing.expectEqual(ComfyQuantScheme.w6a8_int8, parseComfyQuantScheme(w6a8_comfy_json));
+    try testing.expectEqual(@as(u64, 8 * 384), types.DataType.W6A8_INT8.calcSizeInBytes(8 * 512));
 }
 
 test "NVFP4 encode→decode round-trip: fixture data" {

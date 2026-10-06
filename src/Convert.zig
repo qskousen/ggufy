@@ -197,7 +197,7 @@ pub fn validateDatatypeForFiletype(datatype: ?types.DataType, filetype: types.Fi
             .safetensors => std.log.err(
                 "{s} is a GGUF block-quantized type and cannot be stored in a SafeTensors file. " ++
                     "Use -f gguf to write a GGUF, or choose a SafeTensors type " ++
-                    "(F16, BF16, F8_E4M3, SCALED_F8_E4M3, INT8, INT8_CONVROT, INT4_CONVROT, ASYM_W4A8_INT8, MXFP4, MXFP8_E4M3, NVFP4).",
+                    "(F16, BF16, F8_E4M3, SCALED_F8_E4M3, INT8, INT8_CONVROT, INT4_CONVROT, ASYM_W4A8_INT8, ASYM_W4A8_INT8_ZP, W6A8_INT8, MXFP4, MXFP8_E4M3, NVFP4).",
                 .{@tagName(dt)},
             ),
             .gguf => std.log.err(
@@ -763,6 +763,13 @@ pub fn convert(
         return error.UpscalingNotAllowed;
     }
 
+    if (opts.datatype == .ASYM_W4A8_INT8_ZP) {
+        std.log.warn(
+            "ASYM_W4A8_INT8_ZP: current ComfyUI drops weight_correction when loading, and decodes these layers wrong. comfy_kitchen and ggufy read them correctly.",
+            .{},
+        );
+    }
+
     var prep = try prepareConversion(f, opts, allocator, arena_alloc);
 
     // --- Write output ---------------------------------------------------------
@@ -889,7 +896,9 @@ pub fn liftToFloor(target: types.DataType, min: imagearch.Precision) ?types.Data
     return switch (target) {
         // Rotated-int cluster line: the 8-bit rung keeps the Hadamard rotation and
         // the per-row scale, so only the element width changes.
-        .INT4_CONVROT, .INT4_CONVROT_SR, .ASYM_W4A8_INT8 => if (want <= 8) .INT8_CONVROT else null,
+        .INT4_CONVROT, .INT4_CONVROT_SR, .W6A8_INT8 => if (want <= 8) .INT8_CONVROT else null,
+        // W6A8 is W4A8's own layout and kernel at 6 bits, so it is the nearer rung.
+        .ASYM_W4A8_INT8, .ASYM_W4A8_INT8_ZP => if (want <= 6) .W6A8_INT8 else if (want <= 8) .INT8_CONVROT else null,
         // Block-scaled FP line. Both lift to MXFP8 rather than to SCALED_F8_E4M3,
         // which is also 8-bit and slightly smaller: scaled-fp8 carries a single F32
         // for the whole tensor, so it would buy four bits of element precision while
@@ -1546,7 +1555,7 @@ fn clusterEligible(t: *const types.Tensor, ttype: types.DataType, num_elements: 
         // Two separate constraints on the input dim: the rotation group and the scale group.
         // The rotation group is a multiple of the scale group today, so the first check covers
         // both, but the scale group is a per-layer field and need not stay 16.
-        .ASYM_W4A8_INT8 => t.dims.len == 2 and
+        .ASYM_W4A8_INT8, .ASYM_W4A8_INT8_ZP, .W6A8_INT8 => t.dims.len == 2 and
             n_cols % TensorClusters.asym_w4a8_convrot_group_size == 0 and
             n_cols % TensorClusters.asym_w4a8_group_size == 0,
         else => false,
@@ -3321,6 +3330,12 @@ test "liftToFloor stays inside the requested format's family" {
     try testing.expectEqual(types.DataType.INT8_CONVROT, liftToFloor(.INT4_CONVROT, F.bits8).?);
     try testing.expectEqual(types.DataType.INT8_CONVROT, liftToFloor(.INT4_CONVROT_SR, F.bits8).?);
     try testing.expectEqual(types.DataType.INT8_CONVROT, liftToFloor(.ASYM_W4A8_INT8, F.bits8).?);
+    try testing.expectEqual(types.DataType.W6A8_INT8, liftToFloor(.ASYM_W4A8_INT8, F.bits6).?);
+    try testing.expectEqual(types.DataType.W6A8_INT8, liftToFloor(.ASYM_W4A8_INT8_ZP, F.bits6).?);
+    try testing.expectEqual(types.DataType.INT8_CONVROT, liftToFloor(.ASYM_W4A8_INT8_ZP, F.bits8).?);
+    try testing.expectEqual(types.DataType.W6A8_INT8, liftToFloor(.ASYM_W4A8_INT8, F.bits5).?);
+    try testing.expectEqual(types.DataType.W6A8_INT8, liftToFloor(.W6A8_INT8, F.bits6).?);
+    try testing.expectEqual(types.DataType.INT8_CONVROT, liftToFloor(.W6A8_INT8, F.bits8).?);
     // Float lines step to their own siblings, not to an int format.
     try testing.expectEqual(types.DataType.MXFP8_E4M3, liftToFloor(.NVFP4, F.bits8).?);
     try testing.expectEqual(types.DataType.MXFP8_E4M3, liftToFloor(.MXFP4, F.bits8).?);
@@ -3348,6 +3363,7 @@ test "assignTensorType: sensenova_u15 floors down_proj on every output path" {
         .{ .target = .INT4_CONVROT, .filetype = .safetensors, .want = "INT8_CONVROT" },
         .{ .target = .NVFP4, .filetype = .safetensors, .want = "MXFP8_E4M3" },
         .{ .target = .ASYM_W4A8_INT8, .filetype = .safetensors, .want = "INT8_CONVROT" },
+        .{ .target = .W6A8_INT8, .filetype = .safetensors, .want = "INT8_CONVROT" },
         // Already at the floor: must pass through untouched, not get lifted again.
         .{ .target = .INT8_CONVROT, .filetype = .safetensors, .want = "INT8_CONVROT" },
     };
@@ -3382,6 +3398,41 @@ test "assignTensorType: sensenova_u15 floors down_proj on every output path" {
         };
         try assignTensorType(&twin, n, &imagearch.sensenova_u15, QUANTIZATION_THRESHOLD, opts, false, null, a);
         try testing.expectEqualStrings(@tagName(c.target), twin.type);
+    }
+}
+
+test "assignTensorType: qwen_image21 quantizes the blocks and nothing else" {
+    const Case = struct { target: types.DataType, filetype: types.FileType, spared: []const u8 };
+    const cases = [_]Case{
+        // ComfyUI cannot carry bf16 through GGUF, so spared tensors widen to f32.
+        .{ .target = .q4_k, .filetype = .gguf, .spared = "f32" },
+        .{ .target = .q8_0, .filetype = .gguf, .spared = "f32" },
+        .{ .target = .INT8_CONVROT, .filetype = .safetensors, .spared = "BF16" },
+        .{ .target = .NVFP4, .filetype = .safetensors, .spared = "BF16" },
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    for (cases) |c| {
+        var opts = testOpts(c.target);
+        opts.filetype = c.filetype;
+
+        var mod_dims = [_]usize{ 16384, 4096 };
+        var mod = types.Tensor{ .name = "modulation.1.weight", .type = "BF16", .dims = &mod_dims, .size = 0, .offset = 0 };
+        try assignTensorType(&mod, 16384 * 4096, &imagearch.qwen21, QUANTIZATION_THRESHOLD, opts, false, null, a);
+        try testing.expectEqualStrings(c.spared, mod.type);
+
+        var sq_dims = [_]usize{ 4096, 4096 };
+        var txt = types.Tensor{ .name = "txt_in.in_layer.weight", .type = "BF16", .dims = &sq_dims, .size = 0, .offset = 0 };
+        try assignTensorType(&txt, 4096 * 4096, &imagearch.qwen21, QUANTIZATION_THRESHOLD, opts, false, null, a);
+        try testing.expectEqualStrings(c.spared, txt.type);
+
+        var gu_dims = [_]usize{ 24576, 4096 };
+        var gate_up = types.Tensor{ .name = "transformer_blocks.3.img_mlp.gate_up.weight", .type = "BF16", .dims = &gu_dims, .size = 0, .offset = 0 };
+        try assignTensorType(&gate_up, 24576 * 4096, &imagearch.qwen21, QUANTIZATION_THRESHOLD, opts, false, null, a);
+        try testing.expectEqualStrings(@tagName(c.target), gate_up.type);
     }
 }
 

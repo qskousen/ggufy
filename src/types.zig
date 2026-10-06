@@ -139,6 +139,8 @@ pub const DataType = enum {
     INT4_CONVROT, // ComfyUI convrot_w4a4 cluster: I8 nibble-packed signed 4-bit weight (Hadamard-rotated) + F32 per-row scale + comfy_quant
     INT4_CONVROT_SR, // Same on-disk convrot_w4a4 format as INT4_CONVROT, but quantized with stochastic rounding ("SR")
     ASYM_W4A8_INT8, // ComfyUI asym_w4a8_int8 cluster: rotated 4-bit codebook indices + fp8 per-group scale + F32 per-row scale + F32 codebook + comfy_quant
+    ASYM_W4A8_INT8_ZP, // ASYM_W4A8_INT8's asymmetric form: uniform codes over each group's range + a BF16 per-group correction. Current ComfyUI drops the correction on load.
+    W6A8_INT8, // ComfyUI w6a8_int8 cluster: same layout as ASYM_W4A8_INT8 with uniform 6-bit codes and no codebook
     BF16,
     F16,
     F32,
@@ -255,7 +257,7 @@ pub const DataType = enum {
 
     pub fn formatType(self: DataType) FileType {
         return switch (self) {
-            .F8_E4M3, .F8_E5M2, .SCALED_F8_E4M3, .F4_E2M1, .MXFP4, .MXFP8_E4M3, .NVFP4, .INT8, .INT8_CONVROT, .INT4_CONVROT, .INT4_CONVROT_SR, .ASYM_W4A8_INT8, .BF16, .F16, .F32, .F64, .I8, .I16, .I32, .I64, .U8, .U16, .U32, .U64 => FileType.safetensors,
+            .F8_E4M3, .F8_E5M2, .SCALED_F8_E4M3, .F4_E2M1, .MXFP4, .MXFP8_E4M3, .NVFP4, .INT8, .INT8_CONVROT, .INT4_CONVROT, .INT4_CONVROT_SR, .ASYM_W4A8_INT8, .ASYM_W4A8_INT8_ZP, .W6A8_INT8, .BF16, .F16, .F32, .F64, .I8, .I16, .I32, .I64, .U8, .U16, .U32, .U64 => FileType.safetensors,
             .f32, .f16, .q4_0, .q4_1, .q4_2, .q4_3, .q5_0, .q5_1, .q8_0, .q8_1, .q2_k, .q3_k, .q4_k, .q5_k, .q6_k, .q8_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq1_s, .iq4_nl, .iq3_s, .iq2_s, .iq4_xs, .i8, .i16, .i32, .i64, .f64, .iq1_m, .bf16, .q4_0_4_4, .q4_0_4_8, .q4_0_8_8, .tq1_0, .tq2_0, .iq4_nl_4_4, .iq4_nl_4_8, .iq4_nl_8_8, .mxfp4, .nvfp4, .q1_0, .count => FileType.gguf,
         };
     }
@@ -266,12 +268,12 @@ pub const DataType = enum {
             .q1_0, .iq1_s, .iq1_m => 1,
             .q2_k, .iq2_xxs, .iq2_xs, .iq2_s, .tq1_0, .tq2_0 => 2,
             .q3_k, .iq3_xxs, .iq3_s => 3,
-            .F4_E2M1, .MXFP4, .NVFP4, .INT4_CONVROT, .INT4_CONVROT_SR, .ASYM_W4A8_INT8 => 4,
+            .F4_E2M1, .MXFP4, .NVFP4, .INT4_CONVROT, .INT4_CONVROT_SR, .ASYM_W4A8_INT8, .ASYM_W4A8_INT8_ZP => 4,
             .q4_0, .q4_1, .q4_2, .q4_3, .q4_k, .mxfp4, .nvfp4 => 4,
             .iq4_nl, .iq4_xs, .iq4_nl_4_4, .iq4_nl_4_8, .iq4_nl_8_8 => 4,
             .q4_0_4_4, .q4_0_4_8, .q4_0_8_8 => 4,
             .q5_0, .q5_1, .q5_k => 5,
-            .q6_k => 6,
+            .q6_k, .W6A8_INT8 => 6,
             .F8_E4M3, .F8_E5M2, .SCALED_F8_E4M3, .MXFP8_E4M3, .INT8, .INT8_CONVROT => 8,
             .I8, .U8, .i8, .q8_0, .q8_1, .q8_k => 8,
             .BF16, .F16, .I16, .U16, .bf16, .f16, .i16 => 16,
@@ -288,7 +290,8 @@ pub const DataType = enum {
         if (self == .SCALED_F8_E4M3 or self == .INT8_CONVROT or self == .INT8) return n_elements;
         // These pack two 4-bit values per byte; report the packed weight bytes. Their scale
         // tensors are added on by clusterWriteSize, like every other cluster type.
-        if (self == .INT4_CONVROT or self == .INT4_CONVROT_SR or self == .ASYM_W4A8_INT8) return (n_elements + 1) / 2;
+        if (self == .INT4_CONVROT or self == .INT4_CONVROT_SR or self == .ASYM_W4A8_INT8 or self == .ASYM_W4A8_INT8_ZP) return (n_elements + 1) / 2;
+        if (self == .W6A8_INT8) return n_elements / 4 * 3;
         return switch (self.formatType()) {
             .safetensors => {
                 const t = Safetensors.DType.fromString(@tagName(self)) catch unreachable;

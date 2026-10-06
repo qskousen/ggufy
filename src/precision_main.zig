@@ -72,6 +72,7 @@ fn reportChains(w: W, allocator: std.mem.Allocator, input: []const f32, pool: *T
         .{ .name = "F8_E4M3→NVFP4", .steps = &.{ .f8_e4m3, .nvfp4 } },
         .{ .name = "F16→Q8_0→F16", .steps = &.{ .f16, .q8_0, .f16 } },
         .{ .name = "INT8_CR→INT4_CR", .steps = &.{ .int8_convrot, .int4_convrot } },
+        .{ .name = "W6A8→W4A8", .steps = &.{ .w6a8, .asym_w4a8 } },
     };
 
     try w.print("| Chain               |  SNR(dB) |      RMSE |   cosine |  relFrob |\n", .{});
@@ -90,7 +91,7 @@ fn reportChains(w: W, allocator: std.mem.Allocator, input: []const f32, pool: *T
 /// Repeated same-format round-trips — does error stabilize? (synthetic only)
 fn reportRepeated(w: W, allocator: std.mem.Allocator, pool: *ThreadPool) !void {
     const n_trips = 5;
-    const watched = [_]h.Format{ .f8_e4m3, .q8_0, .q4_k, .q2_k, .mxfp4, .mxfp8, .nvfp4, .int8, .int4_convrot };
+    const watched = [_]h.Format{ .f8_e4m3, .q8_0, .q4_k, .q2_k, .mxfp4, .mxfp8, .nvfp4, .int8, .int4_convrot, .asym_w4a8, .w6a8 };
 
     try w.print("\n## Repeated round-trips (stability)\n", .{});
     try w.print("\n{d} successive round-trips of the same format on `gaussian_weight`, each measured vs. the original. A stable quantizer reaches a fixed point after trip 1.\n\n", .{n_trips});

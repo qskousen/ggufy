@@ -1,0 +1,7 @@
+{
+  "rows": 8,
+  "cols": 512,
+  "group_size": 16,
+  "convrot_groupsize": 256,
+  "bits": 6
+}

@@ -160,6 +160,22 @@ pub fn build(b: *std.Build) void {
     const run_bench_eff = b.addRunArtifact(bench_eff);
     b.step("bench-efficiency", "Run quantization efficiency benchmarks").dependOn(&run_bench_eff.step);
 
+    const bench_convrot = b.addExecutable(.{
+        .name = "bench-convrot",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_convrot.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ggml.h", .module = ggml_h_module },
+            },
+        }),
+    });
+    ggml.link(b, bench_convrot, target, optimize);
+    const run_bench_convrot = b.addRunArtifact(bench_convrot);
+    if (b.args) |args| run_bench_convrot.addArgs(args);
+    b.step("bench-convrot", "Time the ConvRot-family quantizers (follows -Doptimize)").dependOn(&run_bench_convrot.step);
+
     // --- Tests ---
 
     const test_step = b.step("test", "Run tests");

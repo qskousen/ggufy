@@ -52,6 +52,9 @@ pub const Format = enum {
     int8_convrot,
     int4,
     int4_convrot,
+    asym_w4a8,
+    asym_w4a8_zp,
+    w6a8,
 };
 
 pub const FormatSpec = struct {
@@ -83,6 +86,11 @@ pub const formats = [_]FormatSpec{
     .{ .fmt = .int8_convrot, .name = "INT8_CR", .bits = 8.03 },
     .{ .fmt = .int4, .name = "INT4", .bits = 4.03 },
     .{ .fmt = .int4_convrot, .name = "INT4_CR", .bits = 4.03 },
+    // Codes plus an fp8 scale per 16 columns plus the per-row f32.
+    .{ .fmt = .asym_w4a8, .name = "W4A8", .bits = 4.53 },
+    // Plus a bf16 correction per 16 columns.
+    .{ .fmt = .asym_w4a8_zp, .name = "W4A8_ZP", .bits = 5.53 },
+    .{ .fmt = .w6a8, .name = "W6A8", .bits = 6.53 },
 };
 
 /// The GGUF datatype used for each byte-based format's round-trip.
@@ -166,6 +174,38 @@ pub fn roundtrip(
             defer allocator.free(enc.weight);
             defer allocator.free(enc.scale);
             break :blk try TC.dequantizeInt4Raw(enc.weight, enc.scale, rows, cols, cr, convrot_group_size, allocator, pool);
+        },
+        // Rotated at the format's own group of 256, which the harness's 256 columns divide.
+        .asym_w4a8 => blk: {
+            const cgs: usize = @intCast(TC.asym_w4a8_convrot_group_size);
+            const enc = try Q.quantizeToAsymW4a8(allocator, input, rows, cols, cgs, pool);
+            defer allocator.free(enc.weight);
+            defer allocator.free(enc.s_rel);
+            defer allocator.free(enc.s_channel);
+            break :blk try TC.dequantizeAsymW4a8Raw(enc.weight, enc.s_rel, enc.s_channel, &Q.w4a8_codebook, null, 4, rows, cols, Q.w4a8_group_size, cgs, allocator, pool);
+        },
+        // The correction goes through bf16 as it does on disk.
+        .asym_w4a8_zp => blk: {
+            const cgs: usize = @intCast(TC.asym_w4a8_convrot_group_size);
+            const enc = try Q.quantizeToAsymW4a8Zp(allocator, input, rows, cols, cgs, pool);
+            defer allocator.free(enc.weight);
+            defer allocator.free(enc.s_rel);
+            defer allocator.free(enc.s_channel);
+            defer allocator.free(enc.correction);
+            const bf16 = try Q.convertTensorData(allocator, std.mem.sliceAsBytes(enc.correction), .F32, .BF16, enc.correction.len, pool);
+            defer allocator.free(bf16);
+            const back = try Q.convertTensorData(allocator, bf16, .BF16, .F32, enc.correction.len, pool);
+            defer allocator.free(back);
+            const corr: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(back)));
+            break :blk try TC.dequantizeAsymW4a8Raw(enc.weight, enc.s_rel, enc.s_channel, null, corr, 4, rows, cols, Q.w4a8_group_size, cgs, allocator, pool);
+        },
+        .w6a8 => blk: {
+            const cgs: usize = @intCast(TC.asym_w4a8_convrot_group_size);
+            const enc = try Q.quantizeToW6a8(allocator, input, rows, cols, cgs, pool);
+            defer allocator.free(enc.weight);
+            defer allocator.free(enc.s_rel);
+            defer allocator.free(enc.s_channel);
+            break :blk try TC.dequantizeAsymW4a8Raw(enc.weight, enc.s_rel, enc.s_channel, null, null, 6, rows, cols, Q.w4a8_group_size, cgs, allocator, pool);
         },
         else => unreachable, // byte-based formats handled above
     };
@@ -388,6 +428,20 @@ test "ConvRot rotation helps on heavy-tailed data" {
     try testing.expect(rotated_snr >= plain_snr - 0.5);
 }
 
+test "W6A8 keeps markedly more signal than W4A8" {
+    var pool = testPool();
+    const input = try generate(.gaussian_weight, testing.allocator, test_n, 0x6A8);
+    defer testing.allocator.free(input);
+
+    const w4 = try roundtrip(.asym_w4a8, testing.allocator, input, test_rows, test_cols, &pool);
+    defer testing.allocator.free(w4);
+    const w6 = try roundtrip(.w6a8, testing.allocator, input, test_rows, test_cols, &pool);
+    defer testing.allocator.free(w6);
+
+    // comfy_kitchen measures about 3x lower error, 9.5 dB. 6 dB is half the error.
+    try testing.expect(metrics.compute(input, w6).snr_db > metrics.compute(input, w4).snr_db + 6.0);
+}
+
 test "float formats round-trip the exact-representable set near-perfectly" {
     var pool = testPool();
     const input = try generate(.exact_fp4, testing.allocator, test_n, 0x99);
@@ -410,6 +464,9 @@ test "repeated round-trips stabilize (idempotent after first trip)" {
 
     // A quantizer applied to its own output should reach a fixed point: trip 5
     // must be no worse than trip 2 by more than rounding noise.
+    // Not W4A8 or W6A8: decoded values sit on round(level * s_rel), an uneven int8 grid, so
+    // each trip fits fresh scales to off-grid data and loses about 1 dB at 6 bits, in
+    // comfy_kitchen too.
     inline for ([_]Format{ .q8_0, .q4_k, .mxfp8, .int8 }) |fmt| {
         var series: [5]metrics.Metrics = undefined;
         try roundtripSeries(fmt, testing.allocator, input, test_rows, test_cols, &pool, &series);
