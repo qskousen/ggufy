@@ -577,6 +577,15 @@ pub const qwen = Arch{
     },
     .shape_fix = true,
     .threshhold = null,
+    // The input/output projections, final AdaLN modulation and timestep MLP, as for
+    // Mage-Flow: about 0.2% of the weights, and ComfyUI's own quantized releases keep them.
+    .keys_hiprec = &.{
+        "img_in.",
+        "txt_in.",
+        "proj_out.",
+        "norm_out.linear",
+        "time_text_embed",
+    },
     .upcast_from_bf16 = &.{
         "txt_norm.weight",
         ".norm_k.weight",
@@ -1446,6 +1455,26 @@ test "mage_flow floors the modulation up-projections at 8 bits" {
 
     // The bottleneck is spared outright, not floored.
     try std.testing.expect(!mageflow.isHighPrecision("transformer_blocks.0.img_mod.1.weight"));
+}
+
+test "qwen_image spares its input/output projections and timestep MLP, not the blocks" {
+    for ([_][]const u8{
+        "model.diffusion_model.img_in.weight",
+        "model.diffusion_model.txt_in.weight",
+        "model.diffusion_model.proj_out.weight",
+        "model.diffusion_model.norm_out.linear.weight",
+        "model.diffusion_model.time_text_embed.timestep_embedder.linear_1.weight",
+        "model.diffusion_model.time_text_embed.timestep_embedder.linear_2.weight",
+    }) |k| try std.testing.expect(qwen.isHighPrecision(k));
+
+    for ([_][]const u8{
+        "model.diffusion_model.transformer_blocks.0.attn.to_out.0.weight",
+        "model.diffusion_model.transformer_blocks.0.attn.to_add_out.weight",
+        "model.diffusion_model.transformer_blocks.0.img_mod.1.weight",
+        "model.diffusion_model.transformer_blocks.0.img_mlp.net.2.weight",
+        "text_encoders.qwen25_7b.transformer.model.layers.0.self_attn.o_proj.weight",
+        "text_encoders.qwen25_7b.transformer.model.layers.0.mlp.down_proj.weight",
+    }) |k| try std.testing.expect(!qwen.isHighPrecision(k));
 }
 
 test "mage_flow upcasts rmsnorm scales" {
