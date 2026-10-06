@@ -599,6 +599,55 @@ pub const qwen = Arch{
     },
 };
 
+// Qwen-Image 2.1: a single-stream DiT, unrelated to Qwen-Image's block despite the
+// name. One modulation linear is shared by every block. Detected on the keys
+// ComfyUI uses; the MLP ships fused (gate_up) or split (proj + gate_layer).
+pub const qwen21 = Arch{
+    .name = "qwen_image21",
+    .keys_detect = &.{
+        &.{
+            "txt_in.text_norm.weight",
+            "modulation.1.weight",
+            "transformer_blocks.0.attn.norm_q.weight",
+            "img_in.weight",
+            "proj_out.weight",
+            "transformer_blocks.0.img_mlp.gate_up.weight",
+        },
+        &.{
+            "txt_in.text_norm.weight",
+            "modulation.1.weight",
+            "transformer_blocks.0.attn.norm_q.weight",
+            "img_in.weight",
+            "proj_out.weight",
+            "transformer_blocks.0.img_mlp.proj.weight",
+        },
+    },
+    .shape_fix = true,
+    .threshhold = null,
+    // Everything outside the blocks: 2% of the weights, yet quantizing it does as
+    // much damage as quantizing all 32 blocks, at 4 bits and at 8 alike (per-row
+    // int8 here doubles the image drift of a bf16-path int8 build). The shared
+    // modulation feeds every block's scale and gate.
+    .keys_hiprec = &.{
+        "img_in.",
+        "txt_in.",
+        "time_text_embed.",
+        "modulation.",
+        "norm_out.linear",
+        "proj_out.",
+    },
+    // text_norm stores scale - 1, so its values sit near zero.
+    .upcast_from_bf16 = &.{
+        "txt_in.text_norm.weight",
+        ".norm_k.weight",
+        ".norm_q.weight",
+    },
+    // ComfyUI reads in_channels from img_in.weight.shape[1]; NVFP4 packing halves it.
+    .keys_nvfp4_passthrough = &.{
+        "img_in.weight",
+    },
+};
+
 // Mage-Flow (microsoft/Mage) is a 12-layer native-resolution MMDiT that reuses
 // Qwen-Image's double-stream block verbatim. Its state dict has *exactly* the
 // same set of tensor names as Qwen-Image — only the dimensions differ — so name
@@ -1083,6 +1132,7 @@ pub const arch_list = [_]*const Arch{
     &sdxl,
     &sd1,
     &lumina2,
+    &qwen21,
     &mageflow,
     &qwen,
     &ernie,
@@ -1475,6 +1525,39 @@ test "qwen_image spares its input/output projections and timestep MLP, not the b
         "text_encoders.qwen25_7b.transformer.model.layers.0.self_attn.o_proj.weight",
         "text_encoders.qwen25_7b.transformer.model.layers.0.mlp.down_proj.weight",
     }) |k| try std.testing.expect(!qwen.isHighPrecision(k));
+}
+
+test "qwen_image21 spares everything outside the blocks, and only that" {
+    for ([_][]const u8{
+        "img_in.weight",
+        "txt_in.in_layer.weight",
+        "txt_in.out_layer.weight",
+        "time_text_embed.timestep_embedder.linear_1.weight",
+        "time_text_embed.timestep_embedder.linear_2.weight",
+        "modulation.1.weight",
+        "norm_out.linear.weight",
+        "model.diffusion_model.proj_out.weight",
+    }) |k| try std.testing.expect(qwen21.isHighPrecision(k));
+
+    for ([_][]const u8{
+        "transformer_blocks.0.attn.to_q.weight",
+        "transformer_blocks.0.attn.to_v.weight",
+        "transformer_blocks.17.attn.to_out.0.weight",
+        "transformer_blocks.31.img_mlp.gate_up.weight",
+        "transformer_blocks.31.img_mlp.out.weight",
+        "transformer_blocks.5.img_mlp.proj.weight",
+        "transformer_blocks.5.img_mlp.gate_layer.weight",
+    }) |k| try std.testing.expect(!qwen21.isHighPrecision(k));
+}
+
+test "qwen_image21 upcasts its norm scales and passes img_in through nvfp4" {
+    for ([_][]const u8{
+        "txt_in.text_norm.weight",
+        "transformer_blocks.0.attn.norm_q.weight",
+        "transformer_blocks.31.attn.norm_k.weight",
+    }) |k| try std.testing.expect(qwen21.shouldUpcast(k));
+    try std.testing.expect(!qwen21.shouldUpcast("transformer_blocks.0.attn.to_q.weight"));
+    try std.testing.expect(qwen21.isNvfp4Passthrough("img_in.weight"));
 }
 
 test "mage_flow upcasts rmsnorm scales" {

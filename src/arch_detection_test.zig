@@ -134,6 +134,37 @@ test "mageflow names alone are indistinguishable from qwen-image" {
     try std.testing.expectEqualStrings("qwen_image", imagearch.detectArch(names).?.name);
 }
 
+// Dumped from the bf16 single-file release, which ships the MLP fused.
+test "qwen image 2.1" {
+    try expectArchWithShapes(@embedFile("test_fixtures/qwen21.json"), "qwen_image21");
+}
+
+// The unfused MLP layout ComfyUI also accepts: gate_up split into proj + gate_layer.
+test "qwen image 2.1 with a split MLP" {
+    const allocator = std.testing.allocator;
+    const Entry = struct { name: []const u8, shape: []const usize };
+    const parsed = try std.json.parseFromSlice([]Entry, allocator, @embedFile("test_fixtures/qwen21.json"), .{});
+    defer parsed.deinit();
+
+    var names: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (names.items) |n| allocator.free(n);
+        names.deinit(allocator);
+    }
+    for (parsed.value) |e| {
+        if (std.mem.indexOf(u8, e.name, "img_mlp.gate_up.") != null) {
+            for ([_][]const u8{ "proj", "gate_layer" }) |half| {
+                const n = try std.mem.replaceOwned(u8, allocator, e.name, "gate_up", half);
+                errdefer allocator.free(n);
+                try names.append(allocator, n);
+            }
+        } else {
+            try names.append(allocator, try allocator.dupe(u8, e.name));
+        }
+    }
+    try std.testing.expectEqualStrings("qwen_image21", imagearch.detectArch(names.items).?.name);
+}
+
 // Dumped from a bf16 single-file checkpoint.
 test "sensenova u1.5 8B MoT" {
     try expectArch(@embedFile("test_fixtures/sensenova_u15.json"), "sensenova_u15");

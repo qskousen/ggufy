@@ -3401,6 +3401,41 @@ test "assignTensorType: sensenova_u15 floors down_proj on every output path" {
     }
 }
 
+test "assignTensorType: qwen_image21 quantizes the blocks and nothing else" {
+    const Case = struct { target: types.DataType, filetype: types.FileType, spared: []const u8 };
+    const cases = [_]Case{
+        // ComfyUI cannot carry bf16 through GGUF, so spared tensors widen to f32.
+        .{ .target = .q4_k, .filetype = .gguf, .spared = "f32" },
+        .{ .target = .q8_0, .filetype = .gguf, .spared = "f32" },
+        .{ .target = .INT8_CONVROT, .filetype = .safetensors, .spared = "BF16" },
+        .{ .target = .NVFP4, .filetype = .safetensors, .spared = "BF16" },
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    for (cases) |c| {
+        var opts = testOpts(c.target);
+        opts.filetype = c.filetype;
+
+        var mod_dims = [_]usize{ 16384, 4096 };
+        var mod = types.Tensor{ .name = "modulation.1.weight", .type = "BF16", .dims = &mod_dims, .size = 0, .offset = 0 };
+        try assignTensorType(&mod, 16384 * 4096, &imagearch.qwen21, QUANTIZATION_THRESHOLD, opts, false, null, a);
+        try testing.expectEqualStrings(c.spared, mod.type);
+
+        var sq_dims = [_]usize{ 4096, 4096 };
+        var txt = types.Tensor{ .name = "txt_in.in_layer.weight", .type = "BF16", .dims = &sq_dims, .size = 0, .offset = 0 };
+        try assignTensorType(&txt, 4096 * 4096, &imagearch.qwen21, QUANTIZATION_THRESHOLD, opts, false, null, a);
+        try testing.expectEqualStrings(c.spared, txt.type);
+
+        var gu_dims = [_]usize{ 24576, 4096 };
+        var gate_up = types.Tensor{ .name = "transformer_blocks.3.img_mlp.gate_up.weight", .type = "BF16", .dims = &gu_dims, .size = 0, .offset = 0 };
+        try assignTensorType(&gate_up, 24576 * 4096, &imagearch.qwen21, QUANTIZATION_THRESHOLD, opts, false, null, a);
+        try testing.expectEqualStrings(@tagName(c.target), gate_up.type);
+    }
+}
+
 test "precision floors do not touch architectures that declare none" {
     testing.log_level = .err;
     const dims = [_]usize{ 4096, 12288 };
