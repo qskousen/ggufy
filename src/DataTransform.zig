@@ -1510,6 +1510,124 @@ pub const Quantizer = struct {
         }
     }
 
+    // asym_w4a8_int8 in its asymmetric form: uniform codes over each group's own [min, max],
+    // and a per-group correction that puts the zero point back. Matches comfy_kitchen
+    // quantize_w4a8_int8_weight(symmetric=False, codebook=False) on the rotated weight:
+    //
+    //   group_scale = max((max(group) - min(group)) / 15, 1e-8)
+    //   code        = clamp(round((w - min(group)) / group_scale), 0, 15)
+    //   s_channel   = max(amax_row((code - 8) * group_scale) / 127, 1e-8)
+    //   s_rel       = fp8_e4m3(group_scale / s_channel)
+    //   correction  = 8 * group_scale + min(group)
+    //
+    // The codes are not reassigned against the rounded int8 grid, unlike the codebook form.
+    // correction is laid out [group][row], as ComfyUI stores it.
+
+    pub const AsymW4a8ZpData = struct {
+        weight: []u8, // packed 4-bit codes, [rows * cols / 2]
+        s_rel: []u8, // per-group scale, raw fp8 e4m3 bytes, [rows * cols / group_size]
+        s_channel: []f32, // per-output-row scale, [rows]
+        correction: []f32, // [cols / group_size * rows]
+    };
+
+    /// A convrot_group_size of 0 skips the rotation, which only tests want.
+    pub fn quantizeToAsymW4a8Zp(
+        allocator: std.mem.Allocator,
+        input: []const f32,
+        rows: usize,
+        cols: usize,
+        convrot_group_size: usize,
+        pool: *thread_pool_mod.ThreadPool,
+    ) !AsymW4a8ZpData {
+        if (input.len != rows * cols) return error.InputSizeMismatch;
+        if (cols % w4a8_group_size != 0) return error.ColsNotDivisibleByGroupSize;
+        if (convrot_group_size != 0 and cols % convrot_group_size != 0) return error.ColsNotDivisibleByGroupSize;
+
+        const rotated = try allocator.alloc(f32, input.len);
+        defer allocator.free(rotated);
+        @memcpy(rotated, input);
+        if (convrot_group_size != 0) try rotateGroupwiseInPlace(rotated, rows, cols, convrot_group_size, pool);
+
+        const groups_per_row = cols / w4a8_group_size;
+
+        const weight = try allocator.alloc(u8, rows * (cols / 2));
+        errdefer allocator.free(weight);
+        const s_rel = try allocator.alloc(u8, rows * groups_per_row);
+        errdefer allocator.free(s_rel);
+        const s_channel = try allocator.alloc(f32, rows);
+        errdefer allocator.free(s_channel);
+        const correction = try allocator.alloc(f32, rows * groups_per_row);
+        errdefer allocator.free(correction);
+
+        const group_scales = try allocator.alloc(f32, rows * groups_per_row);
+        defer allocator.free(group_scales);
+
+        const threads_u64: u64 = @intCast(pool.threads.len);
+        const rows_u64: u64 = @intCast(rows);
+        const rows_per_thread = @divTrunc(rows_u64, threads_u64);
+        const leftover = rows_u64 - (rows_per_thread * threads_u64);
+
+        var wg: thread_pool_mod.WaitGroup = .{};
+        var i: u64 = 0;
+        while (i < threads_u64) : (i += 1) {
+            const start = i * rows_per_thread;
+            var end = start + rows_per_thread;
+            if (i == threads_u64 - 1) end += leftover;
+            if (start == end) continue;
+            pool.spawnWg(&wg, quantizeAsymW4a8ZpRows, .{ rotated, weight, s_rel, s_channel, correction, group_scales, rows, cols, @as(usize, @intCast(start)), @as(usize, @intCast(end)) });
+        }
+        wg.wait();
+
+        return .{ .weight = weight, .s_rel = s_rel, .s_channel = s_channel, .correction = correction };
+    }
+
+    fn quantizeAsymW4a8ZpRows(
+        rotated: []const f32,
+        weight: []u8,
+        s_rel: []u8,
+        s_channel: []f32,
+        correction: []f32,
+        group_scales: []f32,
+        rows: usize,
+        cols: usize,
+        start_row: usize,
+        end_row: usize,
+    ) void {
+        const gs_n = w4a8_group_size;
+        const groups_per_row = cols / gs_n;
+        const packed_cols = cols / 2;
+
+        for (start_row..end_row) |r| {
+            const row = rotated[r * cols ..][0..cols];
+            const row_scales = group_scales[r * groups_per_row ..][0..groups_per_row];
+
+            var max_shifted: f32 = 0.0;
+            for (0..groups_per_row) |g| {
+                const grp = row[g * gs_n ..][0..gs_n];
+                const gv: GroupVec = grp.*;
+                const mn = @reduce(.Min, gv);
+                const gs: f32 = @max((@reduce(.Max, gv) - mn) / 15.0, 1e-8);
+                row_scales[g] = gs;
+                correction[g * rows + r] = 8.0 * gs + mn;
+
+                var codes: [gs_n]u8 = undefined;
+                for (&codes, 0..) |*c, j| {
+                    const q = std.math.clamp(roundHalfToEven((grp[j] - mn) / gs), 0.0, 15.0);
+                    c.* = @intFromFloat(q);
+                    max_shifted = @max(max_shifted, @abs((q - 8.0) * gs));
+                }
+                const base = g * gs_n;
+                for (0..gs_n / 2) |p| {
+                    weight[r * packed_cols + (base + 2 * p) / 2] = codes[2 * p] | (codes[2 * p + 1] << 4);
+                }
+            }
+
+            const sc: f32 = @max(max_shifted / 127.0, 1e-8);
+            s_channel[r] = sc;
+            for (0..groups_per_row) |g| s_rel[r * groups_per_row + g] = f32_to_fp8_e4m3(row_scales[g] / sc);
+        }
+    }
+
     // w6a8_int8: the same ComfyUI layout as asym_w4a8_int8 at bits=6. Uniform levels -31..31
     // instead of a codebook, stored as code q+32, and the fp8 group scale is then searched over
     // its e4m3 neighbours for the one whose rounded int8 grid fits the group best. Matches

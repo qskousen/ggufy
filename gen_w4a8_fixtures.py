@@ -18,6 +18,19 @@ Outputs, into src/test_fixtures:
     w4a8_codebook.f32    the 16 levels
     w4a8_expected.f32    decoded weight, un-rotated, [rows, cols]
     w4a8_meta.json       shapes and group sizes
+
+Two more layouts the format allows, decode only, since ggufy writes just the codebook form:
+    w4a8_uniform_*       symmetric without a codebook: level = code - 8
+    w4a8_asym_*          asymmetric: level = code - 8, plus a per-group correction added after
+                         the channel scale, stored [groups, rows] in the weight's dtype. The
+                         input is the same slice in bf16 plus an offset, so the correction is
+                         bf16 and carries real weight.
+Each writes weight.u8, s_rel.u8, s_channel.f32 and expected.f32; asym adds correction.bf16.
+
+And the asymmetric encoder ggufy writes, from the f32 slice so the correction comes back f32:
+    w4a8_zp_*            rotated, through quantize_w4a8_int8_weight
+    w4a8_zp_norot_*      the rotation skipped, so the Zig side must match exactly
+Each writes weight.u8, s_rel.u8, s_channel.f32 and correction.f32 ([groups, rows]).
 """
 import json
 import os
@@ -27,6 +40,7 @@ import torch
 
 from comfy_kitchen.backends.eager.w4a8_int8 import (
     _FIXED_LUT,
+    _quantize_rotated_w4a8_int8_weight,
     dequantize_w4a8_int8_weight,
     quantize_w4a8_int8_weight,
 )
@@ -105,5 +119,68 @@ def main():
         print("         writes the frozen LUT, so the quantize test will not match.")
 
 
+def emit_variant(prefix, weight, symmetric):
+    packed, s_rel, s_channel, correction, codebook = quantize_w4a8_int8_weight(
+        weight,
+        group_size=GROUP_SIZE,
+        convrot_groupsize=CONVROT_GROUPSIZE,
+        symmetric=symmetric,
+        scale_dtype=torch.float8_e4m3fn,
+        codebook=False,
+    )
+    assert codebook is None
+    assert (correction is None) == symmetric
+    expected = dequantize_w4a8_int8_weight(
+        packed,
+        s_rel,
+        s_channel,
+        codebook=None,
+        correction=correction,
+        group_size=GROUP_SIZE,
+        convrot_groupsize=CONVROT_GROUPSIZE,
+        output_dtype=torch.float32,
+    )
+    outs = [
+        ("weight.u8", packed.cpu().numpy().view(np.uint8)),
+        ("s_rel.u8", s_rel.cpu().view(torch.uint8).numpy()),
+        ("s_channel.f32", s_channel.cpu().float().numpy()),
+        ("expected.f32", expected.cpu().float().numpy()),
+    ]
+    if correction is not None:
+        assert correction.dtype == torch.bfloat16 and tuple(correction.shape) == (COLS // GROUP_SIZE, ROWS)
+        outs.append(("correction.bf16", correction.cpu().view(torch.int16).numpy()))
+    for name, arr in outs:
+        arr.tofile(os.path.join(OUT_DIR, prefix + name))
+        print(f"  {prefix + name:28s} {arr.dtype!s:8s} {list(arr.shape)} -> {arr.nbytes} bytes")
+
+
+def emit_zp(prefix, weight, rotate):
+    kw = dict(group_size=GROUP_SIZE, symmetric=False, scale_dtype=torch.float8_e4m3fn, codebook=False)
+    if rotate:
+        out = quantize_w4a8_int8_weight(weight, convrot_groupsize=CONVROT_GROUPSIZE, **kw)
+    else:
+        out = _quantize_rotated_w4a8_int8_weight(weight, **kw)
+    packed, s_rel, s_channel, correction, codebook = out
+    assert codebook is None and correction.dtype == torch.float32
+    for name, arr in (
+        ("weight.u8", packed.cpu().numpy().view(np.uint8)),
+        ("s_rel.u8", s_rel.cpu().view(torch.uint8).numpy()),
+        ("s_channel.f32", s_channel.cpu().float().numpy()),
+        ("correction.f32", correction.cpu().numpy()),
+    ):
+        arr.tofile(os.path.join(OUT_DIR, prefix + name))
+        print(f"  {prefix + name:28s} {arr.dtype!s:8s} {list(arr.shape)} -> {arr.nbytes} bytes")
+
+
+def main_variants():
+    src = os.path.join(OUT_DIR, "convrot_expected.f32")
+    weight = torch.from_numpy(np.fromfile(src, dtype=np.float32).reshape(ROWS, COLS).copy())
+    emit_variant("w4a8_uniform_", weight, symmetric=True)
+    emit_variant("w4a8_asym_", (weight + 0.05).to(torch.bfloat16), symmetric=False)
+    emit_zp("w4a8_zp_", weight, rotate=True)
+    emit_zp("w4a8_zp_norot_", weight, rotate=False)
+
+
 if __name__ == "__main__":
     main()
+    main_variants()

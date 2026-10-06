@@ -53,6 +53,7 @@ pub const Format = enum {
     int4,
     int4_convrot,
     asym_w4a8,
+    asym_w4a8_zp,
     w6a8,
 };
 
@@ -87,6 +88,8 @@ pub const formats = [_]FormatSpec{
     .{ .fmt = .int4_convrot, .name = "INT4_CR", .bits = 4.03 },
     // Codes plus an fp8 scale per 16 columns plus the per-row f32.
     .{ .fmt = .asym_w4a8, .name = "W4A8", .bits = 4.53 },
+    // Plus a bf16 correction per 16 columns.
+    .{ .fmt = .asym_w4a8_zp, .name = "W4A8_ZP", .bits = 5.53 },
     .{ .fmt = .w6a8, .name = "W6A8", .bits = 6.53 },
 };
 
@@ -179,7 +182,22 @@ pub fn roundtrip(
             defer allocator.free(enc.weight);
             defer allocator.free(enc.s_rel);
             defer allocator.free(enc.s_channel);
-            break :blk try TC.dequantizeAsymW4a8Raw(enc.weight, enc.s_rel, enc.s_channel, &Q.w4a8_codebook, 4, rows, cols, Q.w4a8_group_size, cgs, allocator, pool);
+            break :blk try TC.dequantizeAsymW4a8Raw(enc.weight, enc.s_rel, enc.s_channel, &Q.w4a8_codebook, null, 4, rows, cols, Q.w4a8_group_size, cgs, allocator, pool);
+        },
+        // The correction goes through bf16 as it does on disk.
+        .asym_w4a8_zp => blk: {
+            const cgs: usize = @intCast(TC.asym_w4a8_convrot_group_size);
+            const enc = try Q.quantizeToAsymW4a8Zp(allocator, input, rows, cols, cgs, pool);
+            defer allocator.free(enc.weight);
+            defer allocator.free(enc.s_rel);
+            defer allocator.free(enc.s_channel);
+            defer allocator.free(enc.correction);
+            const bf16 = try Q.convertTensorData(allocator, std.mem.sliceAsBytes(enc.correction), .F32, .BF16, enc.correction.len, pool);
+            defer allocator.free(bf16);
+            const back = try Q.convertTensorData(allocator, bf16, .BF16, .F32, enc.correction.len, pool);
+            defer allocator.free(back);
+            const corr: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(back)));
+            break :blk try TC.dequantizeAsymW4a8Raw(enc.weight, enc.s_rel, enc.s_channel, null, corr, 4, rows, cols, Q.w4a8_group_size, cgs, allocator, pool);
         },
         .w6a8 => blk: {
             const cgs: usize = @intCast(TC.asym_w4a8_convrot_group_size);
@@ -187,7 +205,7 @@ pub fn roundtrip(
             defer allocator.free(enc.weight);
             defer allocator.free(enc.s_rel);
             defer allocator.free(enc.s_channel);
-            break :blk try TC.dequantizeAsymW4a8Raw(enc.weight, enc.s_rel, enc.s_channel, null, 6, rows, cols, Q.w4a8_group_size, cgs, allocator, pool);
+            break :blk try TC.dequantizeAsymW4a8Raw(enc.weight, enc.s_rel, enc.s_channel, null, null, 6, rows, cols, Q.w4a8_group_size, cgs, allocator, pool);
         },
         else => unreachable, // byte-based formats handled above
     };
