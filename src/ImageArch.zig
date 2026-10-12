@@ -298,7 +298,8 @@ pub const flux = Arch{
         &.{"transformer_blocks.0.attn.norm_added_k.weight"},
         &.{"double_blocks.0.img_attn.proj.weight"},
     },
-    .keys_banned = &.{"transformer_blocks.0.attn.norm_added_k.weight"},
+    // HunyuanVideo under ComfyUI's names shares flux's double_blocks; ComfyUI tells them apart by its token refiner.
+    .keys_banned = &.{ "transformer_blocks.0.attn.norm_added_k.weight", "txt_in.individual_token_refiner.blocks.0.norm1.weight" },
     .threshhold = null,
     .upcast_from_bf16 = &.{
         ".norm.query_norm.scale",
@@ -432,9 +433,15 @@ pub const cosmos = Arch{
 pub const hyvid = Arch{
     .name = "hyvid",
     .keys_detect = &.{
+        // Tencent's names, which ComfyUI renames on load.
         &.{
             "double_blocks.0.img_attn_proj.weight",
             "txt_in.individual_token_refiner.blocks.1.self_attn_qkv.weight",
+        },
+        // ComfyUI's own, as Comfy-Org ships it.
+        &.{
+            "double_blocks.0.img_attn.proj.weight",
+            "txt_in.individual_token_refiner.blocks.0.norm1.weight",
         },
     },
     .threshhold = null,
@@ -1222,8 +1229,10 @@ pub const generic_arch: Arch = .{
 /// Strip prefixes from a tensor name (e.g. "model.diffusion_model.", etc.)
 pub fn stripPrefix(name: []const u8) []const u8 {
     // Prefixes for mixed state dict
+    // Longest first. Comfy-Org ships some models (HunyuanVideo) under "model.model.".
     const mixed_prefixes = [_][]const u8{
         "model.diffusion_model.",
+        "model.model.",
         "model.",
     };
 

@@ -58,6 +58,23 @@ test "flux2 dev" {
     try expectArch(@embedFile("test_fixtures/flux2.d.json"), "flux");
 }
 
+// ── HunyuanVideo ──────────────────────────────────────────────────────────────
+
+test "hunyuan video under Tencent's names" {
+    try expectArch(@embedFile("test_fixtures/hyvid.json"), "hyvid");
+}
+
+// Its double_blocks are named like flux's; the token refiner tells them apart.
+test "hunyuan video as Comfy-Org ships it, and without the model.model. prefix" {
+    try expectArch(@embedFile("test_fixtures/hyvid.comfy.json"), "hyvid");
+
+    const allocator = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice([][]const u8, allocator, @embedFile("test_fixtures/hyvid.comfy.json"), .{});
+    defer parsed.deinit();
+    for (parsed.value) |*n| n.* = n.*["model.model.".len..];
+    try std.testing.expectEqualStrings("hyvid", imagearch.detectArch(parsed.value).?.name);
+}
+
 test "flux2 klein 9b" {
     try expectArch(@embedFile("test_fixtures/flux2.klein.9b.json"), "flux");
 }
