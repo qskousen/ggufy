@@ -813,6 +813,9 @@ pub fn prepareConversion(
     var groups = try TensorClusters.groupClusters(f, arena_alloc, allocator);
     groups.expert_stacks = expert_stacks;
     try TensorClusters.collapseModelTensors(&model_tensors, &groups, .dequant, arena_alloc);
+    if (Target.fusesMlp(opts.target, arch.name)) {
+        groups.expert_stacks = try fuseSplitMlp(f.tensors.items, &model_tensors, groups.expert_stacks, arena_alloc);
+    }
 
     // --- Assign quantization types (template or auto) -------------------------
     var template_metadata: ?std.json.ObjectMap = null;
@@ -1213,6 +1216,72 @@ fn hfDirCandidates(io: std.Io, path: []const u8) ?[]const u8 {
         if (stat.kind != .directory) return null;
     }
     return dir;
+}
+
+/// Replace each block's split `img_mlp.gate_layer` / `img_mlp.proj` pair with one
+/// `img_mlp.gate_up`, gate rows first, which is the order ComfyUI's SwiGLU chunks it in.
+/// Runs on collapsed tensors so a quantized half already has its logical shape; the
+/// returned stacks (`stacks` plus one per fused tensor) read each half from `sources`.
+fn fuseSplitMlp(
+    sources: []const types.Tensor,
+    model_tensors: *std.ArrayList(types.Tensor),
+    stacks: []const TensorClusters.ExpertStack,
+    arena_alloc: std.mem.Allocator,
+) ![]const TensorClusters.ExpertStack {
+    const gate_tag = ".img_mlp.gate_layer.";
+    const up_tag = ".img_mlp.proj.";
+    var out: std.ArrayList(TensorClusters.ExpertStack) = .empty;
+    try out.appendSlice(arena_alloc, stacks);
+    var fused_ups: std.StringHashMapUnmanaged(void) = .empty;
+    var kept: std.ArrayList(types.Tensor) = .empty;
+
+    for (model_tensors.items) |t| {
+        const at = std.mem.indexOf(u8, t.name, gate_tag) orelse {
+            try kept.append(arena_alloc, t);
+            continue;
+        };
+        const head = t.name[0..at];
+        const tail = t.name[at + gate_tag.len ..];
+        const up_name = try std.mem.concat(arena_alloc, u8, &.{ head, up_tag, tail });
+        const up = for (model_tensors.items) |u| {
+            if (std.mem.eql(u8, u.name, up_name)) break u;
+        } else {
+            std.log.warn("{s} has no {s} to fuse with; keeping the MLP split", .{ t.name, up_name });
+            try kept.append(arena_alloc, t);
+            continue;
+        };
+        const gate_src = TensorClusters.bestSourceMatch(sources, t.name);
+        const up_src = TensorClusters.bestSourceMatch(sources, up_name);
+        if (t.dims.len == 0 or !std.mem.eql(usize, t.dims, up.dims) or !std.mem.eql(u8, t.type, up.type) or gate_src == null or up_src == null) {
+            std.log.warn("{s} and {s} differ in shape or type; keeping the MLP split", .{ t.name, up_name });
+            try kept.append(arena_alloc, t);
+            continue;
+        }
+
+        var n: usize = 1;
+        for (t.dims) |d| n *= d;
+        const dims = try arena_alloc.dupe(usize, t.dims);
+        dims[0] *= 2;
+        const segments = try arena_alloc.dupe(types.StackSegment, &.{
+            .{ .tensor = sources[gate_src.?], .elem_offset = 0, .elem_count = n },
+            .{ .tensor = sources[up_src.?], .elem_offset = 0, .elem_count = n },
+        });
+        const name = try std.mem.concat(arena_alloc, u8, &.{ head, ".img_mlp.gate_up.", tail });
+        try out.append(arena_alloc, .{ .name = name, .dims = dims, .dtype = t.type, .segments = segments });
+
+        var fused = t;
+        fused.name = name;
+        fused.dims = dims;
+        fused.size = (try types.DataType.fromString(t.type)).calcSizeInBytes(2 * n);
+        try kept.append(arena_alloc, fused);
+        try fused_ups.put(arena_alloc, up_name, {});
+    }
+
+    if (fused_ups.count() == 0) return stacks;
+    model_tensors.clearRetainingCapacity();
+    for (kept.items) |t| if (!fused_ups.contains(t.name)) try model_tensors.append(arena_alloc, t);
+    std.log.info("fused {d} split MLP projections into gate_up, the layout ComfyUI's LoRA loader and int8 path expect", .{fused_ups.count()});
+    return out.items;
 }
 
 /// Returns a new list containing only the tensors that should be converted,
@@ -5242,6 +5311,97 @@ test "an image model's small float tensors still read as ComfyUI-GGUF types" {
     const dflt = try applyTarget(&f, targetTestOpts(io, src_path, dir, .comfyui, null), gpa, a);
     try testing.expectEqual(types.FileType.safetensors, dflt.filetype);
     try testing.expectError(error.TargetCannotLoad, applyTarget(&f, targetTestOpts(io, src_path, dir, .llamacpp, .q4_k), gpa, a));
+}
+
+test "the ComfyUI target fuses Qwen-Image 2.1's split MLP gate first, and custom keeps it split" {
+    testing.log_level = .err;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const dir = try targetTestDir(io, a, "qwen21fuse");
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const B = "transformer_blocks.0.";
+    const specs = [_]StSpec{
+        .{ .name = "txt_in.text_norm.weight", .dims = &.{8} },
+        .{ .name = "modulation.1.weight", .dims = &.{ 8, 8 } },
+        .{ .name = B ++ "attn.norm_q.weight", .dims = &.{8} },
+        .{ .name = "img_in.weight", .dims = &.{ 8, 8 } },
+        .{ .name = "proj_out.weight", .dims = &.{ 8, 8 } },
+        .{ .name = B ++ "img_mlp.gate_layer.weight", .dims = &.{ 4, 8 } },
+        .{ .name = B ++ "img_mlp.proj.weight", .dims = &.{ 4, 8 } },
+        .{ .name = B ++ "img_mlp.out.weight", .dims = &.{ 8, 4 } },
+    };
+    const gate_k = 5;
+    const up_k = 6;
+    const src_path = try std.fmt.allocPrint(a, "{s}/m.safetensors", .{dir});
+    try writeF32Safetensors(io, a, src_path, &specs, 0, 1);
+
+    const find = struct {
+        fn f(tensors: []const types.Tensor, name: []const u8) ?types.Tensor {
+            for (tensors) |t| if (std.mem.eql(u8, t.name, name)) return t;
+            return null;
+        }
+    }.f;
+    const read = struct {
+        fn f(g: anytype, t: types.Tensor, alloc: std.mem.Allocator) ![]const f32 {
+            const buf = try alloc.alignedAlloc(u8, .of(f32), @intCast(t.size));
+            const file = try g.openFileForTensor(t.name);
+            _ = try file.readPositionalAll(g.io, buf, t.offset + g.current_data_begin);
+            return std.mem.bytesAsSlice(f32, buf);
+        }
+    }.f;
+    const expectFused = struct {
+        fn f(v: []const f32) !void {
+            try testing.expectEqual(@as(usize, 64), v.len);
+            for (0..32) |i| {
+                try testing.expectEqual(@as(f32, @floatFromInt(gate_k * 1000 + i)), v[i]);
+                try testing.expectEqual(@as(f32, @floatFromInt(up_k * 1000 + i)), v[32 + i]);
+            }
+        }
+    }.f;
+
+    var f = try st.init(src_path, io, gpa, a, false, false);
+    defer f.deinit();
+
+    const st_opts = try applyTarget(&f, targetTestOpts(io, src_path, dir, .comfyui, .F32), gpa, a);
+    try testing.expectEqual(types.FileType.safetensors, st_opts.filetype);
+    try convert(&f, st_opts, gpa, a);
+    {
+        var out = try st.init(try std.fmt.allocPrint(a, "{s}/out.safetensors", .{dir}), io, gpa, a, false, false);
+        defer out.deinit();
+        const gu = find(out.tensors.items, B ++ "img_mlp.gate_up.weight") orelse return error.TestExpectedTensor;
+        try testing.expectEqualSlices(usize, &.{ 8, 8 }, gu.dims);
+        try expectFused(try read(&out, gu, a));
+        try testing.expect(find(out.tensors.items, B ++ "img_mlp.gate_layer.weight") == null);
+        try testing.expect(find(out.tensors.items, B ++ "img_mlp.proj.weight") == null);
+        try testing.expect(find(out.tensors.items, B ++ "img_mlp.out.weight") != null);
+    }
+
+    const g_opts = try applyTarget(&f, targetTestOpts(io, src_path, dir, .comfyui, .f32), gpa, a);
+    try convert(&f, g_opts, gpa, a);
+    {
+        var out = try gguf.init(try std.fmt.allocPrint(a, "{s}/out.gguf", .{dir}), io, gpa, a, false);
+        defer out.deinit();
+        const gu = find(out.tensors.items, B ++ "img_mlp.gate_up.weight") orelse return error.TestExpectedTensor;
+        try expectFused(try read(&out, gu, a));
+        try testing.expect(find(out.tensors.items, B ++ "img_mlp.proj.weight") == null);
+    }
+
+    var custom = targetTestOpts(io, src_path, dir, .custom, .f32);
+    custom.output_name = "split";
+    try convert(&f, try applyTarget(&f, custom, gpa, a), gpa, a);
+    {
+        var out = try gguf.init(try std.fmt.allocPrint(a, "{s}/split.gguf", .{dir}), io, gpa, a, false);
+        defer out.deinit();
+        try testing.expect(find(out.tensors.items, B ++ "img_mlp.gate_up.weight") == null);
+        try testing.expect(find(out.tensors.items, B ++ "img_mlp.gate_layer.weight") != null);
+    }
 }
 
 test "the ComfyUI target warns about a GGUF of an architecture ComfyUI-GGUF does not list" {

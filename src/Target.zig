@@ -354,6 +354,13 @@ pub fn hfNames(target: Target, kind: Kind, arch_name: []const u8, ft: types.File
     };
 }
 
+/// Whether `target` takes this architecture's split MLP fused into one gate_up tensor.
+/// ComfyUI maps LoRAs under either naming onto a fused MLP but only the split names onto a
+/// split one, and only its fused MLP takes the int8 SwiGLU fast path.
+pub fn fusesMlp(target: Target, arch_name: []const u8) bool {
+    return target == .comfyui and std.mem.eql(u8, arch_name, "qwen_image21");
+}
+
 /// What a target asks of a conversion of `arch_name`. `datatype` null means the
 /// default, and `requested` is a container the user asked for, which the target
 /// plans around instead of choosing one. A safetensors LLM source already
