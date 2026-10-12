@@ -6,6 +6,7 @@ const gguf = ggufy.gguf;
 const clap = @import("clap");
 const imagearch = ggufy.imageArch;
 const conv = ggufy.convert;
+const Target = ggufy.target;
 
 const build_options = @import("build_options");
 
@@ -56,6 +57,7 @@ fn exitIfExplained(err: anyerror) void {
         error.MmprojMissing,
         error.MmprojUnusable,
         error.UnexpectedVisionShape,
+        error.TargetCannotLoad,
         => std.process.exit(1),
         else => {},
     }
@@ -69,7 +71,8 @@ fn reportPredictedSize(
     arena_alloc: std.mem.Allocator,
     stdout: *std.Io.Writer,
 ) !void {
-    const size = conv.predictOutputSize(f, opts, allocator, arena_alloc) catch |err| {
+    const pred = conv.predictOutput(f, opts, allocator, arena_alloc) catch |err| {
+        if (opts.target_issue.len > 0) std.log.warn("{s}", .{opts.target_issue});
         if (err == error.UnknownArchitecture) {
             std.log.err("Architecture not recognized. Pass --allow-unknown-arch (-u) to calculate size anyway. Results may be suboptimal.", .{});
         }
@@ -78,8 +81,44 @@ fn reportPredictedSize(
         return err;
     };
     var buf: [32]u8 = undefined;
-    try stdout.print("Estimated output size: {s} ({d} bytes)\n", .{ formatBytes(size, &buf), size });
+    try stdout.print("Estimated output size: {s} ({d} bytes)\n", .{ formatBytes(pred.size, &buf), pred.size });
+    try stdout.print("Works with: {s}\n", .{try Target.worksWith(&pred.verdicts, arena_alloc)});
+    const problem = try Target.problem(opts.target_issue, &pred.verdicts, opts.target, arena_alloc);
+    if (problem.len > 0) {
+        try stdout.print("{s}\n", .{problem});
+        if (!opts.allow_incompatible) try stdout.print("convert will refuse it without --allow-incompatible\n", .{});
+    }
     try stdout.flush();
+}
+
+/// Resolve the target against the opened file. Sizing plans past a refusal, so
+/// it can report the size and the reason (`target_issue`) both.
+fn resolveTarget(
+    f: anytype,
+    base: conv.ConvertOptions,
+    for_size: bool,
+    allocator: std.mem.Allocator,
+    arena_alloc: std.mem.Allocator,
+) conv.ConvertOptions {
+    const opts = if (for_size) blk: {
+        var allowed = base;
+        allowed.allow_incompatible = true;
+        var why: []const u8 = "";
+        var opts = conv.planTarget(f, allowed, allocator, arena_alloc, &why) catch |err| targetFailed(err);
+        opts.allow_incompatible = base.allow_incompatible;
+        break :blk opts;
+    } else conv.applyTarget(f, base, allocator, arena_alloc) catch |err| targetFailed(err);
+    if (opts.target != .custom) {
+        std.log.info("Target: {s}, writing {s}{s}", .{ opts.target.label(), @tagName(opts.filetype), if (opts.hf_names) " with HF tensor names" else "" });
+    }
+    conv.validateDatatypeForFiletype(opts.datatype, opts.filetype) catch std.process.exit(1);
+    return opts;
+}
+
+fn targetFailed(err: anyerror) noreturn {
+    exitIfExplained(err);
+    std.log.err("resolving --target failed: {s}", .{@errorName(err)});
+    std.process.exit(1);
 }
 
 /// Dump the tensor list as a JSON test fixture. With `with_shapes`, each entry
@@ -116,7 +155,8 @@ pub fn main(init: std.process.Init) !void {
     const params = comptime clap.parseParamsComptime(
         \\-h, --help                     Display this help and exit.
         \\-d, --datatype <DATATYPE>      When converting, the target datatype (default fp16).
-        \\-f, --filetype <FILETYPE>      When converting, the target filetype: gguf (default), safetensors. GGUF from an HF checkpoint with a vision tower also writes the tower as mmproj-<output name>.gguf, as llama.cpp's converter would.
+        \\-T, --target <TARGET>          The program the output is for: comfyui, llamacpp, transformers, or custom. Picks the file type (from -d) and tensor naming that program reads, and refuses output it cannot load. Default: comfyui for a diffusion model, llamacpp for an LLM; -f or -H without -T means custom.
+        \\-f, --filetype <FILETYPE>      When converting, the target filetype: gguf (default), safetensors. Without -T, implies --target custom. GGUF from an HF checkpoint with a vision tower also writes the tower as mmproj-<output name>.gguf, as llama.cpp's converter would.
         \\-t, --template <FILENAME>      When converting, specify a template to use.
         \\-o, --output-dir <DIR>         Output directory (default: same as source file).
         \\-n, --output-name <FILENAME>   Output filename without extension (default: source name + datatype).
@@ -126,10 +166,11 @@ pub fn main(init: std.process.Init) !void {
         \\-s, --sensitivities <FILENAME> Path to a sensitivities JSON file to use (overrides built-in sensitivities) Sensitivities are only used for GGUF model output.
         \\-q, --use-quant-types <QTYPES> Quantization families to use with sensitivity (e.g. "k", "0,k", "0,1,k"). Default: match datatype.
         \\-m, --model-only               When output is safetensors, convert only the main model (UNet/transformer). Ignored for GGUF output.
-        \\-H, --hf-names                 Keep HF state-dict names in the output. Safetensors output: write the HF LLM layout, HF names/shapes and RoPE-unpermuted Q/K from a llama-family GGUF, as model.safetensors unless -n says otherwise; a vision-language GGUF (qwen3vl, qwen2vl, qwen35) takes its vision tower from mmproj-<file name> beside it, or the one .gguf there whose name holds "mmproj" and the file's name. GGUF output: leave an LLM's HF names alone instead of renaming to llama.cpp's blk.*; the architecture is still written where ComfyUI-GGUF's text-encoder loader takes HF names under it (qwen3, qwen3vl, qwen2vl), so a single-file Qwen3-VL loads there with its vision tower.
+        \\-H, --hf-names                 Keep HF state-dict names in the output. Safetensors output: write the HF LLM layout, HF names/shapes and RoPE-unpermuted Q/K from a llama-family GGUF, as model.safetensors unless -n says otherwise; a vision-language GGUF (qwen3vl, qwen2vl, qwen35) takes its vision tower from mmproj-<file name> beside it, or the one .gguf there whose name holds "mmproj" and the file's name. GGUF output: leave an LLM's HF names alone instead of renaming to llama.cpp's blk.*; the architecture is still written where ComfyUI-GGUF's text-encoder loader takes HF names under it (qwen3, qwen3vl, qwen2vl), so a single-file Qwen3-VL loads there with its vision tower. Without -T, implies --target custom.
         \\-I, --imatrix <FILENAME>       Importance matrix (llama.cpp imatrix GGUF) to steer the quantizer's scale search.
         \\-F, --force                    With --hf-names, overwrite existing HF sidecars (config.json, tokenizer.json, ...) instead of refusing.
         \\-u, --allow-unknown-arch       Allow converting files with unrecognized architectures, drop HF LLM tensors that have no llama.cpp name, and convert an LLM whose pre-tokenizer matches no llama.cpp tag (to GGUF: tagged "default", which llama.cpp tokenizes as gpt2; to an HF layout: without a tokenizer.json). Results may be suboptimal.
+        \\-W, --allow-incompatible       Write an output the --target program cannot load, with a warning, instead of refusing.
         \\-U, --allow-upscale            Allow converting from a lower-precision (quantized/FP8) source to a higher-precision target. The extra bits are fill-in; no quality is recovered.
         \\-A, --arch <NAME>              Set the architecture name written to the GGUF metadata (GGUF output only). Free-form, but not empty: for an LLM it also prefixes the <arch>.block_count/embedding_length/... keys llama.cpp looks up.
         \\-R, --stochastic-rounding <SEED> Seed for INT4_CONVROT_SR stochastic rounding. Omit for the built-in default seed; pass 0 to disable (deterministic, for comparison). Ignored by other types.
@@ -142,6 +183,7 @@ pub fn main(init: std.process.Init) !void {
     const parsers = comptime .{
         .DATATYPE = clap.parsers.enumeration(types.DataType),
         .FILETYPE = clap.parsers.enumeration(types.FileType),
+        .TARGET = clap.parsers.enumeration(Target.Target),
         .COMMAND = clap.parsers.enumeration(Command),
         .FILENAME = clap.parsers.string,
         .DIR = clap.parsers.string,
@@ -208,9 +250,12 @@ pub fn main(init: std.process.Init) !void {
     };
     const filetype = res.args.filetype orelse types.FileType.gguf;
     const datatype: ?types.DataType = res.args.datatype;
+    const target: Target.Target = res.args.target orelse
+        if (res.args.filetype != null or res.args.@"hf-names" != 0) .custom else .auto;
     // Refuse a target type the output container cannot hold before opening anything —
-    // it used to be accepted and produce a file no reader could load.
-    conv.validateDatatypeForFiletype(datatype, filetype) catch std.process.exit(1);
+    // it used to be accepted and produce a file no reader could load. Any other
+    // target picks the container from the type.
+    if (target == .custom) conv.validateDatatypeForFiletype(datatype, filetype) catch std.process.exit(1);
     const template_path = res.args.template;
     const output_dir = res.args.@"output-dir";
     const output_name = res.args.@"output-name";
@@ -258,6 +303,9 @@ pub fn main(init: std.process.Init) !void {
         .arch_override = arch_override,
         .imatrix_path = res.args.imatrix,
         .stochastic_rounding = res.args.@"stochastic-rounding",
+        .target = target,
+        .filetype_requested = if (target == .custom) null else res.args.filetype,
+        .allow_incompatible = res.args.@"allow-incompatible" != 0,
     };
 
     const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
@@ -287,9 +335,10 @@ pub fn main(init: std.process.Init) !void {
                     try f.printMetadata(stdout);
                 },
                 .convert => {
+                    const opts = resolveTarget(&f, convert_opts, calculate_size, allocator, arena_alloc);
                     if (calculate_size) {
-                        try reportPredictedSize(&f, convert_opts, allocator, arena_alloc, stdout);
-                    } else conv.convert(&f, convert_opts, allocator, arena_alloc) catch |err| {
+                        try reportPredictedSize(&f, opts, allocator, arena_alloc, stdout);
+                    } else conv.convert(&f, opts, allocator, arena_alloc) catch |err| {
                         if (err == error.UnknownArchitecture) {
                             std.log.err("Architecture not recognized. Pass --allow-unknown-arch (-u) to convert anyway. Results may be suboptimal.", .{});
                         }
@@ -361,9 +410,10 @@ pub fn main(init: std.process.Init) !void {
                     try f.readGgufMetadata(stdout);
                 },
                 .convert => {
+                    const opts = resolveTarget(&f, convert_opts, calculate_size, allocator, arena_alloc);
                     if (calculate_size) {
-                        try reportPredictedSize(&f, convert_opts, allocator, arena_alloc, stdout);
-                    } else conv.convert(&f, convert_opts, allocator, arena_alloc) catch |err| {
+                        try reportPredictedSize(&f, opts, allocator, arena_alloc, stdout);
+                    } else conv.convert(&f, opts, allocator, arena_alloc) catch |err| {
                         if (err == error.UnknownArchitecture) {
                             std.log.err("Architecture not recognized. Pass --allow-unknown-arch (-u) to convert anyway. Results may be suboptimal.", .{});
                         }

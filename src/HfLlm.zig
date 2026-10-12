@@ -330,6 +330,13 @@ fn nonZero(v: ?u32) ?u32 {
     return if (v) |n| (if (n == 0) null else n) else null;
 }
 
+/// The arch config.json's model_type names, without reading the rest of the checkpoint.
+pub fn configArch(io: std.Io, dir: std.Io.Dir, alloc: std.mem.Allocator) ?*const imagearch.Arch {
+    const cfg = readJson(io, dir, "config.json", alloc) catch return null;
+    const c = obj(cfg.value) orelse return null;
+    return archForModelType(getStr(c, "model_type") orelse return null);
+}
+
 /// Why `load` returned null. "Not an HF checkpoint at all" and "an HF
 /// checkpoint whose tokenizer we cannot read" send the user to different
 /// files, so the caller needs to tell them apart to say anything useful.
@@ -2979,8 +2986,17 @@ pub fn dominantTorchDtype(tensors: []const types.Tensor, alloc: std.mem.Allocato
 /// is the one its callers are free to go on from, by leaving tokenizer.json out.
 /// The architectures writeConfig knows the transformers shape of. Any other
 /// name would become a model_type and a ForCausalLM class transformers lacks.
+const hf_config_archs = [_][]const u8{ "llama", "qwen2", "qwen3", "qwen35", "qwen3vl", "qwen2vl" };
+
+/// The architectures `hfConfigWritable` takes, for messages: "llama, qwen2, ... and qwen2vl".
+pub const hf_config_archs_text = blk: {
+    var s: []const u8 = "";
+    for (hf_config_archs, 0..) |n, i| s = s ++ (if (i == 0) "" else if (i == hf_config_archs.len - 1) " and " else ", ") ++ n;
+    break :blk s;
+};
+
 pub fn hfConfigWritable(arch_name: []const u8) bool {
-    for ([_][]const u8{ "llama", "qwen2", "qwen3", "qwen35", "qwen3vl", "qwen2vl" }) |n| if (std.mem.eql(u8, n, arch_name)) return true;
+    for (hf_config_archs) |n| if (std.mem.eql(u8, n, arch_name)) return true;
     return false;
 }
 

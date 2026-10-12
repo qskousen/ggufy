@@ -16,12 +16,17 @@ pub const State = struct {
     file_dialog_open: bool = false,
     load_error: ?anyerror = null,
     loaded_file: ?ggufy.fileLoader.TensorFile = null,
+    /// The loaded file as a target plans for it, under the architecture a
+    /// conversion writes. null when no architecture matched.
+    target_model: ?ggufy.convert.TargetModel = null,
     wakeup_event_type: u32 = 0,
 
     // Conversion options
     /// Set to true after first populating folder/filename buffers from the
     /// loaded file path so we don't clobber edits the user has already made.
     convert_options_initialized: bool = false,
+    /// The program the output is for. Chosen from the model kind when a file loads.
+    target: ggufy.target.Target = .comfyui,
     target_filetype: ggufy.types.FileType = .gguf,
     target_dtype: ?ggufy.types.DataType = null,
     /// Output folder — null-terminated; dvui textEntry writes here directly.
@@ -111,6 +116,12 @@ pub const State = struct {
     // "not yet computed" or "prediction unavailable" (e.g. no data type selected).
     predicted_size: ?u64 = null,
     prev_pred_signature: ?u64 = null,
+    /// From the same prediction: who loads the output, and why the target
+    /// cannot (empty when it can).
+    works_with_buf: [512]u8 = undefined,
+    works_with_len: usize = 0,
+    target_problem_buf: [512]u8 = undefined,
+    target_problem_len: usize = 0,
 
     // Overwrite confirmation
     overwrite_pending_path_buf: [std.fs.max_path_bytes]u8 = undefined,
@@ -119,6 +130,10 @@ pub const State = struct {
     // Upscale confirmation
     upscale_pending: bool = false,
     allow_upscale: bool = false,
+
+    // Confirmation for an output the Use with target cannot load
+    incompatible_pending: bool = false,
+    allow_incompatible: bool = false,
 
     // Misc UI state
     show_about: bool = false,
@@ -154,11 +169,20 @@ pub const State = struct {
         return self.tool_status_buf[0..self.tool_status_len];
     }
 
+    pub fn worksWith(self: *const State) []const u8 {
+        return self.works_with_buf[0..self.works_with_len];
+    }
+
+    pub fn targetProblem(self: *const State) []const u8 {
+        return self.target_problem_buf[0..self.target_problem_len];
+    }
+
     /// A hash of every option that affects the predicted output size. When it changes,
     /// the predicted size is recomputed; otherwise the cached value is reused so the
     /// (relatively cheap, but non-trivial) prediction doesn't run every frame.
     pub fn predictionSignature(self: *const State) u64 {
         var h = std.hash.Wyhash.init(0);
+        std.hash.autoHash(&h, self.target);
         std.hash.autoHash(&h, self.target_filetype);
         if (self.target_dtype) |dt| std.hash.autoHash(&h, dt) else std.hash.autoHash(&h, @as(u16, 0xFFFF));
         std.hash.autoHash(&h, self.target_aggressiveness);

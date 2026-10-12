@@ -266,6 +266,15 @@ pub fn build(b: *std.Build) void {
     ggml.link(b, safetensor_test, target, optimize);
     test_step.dependOn(&b.addRunArtifact(safetensor_test).step);
 
+    const target_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/Target.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(target_test).step);
+
     const precision_metrics_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/PrecisionMetrics.zig"),

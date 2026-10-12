@@ -2,6 +2,7 @@ const std = @import("std");
 const guiState = @import("gui_state.zig");
 const ggufy = @import("ggufy");
 const conv = ggufy.convert;
+const Target = ggufy.target;
 const SDLBackend = @import("backend");
 
 // Wakeup helper
@@ -18,6 +19,7 @@ fn pushWakeupEvent(state: *guiState.State) void {
 /// Handles load_state transitions.  Runs on a detached thread.
 pub fn loadFile(alloc: std.mem.Allocator, arena_alloc: std.mem.Allocator, state: *guiState.State) void {
     state.load_state.store(.loading, .release);
+    state.target_model = null;
     const path = state.file_selected.?;
     state.loaded_file = ggufy.fileLoader.TensorFile.loadFile(state.io, alloc, arena_alloc, path) catch |err| {
         state.load_error = err;
@@ -25,6 +27,8 @@ pub fn loadFile(alloc: std.mem.Allocator, arena_alloc: std.mem.Allocator, state:
         pushWakeupEvent(state);
         return;
     };
+    const lf = &state.loaded_file.?;
+    state.target_model = conv.targetModel(state.io, path, lf.tensors.items, lf.metadata, lf.type == .gguf, alloc, arena_alloc) catch null;
     state.load_state.store(.done, .release);
     pushWakeupEvent(state);
 }
@@ -303,6 +307,9 @@ pub fn buildConvertOptions(state: *guiState.State) conv.ConvertOptions {
         .path = state.file_selected.?,
         .filetype = state.target_filetype,
         .datatype = state.target_dtype,
+        .target = state.target,
+        // The Format row is kept within what the target reads, so it is a request.
+        .filetype_requested = if (state.target == .custom) null else state.target_filetype,
         .output_dir = if (folder.len > 0) folder else null,
         .output_name = if (filename.len > 0) filename else null,
         .threads = state.target_threads,
@@ -314,8 +321,10 @@ pub fn buildConvertOptions(state: *guiState.State) conv.ConvertOptions {
         .allow_unknown_arch = state.allow_unknown_arch,
         .allow_upscale = state.allow_upscale,
         .arch_override = state.archOverride(),
-        .hf_names = state.hf_names,
+        // Any other target picks the naming itself.
+        .hf_names = state.target == .custom and state.hf_names,
         .force = state.force,
+        .allow_incompatible = state.allow_incompatible,
         .imatrix_path = state.imatrix_path,
     };
 }
@@ -324,6 +333,7 @@ pub fn buildConvertOptions(state: *guiState.State) conv.ConvertOptions {
 /// Opens the source file (header/metadata only — no tensor data) and runs the same
 /// pipeline the real conversion uses. Returns null if the size can't be determined
 /// (e.g. no data type selected, or an unrecognized architecture without override).
+/// Also fills in who can load the output, and why the target cannot.
 pub fn predictSize(alloc: std.mem.Allocator, state: *guiState.State) ?u64 {
     // The prediction runs the real pipeline, so it is also where the UI learns
     // that this checkpoint's pre-tokenizer has no llama.cpp tag. Only a run with
@@ -331,6 +341,8 @@ pub fn predictSize(alloc: std.mem.Allocator, state: *guiState.State) ?u64 {
     // prediction past the refusal, and it is ticked in the very box the flag
     // draws, so clearing it here would erase the box and the checkbox with it.
     if (!state.allow_unknown_arch) state.pretok_unknown = false;
+    state.works_with_len = 0;
+    state.target_problem_len = 0;
     if (state.file_selected == null or state.target_dtype == null) return null;
     const path = state.file_selected.?;
 
@@ -350,20 +362,51 @@ pub fn predictSize(alloc: std.mem.Allocator, state: *guiState.State) ?u64 {
         .safetensors => {
             var f = ggufy.safetensor.init(path, state.io, alloc, pa, false, false) catch return null;
             defer f.deinit();
-            return conv.predictOutputSize(&f, opts, alloc, pa) catch |e| {
-                state.pretok_unknown = e == error.UnknownPretokenizer;
-                return null;
-            };
+            return predictFor(&f, opts, alloc, pa, state);
         },
         .gguf => {
             var f = ggufy.gguf.init(path, state.io, alloc, pa, false) catch return null;
             defer f.deinit();
-            return conv.predictOutputSize(&f, opts, alloc, pa) catch |e| {
-                state.pretok_unknown = e == error.UnknownPretokenizer;
-                return null;
-            };
+            return predictFor(&f, opts, alloc, pa, state);
         },
     }
+}
+
+fn copyText(buf: []u8, len: *usize, text: []const u8) void {
+    len.* = @min(text.len, buf.len);
+    @memcpy(buf[0..len.*], text[0..len.*]);
+}
+
+fn predictFor(f: anytype, base: conv.ConvertOptions, alloc: std.mem.Allocator, pa: std.mem.Allocator, state: *guiState.State) ?u64 {
+    // Predict what would be written anyway, so the size and the reason both show.
+    var allowed = base;
+    allowed.allow_incompatible = true;
+    var why: []const u8 = "";
+    const opts = conv.planTargetFor(state.target_model, allowed, std.meta.Child(@TypeOf(f)) == ggufy.gguf, pa, &why) catch return null;
+    if (why.len > 0) copyText(&state.target_problem_buf, &state.target_problem_len, why);
+    const pred = conv.predictOutput(f, opts, alloc, pa) catch |e| {
+        state.pretok_unknown = e == error.UnknownPretokenizer;
+        return null;
+    };
+    copyText(&state.works_with_buf, &state.works_with_len, Target.worksWith(&pred.verdicts, pa) catch "");
+    const problem = Target.problem(why, &pred.verdicts, opts.target, pa) catch why;
+    const shown = if (problem.len > 0) problem else Target.warning(&pred.verdicts, opts.target, pa) catch "";
+    copyText(&state.target_problem_buf, &state.target_problem_len, shown);
+    return pred.size;
+}
+
+/// Record a failed conversion. A target refusal the user was not asked about
+/// opens the Convert anyway dialog instead.
+fn convertFailed(state: *guiState.State, err: anyerror) void {
+    if (err == error.TargetCannotLoad and !state.allow_incompatible) {
+        if (state.target_problem_len == 0) copyText(&state.target_problem_buf, &state.target_problem_len, "The program chosen under Use with cannot load this output. The log says why.");
+        state.incompatible_pending = true;
+        state.convert_state.store(.idle, .release);
+    } else {
+        state.convert_error = err;
+        state.convert_state.store(.err, .release);
+    }
+    pushWakeupEvent(state);
 }
 
 pub fn convertFile(alloc: std.mem.Allocator, arena_alloc: std.mem.Allocator, state: *guiState.State) void {
@@ -415,16 +458,17 @@ pub fn convertFile(alloc: std.mem.Allocator, arena_alloc: std.mem.Allocator, sta
             };
             defer f.deinit();
 
-            conv.convert(&f, opts, alloc, arena_alloc) catch |err| {
+            const resolved = conv.applyTargetFor(state.target_model, opts, false, arena_alloc) catch |err| {
+                convertFailed(state, err);
+                return;
+            };
+            conv.convert(&f, resolved, alloc, arena_alloc) catch |err| {
                 if (err == error.Cancelled) {
                     state.cancel_requested.store(false, .release);
                     state.convert_progress.store(0, .release);
                     state.convert_state.store(.idle, .release);
-                } else {
-                    state.convert_error = err;
-                    state.convert_state.store(.err, .release);
-                }
-                pushWakeupEvent(state);
+                    pushWakeupEvent(state);
+                } else convertFailed(state, err);
                 return;
             };
         },
@@ -437,16 +481,17 @@ pub fn convertFile(alloc: std.mem.Allocator, arena_alloc: std.mem.Allocator, sta
             };
             defer f.deinit();
 
-            conv.convert(&f, opts, alloc, arena_alloc) catch |err| {
+            const resolved = conv.applyTargetFor(state.target_model, opts, true, arena_alloc) catch |err| {
+                convertFailed(state, err);
+                return;
+            };
+            conv.convert(&f, resolved, alloc, arena_alloc) catch |err| {
                 if (err == error.Cancelled) {
                     state.cancel_requested.store(false, .release);
                     state.convert_progress.store(0, .release);
                     state.convert_state.store(.idle, .release);
-                } else {
-                    state.convert_error = err;
-                    state.convert_state.store(.err, .release);
-                }
-                pushWakeupEvent(state);
+                    pushWakeupEvent(state);
+                } else convertFailed(state, err);
                 return;
             };
         },

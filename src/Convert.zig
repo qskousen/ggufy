@@ -10,6 +10,7 @@ const cb = @import("callbacks.zig");
 const TensorClusters = @import("TensorClusters.zig");
 const DataTransform = @import("DataTransform.zig");
 const HfLlm = @import("HfLlm.zig");
+const Target = @import("Target.zig");
 const ImatrixMod = @import("Imatrix.zig");
 const ggml = @import("ggml.h");
 const build_options = @import("build_options");
@@ -70,9 +71,124 @@ pub const ConvertOptions = struct {
     /// stochastic rounding (making SR output identical to plain INT4_CONVROT — the
     /// deterministic path used for bit-for-bit comparison). Ignored by all other types.
     stochastic_rounding: ?u64 = null,
+    /// The program the output is for. `applyTarget` turns anything but custom
+    /// into `filetype` and `hf_names`, and `convert` refuses an output that
+    /// program cannot load.
+    target: Target.Target = .custom,
+    /// With a target other than custom, the container the user asked for, which
+    /// the target plans around instead of choosing one.
+    filetype_requested: ?types.FileType = null,
+    /// Write an output the target cannot load, with a warning, instead of refusing.
+    allow_incompatible: bool = false,
+    /// Why the target cannot load this output, when the plan was let through by
+    /// `allow_incompatible`. `convert` reports it with its own verdict.
+    target_issue: []const u8 = "",
     /// Optional GUI progress/cancel hooks.  No-ops when null.
     callbacks: cb.ConvertCallbacks = .{},
 };
+
+/// Set `filetype` and `hf_names` for `opts.target`, which leaves it resolved
+/// (never auto). Custom passes through. Logs why and fails when the target
+/// cannot load any output of this model at this type; with
+/// `allow_incompatible`, `convert` says so instead.
+pub fn applyTarget(f: anytype, opts: ConvertOptions, allocator: std.mem.Allocator, arena_alloc: std.mem.Allocator) !ConvertOptions {
+    if (opts.target == .custom) return opts;
+    const source_is_gguf = std.meta.Child(@TypeOf(f)) == gguf;
+    const model = try targetModel(opts.io, opts.path, f.tensors.items, f.getSourceMetadata(), source_is_gguf, allocator, arena_alloc);
+    return applyTargetFor(model, opts, source_is_gguf, arena_alloc);
+}
+
+/// `applyTarget` for a model `targetModel` already found.
+pub fn applyTargetFor(model: ?TargetModel, opts: ConvertOptions, source_is_gguf: bool, arena_alloc: std.mem.Allocator) !ConvertOptions {
+    var why: []const u8 = "";
+    const out = planTargetFor(model, opts, source_is_gguf, arena_alloc, &why) catch |e| {
+        if (e == error.TargetCannotLoad) {
+            std.log.warn("{s}", .{why});
+            std.log.warn("pass --allow-incompatible to write it anyway", .{});
+        }
+        return e;
+    };
+    // Without -u, prepareConversion refuses the unknown architecture anyway.
+    if (model == null and opts.target == .auto and opts.allow_unknown_arch) {
+        std.log.warn("no known architecture to pick a target for; writing {s} unchecked", .{@tagName(out.filetype)});
+    }
+    return out;
+}
+
+/// `applyTarget` with the reason for a refusal in `why` instead of the log.
+/// With `allow_incompatible` it does not fail but still sets `why`, and takes
+/// the container from the type.
+pub fn planTarget(f: anytype, opts: ConvertOptions, allocator: std.mem.Allocator, arena_alloc: std.mem.Allocator, why: *[]const u8) !ConvertOptions {
+    if (opts.target == .custom) return opts;
+    const source_is_gguf = std.meta.Child(@TypeOf(f)) == gguf;
+    const model = try targetModel(opts.io, opts.path, f.tensors.items, f.getSourceMetadata(), source_is_gguf, allocator, arena_alloc);
+    return planTargetFor(model, opts, source_is_gguf, arena_alloc, why);
+}
+
+/// `planTarget` for a model `targetModel` already found. -H (`opts.hf_names`)
+/// only ever adds HF naming to what the target picks.
+pub fn planTargetFor(model: ?TargetModel, opts: ConvertOptions, source_is_gguf: bool, arena_alloc: std.mem.Allocator, why: *[]const u8) !ConvertOptions {
+    if (opts.target == .custom) return opts;
+    var out = opts;
+    const datatype = opts.datatype orelse lowestTemplateType(opts, arena_alloc);
+    const detected = model orelse {
+        // Nothing to plan for; prepareConversion reports the unknown architecture.
+        // An auto target has no program to stand for, but one the user named
+        // stays, so convert still judges the output against it.
+        out.target = if (opts.target == .auto) .custom else opts.target;
+        out.filetype = opts.filetype_requested orelse if (datatype) |d| d.formatType() else opts.filetype;
+        return out;
+    };
+    // -A is the architecture the loader sees; the HF layout is still the source's.
+    const m: TargetModel = .{ .kind = detected.kind, .arch_name = opts.arch_override orelse detected.arch_name };
+    const p = Target.plan(opts.target, m.kind, m.arch_name, datatype, opts.filetype_requested, source_is_gguf, HfLlm.hfConfigWritable(detected.arch_name), arena_alloc, why) catch |e| {
+        if (e != error.TargetCannotLoad or !opts.allow_incompatible) return e;
+        out.target_issue = why.*;
+        // Written anyway, still in the layout the target names.
+        out.target = Target.resolve(opts.target, m.kind);
+        out.filetype = opts.filetype_requested orelse if (datatype) |d| d.formatType() else opts.filetype;
+        out.hf_names = opts.hf_names or Target.hfNames(out.target, m.kind, m.arch_name, out.filetype, source_is_gguf);
+        return out;
+    };
+    out.target = p.target;
+    out.filetype = p.filetype;
+    out.hf_names = opts.hf_names or p.hf_names;
+    return out;
+}
+
+pub const TargetModel = struct { kind: Target.Kind, arch_name: []const u8 };
+
+/// The model a target is planned for, under the architecture the conversion
+/// will write: tensor names find only a family, which a config.json beside a
+/// safetensors source, or a GGUF source's general.architecture, narrows down
+/// the way prepareConversion does. null when the tensors match no architecture.
+pub fn targetModel(
+    io: std.Io,
+    path: []const u8,
+    tensors: []const types.Tensor,
+    source_metadata: ?std.json.ObjectMap,
+    source_is_gguf: bool,
+    allocator: std.mem.Allocator,
+    arena_alloc: std.mem.Allocator,
+) !?TargetModel {
+    const detected = try imagearch.detectArchFromTensors(tensors, allocator) orelse return null;
+    if (detected.hf_model_type.len == 0) return .{ .kind = .diffusion, .arch_name = detected.name };
+    const source_arch: ?[]const u8 = if (source_metadata) |m| switch (m.get("general.architecture") orelse std.json.Value.null) {
+        .string => |s| if (s.len > 0) s else null,
+        else => null,
+    } else null;
+    if (!source_is_gguf) if (hfDirCandidates(io, path)) |dir| {
+        if (std.Io.Dir.cwd().openDir(io, dir, .{})) |dh| {
+            defer dh.close(io);
+            if (HfLlm.configArch(io, dh, arena_alloc)) |a| return .{ .kind = .llm, .arch_name = a.name };
+        } else |_| {}
+    };
+    if (source_arch) |sa| {
+        if (HfLlm.visionArchByGgufName(sa)) |vl| return .{ .kind = .llm, .arch_name = vl.name };
+        if (detected.keys_family_wide) return .{ .kind = .llm, .arch_name = sa };
+    }
+    return .{ .kind = .llm, .arch_name = detected.name };
+}
 
 /// Which sub-families of quantized types may be used during sensitivity-aware
 /// quantization.  Non-quantized types (f16, bf16, f32, f64) and q8_0 are always
@@ -340,6 +456,8 @@ pub fn computeOutputPath(opts: ConvertOptions, hf_layout: bool, arena_alloc: std
 /// types, sizes, offsets and grouping. All members are backed by `arena_alloc`.
 pub const PreparedConversion = struct {
     arch: *const imagearch.Arch,
+    /// An LLM, whatever names or architecture it is written under.
+    llm: bool = false,
     model_tensors: std.ArrayList(types.Tensor),
     template_metadata: ?std.json.ObjectMap,
     extra_metadata: std.json.ObjectMap,
@@ -524,7 +642,7 @@ pub fn prepareConversion(
 
     const arch = blk: {
         if (detected.hf_model_type.len == 0 or !keep_hf_names) break :blk detected;
-        if (comfyLoadsTextArch(detected.name) and !std.mem.eql(u8, detected.name, "llama")) {
+        if (Target.comfyGgufLoadsText(detected.name) and !std.mem.eql(u8, detected.name, "llama")) {
             std.log.info("--hf-names: keeping HF tensor names under architecture {s}, which ComfyUI-GGUF's text-encoder loader takes as they are", .{detected.name});
             break :blk detected;
         }
@@ -732,6 +850,7 @@ pub fn prepareConversion(
 
     return .{
         .arch = arch,
+        .llm = detected.hf_model_type.len > 0,
         .model_tensors = model_tensors,
         .template_metadata = template_metadata,
         .extra_metadata = extra_metadata,
@@ -763,14 +882,25 @@ pub fn convert(
         return error.UpscalingNotAllowed;
     }
 
-    if (opts.datatype == .ASYM_W4A8_INT8_ZP) {
-        std.log.warn(
-            "ASYM_W4A8_INT8_ZP: current ComfyUI drops weight_correction when loading, and decodes these layers wrong. comfy_kitchen and ggufy read them correctly.",
-            .{},
-        );
-    }
+    // The ComfyUI target says so in its verdict.
+    if (opts.target != .comfyui) if (opts.datatype) |d| if (Target.comfyCaveat(d)) |c| {
+        std.log.warn("{s}: {s}", .{ @tagName(d), c });
+    };
 
     var prep = try prepareConversion(f, opts, allocator, arena_alloc);
+
+    const verdicts = try Target.assess(try outputFacts(f, &prep, opts, arena_alloc), arena_alloc);
+    const problem = try Target.problem(opts.target_issue, &verdicts, opts.target, arena_alloc);
+    if (problem.len > 0) {
+        std.log.warn("{s}", .{problem});
+        if (!opts.allow_incompatible) {
+            std.log.warn("pass --allow-incompatible to write it anyway", .{});
+            return error.TargetCannotLoad;
+        }
+        std.log.warn("writing it anyway: --allow-incompatible was given", .{});
+    }
+    const caution = try Target.warning(&verdicts, opts.target, arena_alloc);
+    if (caution.len > 0) std.log.warn("{s}", .{caution});
 
     // --- Write output ---------------------------------------------------------
     switch (opts.filetype) {
@@ -804,6 +934,36 @@ pub fn convert(
     }
 
     if (prep.vision_plan) |plan| try writeMmproj(f, plan, prep.hf.?, opts, allocator, arena_alloc);
+    std.log.info("Works with: {s}", .{try Target.worksWith(&verdicts, arena_alloc)});
+}
+
+/// What the prepared output is, as far as deciding who can load it goes.
+fn outputFacts(f: anytype, prep: *const PreparedConversion, opts: ConvertOptions, arena_alloc: std.mem.Allocator) !Target.Output {
+    var out: Target.Output = .{
+        .kind = if (prep.llm) .llm else .diffusion,
+        .filetype = opts.filetype,
+        .arch_name = opts.arch_override orelse prep.arch.name,
+        .mmproj = prep.vision_plan != null,
+        .hf_sidecars = opts.filetype == .safetensors and prep.hf_renamed,
+        .has_vision = prep.vision_plan != null or prep.hf_vision != null,
+    };
+    if (opts.filetype == .gguf) out.arch_name = ggufArchName(f, prep.arch, prep.template_metadata, opts, prep.hf);
+    var native = false;
+    for (prep.model_tensors.items) |t| {
+        // A passthrough tensor can still carry its source's spelling of the type.
+        if (types.DataType.fromString(t.type)) |d| out.dtypes.insert(d.forFormat(opts.filetype) catch d) else |_| {}
+        if (std.mem.startsWith(u8, t.name, "blk.") or std.mem.startsWith(u8, t.name, "token_embd.")) native = true;
+        if (std.mem.startsWith(u8, t.name, "visual.") or std.mem.startsWith(u8, t.name, "model.visual.")) out.has_vision = true;
+    }
+    out.hf_names = prep.llm and !native;
+    if (prep.llm and std.mem.eql(u8, out.arch_name, "llama")) {
+        if (prep.hf) |m| {
+            out.llama_heads = .{ .head_count = m.head_count, .head_count_kv = m.head_count_kv };
+        } else if (ropeHeadsFromSource(f, sourceArchName(f) orelse "llama", arena_alloc)) |h| {
+            out.llama_heads = .{ .head_count = @intCast(h.head_count), .head_count_kv = @intCast(h.head_count_kv) };
+        } else |_| {}
+    }
+    return out;
 }
 
 /// Compute the exact size in bytes of the file `convert` would produce with these
@@ -816,8 +976,35 @@ pub fn predictOutputSize(
     allocator: std.mem.Allocator,
     arena_alloc: std.mem.Allocator,
 ) !u64 {
-    const prep = try prepareConversion(f, opts, allocator, arena_alloc);
+    return (try predictOutput(f, opts, allocator, arena_alloc)).size;
+}
 
+pub const Prediction = struct {
+    size: u64,
+    /// Every known consumer's verdict on the output, in Target.Consumer order.
+    verdicts: [3]Target.Verdict,
+};
+
+/// `predictOutputSize` plus who can load the result. Unlike `convert`, an
+/// output its target cannot load is reported in `verdicts`, not refused.
+pub fn predictOutput(
+    f: anytype,
+    opts: ConvertOptions,
+    allocator: std.mem.Allocator,
+    arena_alloc: std.mem.Allocator,
+) !Prediction {
+    const prep = try prepareConversion(f, opts, allocator, arena_alloc);
+    const verdicts = try Target.assess(try outputFacts(f, &prep, opts, arena_alloc), arena_alloc);
+    return .{ .size = try predictedSize(f, &prep, opts, allocator, arena_alloc), .verdicts = verdicts };
+}
+
+fn predictedSize(
+    f: anytype,
+    prep: *const PreparedConversion,
+    opts: ConvertOptions,
+    allocator: std.mem.Allocator,
+    arena_alloc: std.mem.Allocator,
+) !u64 {
     switch (opts.filetype) {
         .gguf => {
             var metadata: std.json.ObjectMap = .empty;
@@ -997,23 +1184,12 @@ pub fn calculateQuantizationLevel(
 // Step 1 — Filter tensors and strip name prefixes
 // ============================================================================
 
-/// The directory whose config.json describes these weights: the parent of a
-/// model.safetensors / index.json path, otherwise the path itself when it is a
-/// directory. load() still has to find a readable config.json for HF mode.
-/// The architectures ComfyUI-GGUF's text-encoder loader accepts (TXT_ARCH_LIST
-/// in its loader.py). It refuses any other general.architecture outright.
-const comfy_gguf_text_archs = [_][]const u8{ "t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl", "gemma3", "ministral3_3b" };
-
-fn comfyLoadsTextArch(name: []const u8) bool {
-    for (comfy_gguf_text_archs) |n| if (std.mem.eql(u8, n, name)) return true;
-    return false;
-}
 
 fn warnVocabless(m: HfLlm.Model, path: []const u8) void {
     const a = m.arch.name;
     std.log.warn("{s} has a config.json but no tokenizer, beside it or in a diffusers tokenizer/ sibling", .{path});
     std.log.warn("writing {s} names and metadata without tokenizer.ggml.* keys: llama.cpp will refuse the file for want of a vocabulary", .{a});
-    if (!comfyLoadsTextArch(a)) {
+    if (!Target.comfyGgufLoadsText(a)) {
         std.log.warn("ComfyUI-GGUF will refuse it too: its text-encoder loader does not list {s}", .{a});
     } else if (std.mem.eql(u8, a, "llama") and (m.head_count != 32 or m.head_count_kv != 8)) {
         // Its llama branch un-permutes Q/K with hardcoded head counts.
@@ -1023,6 +1199,9 @@ fn warnVocabless(m: HfLlm.Model, path: []const u8) void {
     }
 }
 
+/// The directory whose config.json describes these weights: the parent of a
+/// model.safetensors / index.json path, otherwise the path itself when it is a
+/// directory. load() still has to find a readable config.json for HF mode.
 fn hfDirCandidates(io: std.Io, path: []const u8) ?[]const u8 {
     var dir = path;
     while (dir.len > 0 and dir[dir.len - 1] == '/') dir = dir[0 .. dir.len - 1];
@@ -1866,6 +2045,31 @@ fn fillMetadataGaps(metadata: *std.json.ObjectMap, from: std.json.ObjectMap, are
     }
 }
 
+// The generic arch is a detection failure, not a result, so it defers to a
+// source/template general.architecture instead of clobbering it. A name that is
+// not a GGUF architecture id defers the same way, and so does a family-wide name
+// over a source that already says which member it is: renaming a gemma3 file to
+// "llama" leaves every gemma3.* key behind under the old prefix and llama.cpp
+// dies on a missing llama.block_count. A config.json (`hf`) names the model
+// outright and is not a detection guess, so it still writes.
+fn writesArch(f: anytype, arch: *const imagearch.Arch, opts: ConvertOptions, hf: ?HfLlm.Model) bool {
+    if (opts.arch_override != null) return true;
+    const defers_to_source = hf == null and arch.keys_family_wide and sourceArchName(f) != null;
+    return arch != &imagearch.generic_arch and (arch.gguf_arch_id or hf != null) and !defers_to_source;
+}
+
+/// The general.architecture `buildGgufMetadata` writes. When the arch defers,
+/// a template's wins, then the source's off the file directly rather than the
+/// detected one, which would claim an architecture whose <arch>.* keys sit
+/// under another prefix. A name that is not a GGUF architecture id must not
+/// come out either - no loader knows it.
+fn ggufArchName(f: anytype, arch: *const imagearch.Arch, template_metadata: ?std.json.ObjectMap, opts: ConvertOptions, hf: ?HfLlm.Model) []const u8 {
+    const arch_name = opts.arch_override orelse arch.name;
+    if (writesArch(f, arch, opts, hf)) return arch_name;
+    if (template_metadata) |m| if (m.get("general.architecture")) |v| if (v == .string) return v.string;
+    return sourceArchName(f) orelse if (arch.gguf_arch_id) arch_name else imagearch.generic_arch.name;
+}
+
 /// Assemble the final GGUF metadata map (added/overwritten standard keys, merged
 /// template/source keys, extra shape-fix records, dropped source quant header,
 /// stamped provenance, merged base config) into `metadata`. Shared by the real
@@ -1880,21 +2084,10 @@ fn buildGgufMetadata(
     arena_alloc: std.mem.Allocator,
     hf: ?HfLlm.Model,
 ) !void {
-    // Standard metadata. The generic arch is a detection failure, not a result, so it
-    // defers to a source/template general.architecture via the copies below instead of
-    // clobbering it; the fallback after the copies restores "unknown" when none exists.
-    // A name that is not a GGUF architecture id defers the same way, and so does a
-    // family-wide name over a source that already says which member it is: renaming a
-    // gemma3 file to "llama" leaves every gemma3.* key behind under the old prefix and
-    // llama.cpp dies on a missing llama.block_count. A config.json (`hf`) names the
-    // model outright and is not a detection guess, so it still writes.
-    const arch_name = opts.arch_override orelse arch.name;
-    const source_arch = sourceArchName(f);
-    const defers_to_source = opts.arch_override == null and hf == null and
-        arch.keys_family_wide and source_arch != null;
-    const writes_arch = arch != &imagearch.generic_arch and (arch.gguf_arch_id or hf != null) and !defers_to_source;
-    if (writes_arch or opts.arch_override != null) {
-        try metadata.put(arena_alloc, try arena_alloc.dupe(u8, "general.architecture"), .{ .string = arch_name });
+    // Standard metadata. An arch that defers gets its name from the copies below,
+    // and ggufArchName fills in after them when none had one.
+    if (writesArch(f, arch, opts, hf)) {
+        try metadata.put(arena_alloc, try arena_alloc.dupe(u8, "general.architecture"), .{ .string = opts.arch_override orelse arch.name });
     }
     try metadata.put(arena_alloc, try arena_alloc.dupe(u8, "general.quantization_version"), .{ .integer = 2 });
     try metadata.put(arena_alloc, try arena_alloc.dupe(u8, "general.file_type"), .{ .integer = ggufFileType(opts.datatype) });
@@ -1909,7 +2102,7 @@ fn buildGgufMetadata(
 
     if (hf) |m| {
         var hf_meta: std.json.ObjectMap = .empty;
-        try HfLlm.addMetadata(m, &hf_meta, arch_name, arena_alloc);
+        try HfLlm.addMetadata(m, &hf_meta, opts.arch_override orelse arch.name, arena_alloc);
         try fillMetadataGaps(metadata, hf_meta, arena_alloc);
     }
 
@@ -1922,16 +2115,7 @@ fn buildGgufMetadata(
     try fillMetadataGaps(metadata, extra_metadata, arena_alloc);
 
     if (!metadata.contains("general.architecture")) {
-        // The copies above were the deferral, and -t skips the source one, so
-        // take the source's name off the file directly rather than stamping the
-        // detected one: that would claim an architecture whose <arch>.* keys sit
-        // under another prefix. A name that is not a GGUF architecture id must
-        // not arrive here either - no loader knows it.
-        const fallback = if (opts.arch_override != null)
-            arch_name
-        else
-            source_arch orelse if (arch.gguf_arch_id) arch_name else imagearch.generic_arch.name;
-        try metadata.put(arena_alloc, try arena_alloc.dupe(u8, "general.architecture"), .{ .string = fallback });
+        try metadata.put(arena_alloc, try arena_alloc.dupe(u8, "general.architecture"), .{ .string = ggufArchName(f, arch, template_metadata, opts, hf) });
     }
 
     // Drop the source quantization header — it describes the pre-conversion layout —
@@ -2663,7 +2847,7 @@ fn writeSafetensors(
                 },
                 error.HfConfigUnsupported => {
                     const src_arch = sourceMetaStr(f, "general.architecture") orelse "?";
-                    std.log.warn("{s} is a {s} GGUF, and this tool writes config.json for llama, qwen2, qwen3 and qwen35 only", .{ opts.path, src_arch });
+                    std.log.warn("{s} is a {s} GGUF, and this tool writes config.json for {s} only", .{ opts.path, src_arch, HfLlm.hf_config_archs_text });
                     return e;
                 },
                 error.MissingVocabulary => {
@@ -4945,6 +5129,268 @@ test "-H prefixes a bare Qwen3VLModel checkpoint into the layout ComfyUI detects
         if (!found) std.debug.print("{s} is missing from the output\n", .{expected});
         try testing.expect(found);
     }
+}
+
+/// A fresh directory for one target test; the caller deletes it.
+fn targetTestDir(io: std.Io, a: std.mem.Allocator, tag: []const u8) ![]const u8 {
+    const ts_ns: i96 = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    const token: u64 = @as(u64, @bitCast(@as(i64, @truncate(ts_ns)))) ^ @as(u64, @intFromPtr(a.ptr));
+    const dir = try std.fmt.allocPrint(a, "/tmp/ggufy_target_{s}_test_{x}", .{ tag, token });
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir);
+    return dir;
+}
+
+fn targetTestOpts(io: std.Io, src_path: []const u8, dir: []const u8, target: Target.Target, datatype: ?types.DataType) ConvertOptions {
+    return .{
+        .io = io,
+        .path = src_path,
+        .filetype = .gguf,
+        .datatype = datatype,
+        .template_path = null,
+        .output_dir = dir,
+        .output_name = "out",
+        .threads = 1,
+        .skip_sensitivity = true,
+        .quantization_aggressiveness = 0,
+        .target = target,
+    };
+}
+
+test "a target plans the naming for the container asked for, and keeps it when written anyway" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var why: []const u8 = "";
+    const qwen3: TargetModel = .{ .kind = .llm, .arch_name = "qwen3" };
+
+    var asked = targetTestOpts(io, "m.gguf", "/nonexistent", .comfyui, .BF16);
+    asked.filetype_requested = .safetensors;
+    const st_ = try planTargetFor(qwen3, asked, true, a, &why);
+    try testing.expectEqual(types.FileType.safetensors, st_.filetype);
+    try testing.expect(st_.hf_names);
+
+    var forced = targetTestOpts(io, "m.gguf", "/nonexistent", .transformers, .INT8_CONVROT);
+    try testing.expectError(error.TargetCannotLoad, planTargetFor(qwen3, forced, true, a, &why));
+    forced.allow_incompatible = true;
+    const out = try planTargetFor(qwen3, forced, true, a, &why);
+    try testing.expect(why.len > 0);
+    try testing.expectEqualStrings(why, out.target_issue);
+    try testing.expectEqual(types.FileType.safetensors, out.filetype);
+    try testing.expect(out.hf_names);
+}
+
+test "a target plans for the -A architecture, and a named one survives an unknown model" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var why: []const u8 = "";
+    const qwen3: TargetModel = .{ .kind = .llm, .arch_name = "qwen3" };
+
+    // A ComfyUI GGUF keeps HF names for the qwen3vl the file will claim, not for qwen3.
+    const plain = targetTestOpts(io, "m.safetensors", "/nonexistent", .comfyui, .q8_0);
+    try testing.expect(!(try planTargetFor(qwen3, plain, false, a, &why)).hf_names);
+    var renamed = plain;
+    renamed.arch_override = "qwen3vl";
+    try testing.expect((try planTargetFor(qwen3, renamed, false, a, &why)).hf_names);
+
+    const named = try planTargetFor(null, targetTestOpts(io, "m.safetensors", "/nonexistent", .llamacpp, .q4_k), false, a, &why);
+    try testing.expectEqual(Target.Target.llamacpp, named.target);
+    const auto = try planTargetFor(null, targetTestOpts(io, "m.safetensors", "/nonexistent", .auto, .q4_k), false, a, &why);
+    try testing.expectEqual(Target.Target.custom, auto.target);
+}
+
+test "an image model's small float tensors still read as ComfyUI-GGUF types" {
+    testing.log_level = .err;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const dir = try targetTestDir(io, a, "flux");
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    // img_in is under the quantization threshold, so it passes through as the
+    // source's F16, which a GGUF stores as f16.
+    const specs = [_]NameShape{
+        .{ .name = "double_blocks.0.img_attn.proj.weight", .shape = &.{ 512, 512 } },
+        .{ .name = "img_in.weight", .shape = &.{ 64, 64 } },
+    };
+    const src_path = try std.fmt.allocPrint(a, "{s}/m.safetensors", .{dir});
+    try writeZeroSafetensors(io, a, src_path, &specs);
+
+    var f = try st.init(src_path, io, gpa, a, false, false);
+    defer f.deinit();
+    const opts = try applyTarget(&f, targetTestOpts(io, src_path, dir, .auto, .q4_k), gpa, a);
+    try testing.expectEqual(Target.Target.comfyui, opts.target);
+    try testing.expectEqual(types.FileType.gguf, opts.filetype);
+    const pred = try predictOutput(&f, opts, gpa, a);
+    try testing.expectEqual(Target.Level.yes, Target.verdictFor(&pred.verdicts, .comfyui).level);
+    try testing.expectEqual(Target.Level.no, Target.verdictFor(&pred.verdicts, .llamacpp).level);
+
+    // No type means an unquantized default, which ComfyUI loads as safetensors.
+    const dflt = try applyTarget(&f, targetTestOpts(io, src_path, dir, .comfyui, null), gpa, a);
+    try testing.expectEqual(types.FileType.safetensors, dflt.filetype);
+    try testing.expectError(error.TargetCannotLoad, applyTarget(&f, targetTestOpts(io, src_path, dir, .llamacpp, .q4_k), gpa, a));
+}
+
+test "the ComfyUI target warns about a GGUF of an architecture ComfyUI-GGUF does not list" {
+    testing.log_level = .err;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const dir = try targetTestDir(io, a, "krea2");
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const specs = [_]NameShape{
+        .{ .name = "blocks.0.attn.qknorm.qnorm.scale", .shape = &.{64} },
+        .{ .name = "txtfusion.projector.weight", .shape = &.{ 64, 64 } },
+    };
+    const src_path = try std.fmt.allocPrint(a, "{s}/m.safetensors", .{dir});
+    try writeZeroSafetensors(io, a, src_path, &specs);
+
+    var f = try st.init(src_path, io, gpa, a, false, false);
+    defer f.deinit();
+    const gguf_opts = try applyTarget(&f, targetTestOpts(io, src_path, dir, .comfyui, .q4_k), gpa, a);
+    try testing.expectEqual(types.FileType.gguf, gguf_opts.filetype);
+    try testing.expectEqual(Target.Target.comfyui, gguf_opts.target);
+    const pred = try predictOutput(&f, gguf_opts, gpa, a);
+    try testing.expectEqualStrings("", try Target.problem("", &pred.verdicts, .comfyui, a));
+    try testing.expect(std.mem.indexOf(u8, try Target.warning(&pred.verdicts, .comfyui, a), "krea2") != null);
+    // With no type asked for, it is safetensors, which loads with no extension.
+    const st_opts = try applyTarget(&f, targetTestOpts(io, src_path, dir, .comfyui, null), gpa, a);
+    try testing.expectEqual(types.FileType.safetensors, st_opts.filetype);
+}
+
+test "a Qwen3-VL checkpoint takes the layout its target's loader reads" {
+    testing.log_level = .err;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const dir = try targetTestDir(io, a, "qwen3vl");
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const specs = [_]NameShape{
+        .{ .name = "language_model.embed_tokens.weight", .shape = &.{ 32, 64 } },
+        .{ .name = "language_model.norm.weight", .shape = &.{64} },
+        .{ .name = "language_model.layers.0.self_attn.q_proj.weight", .shape = &.{ 64, 64 } },
+        .{ .name = "language_model.layers.0.self_attn.q_norm.weight", .shape = &.{16} },
+        .{ .name = "visual.patch_embed.proj.weight", .shape = &.{ 16, 48 } },
+        .{ .name = "visual.deepstack_merger_list.0.norm.weight", .shape = &.{16} },
+    };
+    const src_path = try std.fmt.allocPrint(a, "{s}/m.safetensors", .{dir});
+    try writeZeroSafetensors(io, a, src_path, &specs);
+
+    var f = try st.init(src_path, io, gpa, a, false, false);
+    defer f.deinit();
+    const comfy = try applyTarget(&f, targetTestOpts(io, src_path, dir, .comfyui, .q8_0), gpa, a);
+    try testing.expect(comfy.hf_names);
+    try testing.expectEqual(types.FileType.gguf, comfy.filetype);
+    const pred = try predictOutput(&f, comfy, gpa, a);
+    const v = Target.verdictFor(&pred.verdicts, .comfyui);
+    try testing.expectEqual(Target.Level.yes, v.level);
+    try testing.expectEqual(Target.Level.no, Target.verdictFor(&pred.verdicts, .llamacpp).level);
+
+    const llama = try applyTarget(&f, targetTestOpts(io, src_path, dir, .auto, .q8_0), gpa, a);
+    try testing.expectEqual(Target.Target.llamacpp, llama.target);
+    try testing.expect(!llama.hf_names);
+}
+
+test "a target plans for the architecture config.json names, not the tensor family" {
+    testing.log_level = .err;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const dir = try targetTestDir(io, a, "config");
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    // Llama-shaped tensors, which detect as the family-wide llama.
+    const specs = [_]NameShape{
+        .{ .name = "model.embed_tokens.weight", .shape = &.{ 32, 64 } },
+        .{ .name = "model.layers.0.self_attn.q_proj.weight", .shape = &.{ 64, 64 } },
+        .{ .name = "model.layers.0.self_attn.k_proj.weight", .shape = &.{ 64, 64 } },
+        .{ .name = "model.layers.0.mlp.gate_proj.weight", .shape = &.{ 64, 64 } },
+        .{ .name = "model.layers.0.mlp.down_proj.weight", .shape = &.{ 64, 64 } },
+        .{ .name = "model.norm.weight", .shape = &.{64} },
+    };
+    const src_path = try std.fmt.allocPrint(a, "{s}/model.safetensors", .{dir});
+    try writeZeroSafetensors(io, a, src_path, &specs);
+
+    var f = try st.init(src_path, io, gpa, a, false, false);
+    defer f.deinit();
+    const bare = (try targetModel(io, src_path, f.tensors.items, f.getSourceMetadata(), false, gpa, a)).?;
+    try testing.expectEqualStrings("llama", bare.arch_name);
+
+    {
+        const file = try std.Io.Dir.cwd().createFile(io, try std.fmt.allocPrint(a, "{s}/config.json", .{dir}), .{ .truncate = true });
+        defer file.close(io);
+        try file.writeStreamingAll(io, "{\"model_type\":\"qwen2\"}");
+    }
+    const named = (try targetModel(io, src_path, f.tensors.items, f.getSourceMetadata(), false, gpa, a)).?;
+    try testing.expectEqual(Target.Kind.llm, named.kind);
+    try testing.expectEqualStrings("qwen2", named.arch_name);
+
+    // Safetensors with no type, GGUF when a GGUF type is asked for.
+    const dflt = try applyTarget(&f, targetTestOpts(io, src_path, dir, .comfyui, null), gpa, a);
+    try testing.expectEqual(types.FileType.safetensors, dflt.filetype);
+    try testing.expectEqual(types.FileType.gguf, (try applyTarget(&f, targetTestOpts(io, src_path, dir, .comfyui, .q4_k), gpa, a)).filetype);
+}
+
+test "convert refuses before writing an output its target cannot load, unless allowed" {
+    testing.log_level = .err;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const dir = try targetTestDir(io, a, "refuse");
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const specs = [_]NameShape{
+        .{ .name = "double_blocks.0.img_attn.proj.weight", .shape = &.{ 512, 512 } },
+    };
+    const src_path = try std.fmt.allocPrint(a, "{s}/m.safetensors", .{dir});
+    try writeZeroSafetensors(io, a, src_path, &specs);
+
+    var f = try st.init(src_path, io, gpa, a, false, false);
+    defer f.deinit();
+    const opts = try applyTarget(&f, targetTestOpts(io, src_path, dir, .comfyui, .ASYM_W4A8_INT8_ZP), gpa, a);
+    const out_path = try std.fmt.allocPrint(a, "{s}/out.safetensors", .{dir});
+    try testing.expectError(error.TargetCannotLoad, convert(&f, opts, gpa, a));
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, out_path, .{}));
+
+    var allowed = opts;
+    allowed.allow_incompatible = true;
+    try convert(&f, allowed, gpa, a);
+    _ = try std.Io.Dir.cwd().statFile(io, out_path, .{});
 }
 
 test "a llama-shaped checkpoint with no usable config.json is refused unless -H keeps its names" {

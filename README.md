@@ -25,6 +25,58 @@ This is not a "vibe coded" program by the normal definition, but it is AI-assist
 After careful usage and consideration, it is my belief that the introduction of AI assistance has not decreased the quality of the code in the way I am using it.
 However, I thought it best to add this disclaimer for transparency.
 
+### Supported input / output datatypes
+
+ggufy supports the following input and output datatypes (the data formats inside the files):
+
+| Datatype            | Safetensors | GGUF         |
+|---------------------|-------------|--------------|
+| `f32`               | ✅           | ✅            |
+| `f16`               | ✅           | ✅            |
+| `bf16`              | ✅           | ✅            |
+| `f64`               | read only   | read only ¹  |
+| `F8_E4M3`           | ✅           | ❌            |
+| `F8_E5M2`           | ✅           | ❌            |
+| `SCALED_F8_E4M3`    | ✅           | ❌            |
+| `F4_E2M1`           | ✅           | ❌            |
+| `MXFP4` / `mxfp4`   | ✅           | ✅            |
+| `MXFP8_E4M3`        | ✅           | ❌            |
+| `NVFP4`             | ✅           | ❌            |
+| `INT8`              | ✅           | ❌            |
+| `INT8_CONVROT`      | ✅           | ❌            |
+| `INT4_CONVROT`      | ✅           | ❌            |
+| `INT4_CONVROT_SR`   | ✅           | ❌            |
+| `ASYM_W4A8_INT8`    | ✅           | ❌            |
+| `ASYM_W4A8_INT8_ZP` | ✅ ²         | ❌            |
+| `W6A8_INT8`         | ✅           | ❌            |
+| `q8_0`              | ❌           | ✅            |
+| `q6_k`              | ❌           | ✅            |
+| `q5_k`              | ❌           | ✅            |
+| `q5_1`              | ❌           | ✅            |
+| `q5_0`              | ❌           | ✅            |
+| `q4_k`              | ❌           | ✅            |
+| `q4_1`              | ❌           | ✅            |
+| `q4_0`              | ❌           | ✅            |
+| `q3_k`              | ❌           | ✅            |
+| `q2_k`              | ❌           | ✅            |
+| `iq4_xs`            | ❌           | ✅            |
+| `iq4_nl`            | ❌           | ✅            |
+| `iq3_s`             | ❌           | ✅            |
+| `iq3_xxs`           | ❌           | ✅            |
+| `iq2_s`             | ❌           | ✅            |
+| `iq2_xs`            | ❌           | ✅ ³          |
+| `iq2_xxs`           | ❌           | ✅ ³          |
+| `iq1_m`             | ❌           | ✅            |
+| `iq1_s`             | ❌           | ✅ ³          |
+| `tq2_0`             | ❌           | read only    |
+| `tq1_0`             | ❌           | read only    |
+
+✅ read and write, ❌ not supported.
+
+1. `f64` for GGUF is converted to `f32`; ComfyUI won't load `f64` GGUF tensors.
+2. Current ComfyUI decodes `ASYM_W4A8_INT8_ZP` incorrectly, so it can't be used there.
+3. Requires an importance matrix (`--imatrix`).
+
 ### Supported architectures
 
 This table lists the architectures that ggufy can convert, and whether they have sensitivity data available.

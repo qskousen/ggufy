@@ -6,6 +6,7 @@ const ggufy = @import("ggufy");
 const guiState = @import("gui_state.zig");
 const fileHandling = @import("file_handling.zig");
 const conv = ggufy.convert;
+const Target = ggufy.target;
 const build_options = @import("build_options");
 
 comptime {
@@ -53,6 +54,52 @@ const st_type_names = [_][]const u8{
 
 comptime {
     std.debug.assert(st_target_types.len == st_type_names.len);
+}
+
+/// Each type list's display names, with a short mark on the types a target cannot load.
+fn markIssues(comptime ts: anytype, comptime names: anytype) std.EnumArray(Target.Target, [names.len][]const u8) {
+    @setEvalBranchQuota(20000);
+    var out: std.EnumArray(Target.Target, [names.len][]const u8) = undefined;
+    for (std.enums.values(Target.Target)) |target| {
+        var marked: [names.len][]const u8 = undefined;
+        for (ts, names, 0..) |t, name, i| marked[i] = if (Target.dtypeIssue(target, t) != null) name ++ "  (!)" else name;
+        out.set(target, marked);
+    }
+    return out;
+}
+
+const gguf_marked_names = markIssues(gguf_target_types, gguf_type_names);
+const st_marked_names = markIssues(st_target_types, st_type_names);
+
+fn targetName(t: Target.Target) []const u8 {
+    return switch (t) {
+        .llamacpp => "llama.cpp (also Ollama, LM Studio)",
+        .transformers => "transformers (Hugging Face)",
+        .custom => "Custom",
+        .comfyui, .auto => t.label(),
+    };
+}
+
+fn targetTip(t: Target.Target, kind: ?Target.Kind) []const u8 {
+    return switch (t) {
+        .comfyui => if (kind == .llm)
+            "A text encoder for ComfyUI. Safetensors loads in ComfyUI itself, GGUF through a GGUF loader extension; the tensor naming each expects is chosen for you."
+        else
+            "Safetensors loads in ComfyUI itself, GGUF through a GGUF loader extension. A model family ComfyUI-GGUF does not load is warned about.",
+        .llamacpp => "A GGUF with llama.cpp's tensor names and tokenizer, and a separate mmproj file for a vision tower.",
+        .transformers => "A directory transformers' from_pretrained loads: HF tensor names in model.safetensors, with config.json and tokenizer files beside it.",
+        .custom => "Choose the format and tensor naming yourself. Nothing is refused for being unloadable.",
+        .auto => "",
+    };
+}
+
+/// Keep the format and type within what the target reads, after either changes.
+fn coerceToTarget(model: ?conv.TargetModel) void {
+    const m = model orelse return;
+    if (!Target.readsContainer(state.target, m.kind, state.target_filetype)) {
+        state.target_filetype = if (state.target_filetype == .gguf) .safetensors else .gguf;
+        state.target_dtype = null;
+    }
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -131,6 +178,8 @@ pub fn main(init: std.process.Init) !void {
             state.pretok_unknown = false;
             state.allow_upscale = false;
             state.upscale_pending = false;
+            state.allow_incompatible = false;
+            state.incompatible_pending = false;
             state.arch_override_buf = std.mem.zeroes([64]u8);
             state.hf_names = false;
             state.force = false;
@@ -277,6 +326,7 @@ fn gui_frame() bool {
 
     // Upscale warning dialog
     if (state.upscale_pending) showUpscaleDialog();
+    if (state.incompatible_pending) showIncompatibleDialog();
 
     // About modal
     if (state.show_about) showAboutModal();
@@ -396,6 +446,7 @@ fn showInputFile() void {
         const stem_len = @min(stem.len, state.filename_base_stem_buf.len - 1);
         @memcpy(state.filename_base_stem_buf[0..stem_len], stem[0..stem_len]);
         state.filename_base_stem_len = stem_len;
+        state.target = if (state.target_model) |m| Target.resolve(.auto, m.kind) else .custom;
     }
 
     // File info banner
@@ -425,10 +476,36 @@ fn showInputFile() void {
         var opts_box = dvui.box(@src(), .{}, .{ .expand = .horizontal, .margin = .{ .x = 4, .y = 8, .w = 4, .h = 4 } });
         defer opts_box.deinit();
 
-        const active_types: []const ggufy.types.DataType = if (state.target_filetype == .gguf) &gguf_target_types else &st_target_types;
-        const active_names: []const []const u8 = if (state.target_filetype == .gguf) &gguf_type_names else &st_type_names;
+        const model = state.target_model;
+        const kind: ?Target.Kind = if (model) |m| m.kind else null;
+        coerceToTarget(model);
 
-        // Target format row
+        // Use with row: the program the output is for
+        {
+            var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .all(2) });
+            defer row.deinit();
+            var lwd: dvui.WidgetData = undefined;
+            dvui.label(@src(), "Use with", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 120 }, .data_out = &lwd });
+            dvui.tooltip(@src(), .{ .active_rect = lwd.borderRectScale().r },
+                "The program you will load the output in. It decides the format and tensor naming, and a conversion it could not load is refused.", .{}, .{});
+
+            const choices = Target.targetsFor(kind);
+            var names_buf: [4][]const u8 = undefined;
+            for (choices, 0..) |t, i| names_buf[i] = targetName(t);
+            const names = names_buf[0..choices.len];
+            var idx: usize = for (choices, 0..) |t, i| {
+                if (t == state.target) break i;
+            } else 0;
+            state.target = choices[idx];
+            var dwd: dvui.WidgetData = undefined;
+            if (dvui.dropdown(@src(), names, .{ .choice = &idx }, .{}, .{ .gravity_y = 0.5, .data_out = &dwd })) {
+                state.target = choices[idx];
+                coerceToTarget(model);
+            }
+            dvui.tooltip(@src(), .{ .active_rect = dwd.borderRectScale().r }, "{s}", .{targetTip(state.target, kind)}, .{});
+        }
+
+        // Target format row, limited to what the target reads
         {
             var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .all(2) });
             defer row.deinit();
@@ -437,13 +514,24 @@ fn showInputFile() void {
             dvui.tooltip(@src(), .{ .active_rect = lwd.borderRectScale().r },
                 "Choose the output file format.", .{}, .{});
 
-            const prev_filetype = state.target_filetype;
-            _ = dvui.dropdownEnum(@src(), ggufy.types.FileType, .{ .choice = &state.target_filetype }, .{}, .{ .gravity_y = 0.5 });
-            if (state.target_filetype != prev_filetype) {
-                // Reset dtype when format changes as old selection may be invalid.
-                state.target_dtype = null;
+            const only_one: ?[]const u8 = if (model) |m| Target.containerReason(state.target, m.kind) else null;
+            if (only_one == null) {
+                const prev_filetype = state.target_filetype;
+                _ = dvui.dropdownEnum(@src(), ggufy.types.FileType, .{ .choice = &state.target_filetype }, .{}, .{ .gravity_y = 0.5 });
+                if (state.target_filetype != prev_filetype) {
+                    // Reset dtype when format changes as old selection may be invalid.
+                    state.target_dtype = null;
+                }
+            } else {
+                var fwd: dvui.WidgetData = undefined;
+                dvui.label(@src(), "{s}", .{@tagName(state.target_filetype)}, .{ .gravity_y = 0.5, .data_out = &fwd });
+                dvui.tooltip(@src(), .{ .active_rect = fwd.borderRectScale().r }, "{s}", .{only_one.?}, .{});
             }
         }
+
+        const active_types: []const ggufy.types.DataType = if (state.target_filetype == .gguf) &gguf_target_types else &st_target_types;
+        // The reason behind a mark shows once that type is picked.
+        const active_names: []const []const u8 = if (state.target_filetype == .gguf) gguf_marked_names.getPtrConst(state.target) else st_marked_names.getPtrConst(state.target);
 
         // Data type row
         {
@@ -595,16 +683,30 @@ fn showInputFile() void {
                     }
                 }
 
+                // What a non-custom target picks for itself.
+                const hf_out = if (state.target == .custom)
+                    state.hf_names
+                else if (model) |m|
+                    Target.hfNames(state.target, m.kind, m.arch_name, state.target_filetype, file.type == .gguf)
+                else
+                    false;
+
                 // HF names: meaningful for both outputs, with a different effect each
                 {
                     var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .all(2) });
                     defer row.deinit();
                     var cwd: dvui.WidgetData = undefined;
-                    _ = dvui.checkbox(@src(), &state.hf_names, "HF names", .{ .gravity_y = 0.5, .data_out = &cwd });
-                    if (is_safetensors_out) {
+                    if (state.target != .custom) {
+                        var dummy_hf = hf_out;
+                        _ = dvui.checkbox(@src(), &dummy_hf, "HF names", .{ .gravity_y = 0.5, .color_text = dim_color, .data_out = &cwd });
+                        dvui.tooltip(@src(), .{ .active_rect = cwd.borderRectScale().r },
+                            "Set by the Use with choice. Choose Custom to set it yourself.", .{}, .{});
+                    } else if (is_safetensors_out) {
+                        _ = dvui.checkbox(@src(), &state.hf_names, "HF names", .{ .gravity_y = 0.5, .data_out = &cwd });
                         dvui.tooltip(@src(), .{ .active_rect = cwd.borderRectScale().r },
                             "Write a transformers-loadable directory from a llama-family GGUF: HF tensor names, un-permuted Q/K, and config.json / tokenizer.json / tokenizer_config.json beside the weights.", .{}, .{});
                     } else {
+                        _ = dvui.checkbox(@src(), &state.hf_names, "HF names", .{ .gravity_y = 0.5, .data_out = &cwd });
                         dvui.tooltip(@src(), .{ .active_rect = cwd.borderRectScale().r },
                             "Keep an LLM's HF tensor names instead of renaming to llama.cpp's blk.* names. The file then claims no architecture and llama.cpp will not load it.", .{}, .{});
                     }
@@ -612,7 +714,7 @@ fn showInputFile() void {
 
                 // Overwrite sidecars, only with HF names on safetensors output
                 {
-                    const active = is_safetensors_out and state.hf_names;
+                    const active = is_safetensors_out and hf_out;
                     var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .all(2) });
                     defer row.deinit();
                     var cwd: dvui.WidgetData = undefined;
@@ -836,6 +938,8 @@ fn showInputFile() void {
             if (state.prev_pred_signature == null or state.prev_pred_signature.? != sig) {
                 state.prev_pred_signature = sig;
                 state.predicted_size = fileHandling.predictSize(gpa, &state);
+                // A confirmation covers the output it was given for, not the next one.
+                state.allow_incompatible = false;
             }
         }
 
@@ -904,6 +1008,15 @@ fn showInputFile() void {
                     .color_text = dim_color,
                 });
             }
+            if (state.worksWith().len > 0) {
+                dvui.label(@src(), "Works with: {s}", .{state.worksWith()}, .{ .margin = .{ .x = 0, .y = 2, .w = 0, .h = 2 } });
+            }
+        }
+        const target_problem = state.targetProblem();
+        if (target_problem.len > 0) {
+            var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal, .background = false, .margin = .{ .x = 0, .y = 4, .w = 0, .h = 2 } });
+            tl.addText(target_problem, .{ .color_text = dvui.Color{ .r = 220, .g = 60, .b = 60, .a = 255 } });
+            tl.deinit();
         }
 
         // Action buttons
@@ -1018,6 +1131,11 @@ fn launchConversion(fa: std.mem.Allocator) void {
         return;
     }
     state.same_file_error = false;
+
+    if (state.targetProblem().len > 0 and !state.allow_incompatible) {
+        state.incompatible_pending = true;
+        return;
+    }
 
     // Warn if converting lossy-quantized tensors to a higher-precision format.
     if (!state.allow_upscale) {
@@ -1214,6 +1332,36 @@ fn showOverwriteDialog() void {
 }
 
 // Upscale warning dialog
+
+fn showIncompatibleDialog() void {
+    var float = dvui.floatingWindow(@src(), .{ .modal = true }, .{ .min_size_content = .{ .w = 420, .h = 160 } });
+    defer float.deinit();
+
+    var content = dvui.box(@src(), .{}, .{ .expand = .both, .padding = .all(16) });
+    defer content.deinit();
+
+    dvui.label(@src(), "{s} cannot load this", .{targetName(state.target)}, .{ .font = .theme(.title) });
+    {
+        var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal, .background = false, .margin = .{ .x = 0, .y = 8, .w = 0, .h = 12 } });
+        tl.addText(state.targetProblem(), .{});
+        tl.deinit();
+    }
+
+    {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .gravity_x = 1.0 });
+        defer row.deinit();
+
+        if (dvui.button(@src(), "Cancel", .{}, .{ .margin = .all(4) })) {
+            state.incompatible_pending = false;
+        }
+
+        if (dvui.button(@src(), "Convert anyway", .{}, .{ .margin = .all(4) })) {
+            state.incompatible_pending = false;
+            state.allow_incompatible = true;
+            launchConversion(frameArena());
+        }
+    }
+}
 
 fn showUpscaleDialog() void {
     var float = dvui.floatingWindow(@src(), .{ .modal = true }, .{ .min_size_content = .{ .w = 420, .h = 160 } });
