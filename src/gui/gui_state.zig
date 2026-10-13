@@ -39,7 +39,8 @@ pub const State = struct {
     /// Last dtype applied when auto-generating the filename. Null = never auto-applied.
     prev_target_dtype: ?ggufy.types.DataType = null,
     /// Length of template_path last time the filename was auto-generated (change detector).
-    prev_template_path_len: usize = 0,
+    prev_template_generation: u32 = 0,
+    prev_target_filetype: ggufy.types.FileType = .gguf,
     /// CPU thread count for quantization. Populated at startup with getCpuCount().
     target_threads: usize = 4,
     cpu_count: usize = 4,
@@ -65,6 +66,10 @@ pub const State = struct {
     sensitivity_path: ?[]u8 = null,
     template_path_buf: [std.fs.max_path_bytes]u8 = std.mem.zeroes([std.fs.max_path_bytes]u8),
     template_path: ?[]u8 = null,
+    /// The template is a llama.cpp type file, which works alongside -d and sensitivities.
+    template_is_rules: bool = false,
+    /// Bumped whenever `template_path` changes, so the output name follows it.
+    template_generation: u32 = 0,
     /// Separate open-flag for each dialog so they don't interfere.
     folder_dialog_open: bool = false,
     sensitivity_dialog_open: bool = false,

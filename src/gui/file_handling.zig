@@ -92,7 +92,10 @@ pub fn sensitivityFileCallback(userdata: ?*anyopaque, filelist: [*c]const [*c]co
     state.sensitivity_path_buf[len] = 0;
     state.sensitivity_path = state.sensitivity_path_buf[0..len];
     // Custom sensitivity and built-in sensitivity are mutually exclusive.
-    state.template_path = null;
+    if (!state.template_is_rules and state.template_path != null) {
+        state.template_path = null;
+        state.template_generation +%= 1;
+    }
     state.skip_sensitivity = false;
     pushWakeupEvent(state);
 }
@@ -124,12 +127,20 @@ pub fn templateFileCallback(userdata: ?*anyopaque, filelist: [*c]const [*c]const
     if (files[0] == null) return;
 
     const path = std.mem.span(files[0]);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const is_rules = conv.isTensorTypeRuleFile(state.io, path, arena.allocator()) catch |e| {
+        std.log.err("Cannot read template {s}: {t}", .{ path, e });
+        return;
+    };
     const len = @min(path.len, state.template_path_buf.len - 1);
     @memcpy(state.template_path_buf[0..len], path[0..len]);
     state.template_path_buf[len] = 0;
     state.template_path = state.template_path_buf[0..len];
-    // Selecting a template clears any sensitivity file
-    state.sensitivity_path = null;
+    state.template_is_rules = is_rules;
+    state.template_generation +%= 1;
+    // A JSON template fixes every type, so it replaces any sensitivity file.
+    if (!state.template_is_rules) state.sensitivity_path = null;
     pushWakeupEvent(state);
 }
 

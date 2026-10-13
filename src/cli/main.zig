@@ -157,7 +157,7 @@ pub fn main(init: std.process.Init) !void {
         \\-d, --datatype <DATATYPE>      When converting, the target datatype (default fp16).
         \\-T, --target <TARGET>          The program the output is for: comfyui, llamacpp, transformers, or custom. Picks the file type (from -d) and tensor naming that program reads, and refuses output it cannot load. Default: comfyui for a diffusion model, llamacpp for an LLM; -f or -H without -T means custom.
         \\-f, --filetype <FILETYPE>      When converting, the target filetype: gguf (default), safetensors. Without -T, implies --target custom. GGUF from an HF checkpoint with a vision tower also writes the tower as mmproj-<output name>.gguf, as llama.cpp's converter would.
-        \\-t, --template <FILENAME>      When converting, specify a template to use.
+        \\-t, --template <FILENAME>      When converting, a ggufy JSON template, or a llama-quantize --tensor-type-file whose pattern=type rules override -d and sensitivities for the tensors they match.
         \\-o, --output-dir <DIR>         Output directory (default: same as source file).
         \\-n, --output-name <FILENAME>   Output filename without extension (default: source name + datatype).
         \\-j, --threads <INT>            Threads to use when quantizing. Defaults to number of cores.

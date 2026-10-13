@@ -173,6 +173,8 @@ pub fn main(init: std.process.Init) !void {
             state.convert_output_path = null;
             state.sensitivity_path = null;
             state.template_path = null;
+            state.template_is_rules = false;
+            state.template_generation +%= 1;
             state.skip_sensitivity = false;
             state.allow_unknown_arch = false;
             state.pretok_unknown = false;
@@ -554,14 +556,19 @@ fn showInputFile() void {
         }
 
         // Auto-regenerate filename when dtype or template changes (or on first display).
-        const cur_tmpl_len = if (state.template_path) |tp| tp.len else 0;
-        const template_changed = cur_tmpl_len != state.prev_template_path_len;
-        if (first_init or state.target_dtype != state.prev_target_dtype or template_changed) {
+        const template_changed = state.template_generation != state.prev_template_generation;
+        // A template's types are spelled per container, so its suffix follows the file type too.
+        const filetype_changed = state.template_path != null and state.target_filetype != state.prev_target_filetype;
+        if (first_init or state.target_dtype != state.prev_target_dtype or template_changed or filetype_changed) {
             state.prev_target_dtype = state.target_dtype;
-            state.prev_template_path_len = cur_tmpl_len;
-            const type_name: []const u8 = if (state.template_path) |tp| blk: {
+            state.prev_template_generation = state.template_generation;
+            state.prev_target_filetype = state.target_filetype;
+            const rule_floor = if (state.template_is_rules) conv.templateRuleFloor(state.io, state.template_path.?, state.target_filetype, state.target_dtype, fa) else null;
+            const type_name: []const u8 = if (rule_floor) |dt|
+                @tagName(dt)
+            else if (state.template_path != null and !state.template_is_rules) blk: {
                 // Template overrides dtype: derive suffix from the template's tensor types.
-                break :blk conv.templateTypeSuffix(state.io, tp, state.target_filetype, fa) catch "";
+                break :blk conv.templateTypeSuffix(state.io, state.template_path.?, state.target_filetype, fa) catch "";
             } else if (state.target_dtype) |dt|
                 @tagName(dt)
             else blk: {
@@ -790,7 +797,7 @@ fn showInputFile() void {
 
                 // Sensitivity file row — dimmed for safetensors output
                 {
-                    const blocked_by_template = state.template_path != null;
+                    const blocked_by_template = state.template_path != null and !state.template_is_rules;
                     const blocked = is_safetensors_out or blocked_by_template;
                     const row_color: ?dvui.Color = if (blocked) dim_color else null;
 
@@ -832,41 +839,37 @@ fn showInputFile() void {
 
                 // Template file row
                 {
-                    const blocked_by_sens = state.sensitivity_path != null;
-                    const row_color: ?dvui.Color = if (blocked_by_sens) dim_color else null;
-
                     var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .all(2) });
                     defer row.deinit();
-                    dvui.label(@src(), "Template file", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 120 }, .color_text = row_color });
+                    dvui.label(@src(), "Template file", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 120 } });
 
                     const tmpl_display = if (state.template_path) |p| p else "none";
-                    dvui.labelNoFmt(@src(), tmpl_display, .{}, .{ .expand = .horizontal, .gravity_y = 0.5, .color_text = row_color });
+                    dvui.labelNoFmt(@src(), tmpl_display, .{}, .{ .expand = .horizontal, .gravity_y = 0.5 });
 
-                    if (state.template_path != null and !blocked_by_sens) {
+                    if (state.template_path != null) {
                         if (dvui.button(@src(), "Clear", .{}, .{ .gravity_y = 0.5 })) {
                             state.template_path = null;
-                            state.prev_template_path_len = 0;
+                            state.template_is_rules = false;
+                            state.template_generation +%= 1;
                         }
                     }
                     var bwd: dvui.WidgetData = undefined;
-                    if (dvui.button(@src(), "Browse...", .{}, .{ .gravity_y = 0.5, .color_text = row_color, .data_out = &bwd })) {
-                        if (!blocked_by_sens and !state.template_dialog_open) {
+                    if (dvui.button(@src(), "Browse...", .{}, .{ .gravity_y = 0.5, .data_out = &bwd })) {
+                        if (!state.template_dialog_open) {
                             state.template_dialog_open = true;
                             SDLBackend.c.SDL_ShowOpenFileDialog(
                                 fileHandling.templateFileCallback,
                                 &state,
                                 g_backend.?.window,
-                                &json_filters,
-                                json_filters.len,
+                                &template_filters,
+                                template_filters.len,
                                 null,
                                 false,
                             );
                         }
                     }
-                    if (blocked_by_sens) {
-                        dvui.tooltip(@src(), .{ .active_rect = bwd.borderRectScale().r },
-                            "Cannot use a template while a sensitivity file is selected.", .{}, .{});
-                    }
+                    dvui.tooltip(@src(), .{ .active_rect = bwd.borderRectScale().r },
+                        "A ggufy JSON template, or a llama-quantize --tensor-type-file of pattern=type rules.", .{}, .{});
                 }
 
                 // Aggressiveness slider — dimmed for safetensors output or when sensitivity inactive
@@ -1140,7 +1143,9 @@ fn launchConversion(fa: std.mem.Allocator) void {
     // Warn if converting lossy-quantized tensors to a higher-precision format.
     if (!state.allow_upscale) {
         const loaded = &state.loaded_file.?;
-        if (conv.detectUpscaling(loaded.tensors.items, state.target_dtype)) {
+        // A rule file that fails to parse is reported by the conversion itself.
+        const rules = conv.loadTemplateRules(opts, fa) catch null;
+        if (conv.detectUpscaling(loaded.tensors.items, state.target_dtype, rules)) {
             state.upscale_pending = true;
             return;
         }
@@ -1621,6 +1626,11 @@ const file_filters = [_]SDLBackend.c.SDL_DialogFileFilter{
 
 const gguf_filters = [_]SDLBackend.c.SDL_DialogFileFilter{
     .{ .name = "GGUF files", .pattern = "gguf" },
+    .{ .name = "All files",  .pattern = "*" },
+};
+
+const template_filters = [_]SDLBackend.c.SDL_DialogFileFilter{
+    .{ .name = "Templates (JSON, llama.cpp type file)", .pattern = "json;txt" },
     .{ .name = "All files",  .pattern = "*" },
 };
 

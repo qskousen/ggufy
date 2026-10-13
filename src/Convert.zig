@@ -11,6 +11,7 @@ const TensorClusters = @import("TensorClusters.zig");
 const DataTransform = @import("DataTransform.zig");
 const HfLlm = @import("HfLlm.zig");
 const Target = @import("Target.zig");
+const TensorTypeRules = @import("TensorTypeRules.zig");
 const ImatrixMod = @import("Imatrix.zig");
 const ggml = @import("ggml.h");
 const build_options = @import("build_options");
@@ -85,6 +86,8 @@ pub const ConvertOptions = struct {
     target_issue: []const u8 = "",
     /// Optional GUI progress/cancel hooks.  No-ops when null.
     callbacks: cb.ConvertCallbacks = .{},
+    /// The llama.cpp type file at `template_path`, parsed. `convert` fills it in when null.
+    tensor_type_rules: ?*TensorTypeRules = null,
 };
 
 /// Set `filetype` and `hf_names` for `opts.target`, which leaves it resolved
@@ -130,7 +133,10 @@ pub fn planTarget(f: anytype, opts: ConvertOptions, allocator: std.mem.Allocator
 pub fn planTargetFor(model: ?TargetModel, opts: ConvertOptions, source_is_gguf: bool, arena_alloc: std.mem.Allocator, why: *[]const u8) !ConvertOptions {
     if (opts.target == .custom) return opts;
     var out = opts;
-    const datatype = opts.datatype orelse lowestTemplateType(opts, arena_alloc);
+    // The container is not known yet, so a type file's floor is taken as written.
+    const datatype = opts.datatype orelse
+        (if (opts.template_path) |tp| templateRuleFloor(opts.io, tp, null, null, arena_alloc) else null) orelse
+        lowestTemplateType(opts, arena_alloc);
     const detected = model orelse {
         // Nothing to plan for; prepareConversion reports the unknown architecture.
         // An auto target has no program to stand for, but one the user named
@@ -265,17 +271,17 @@ fn precisionRank(type_str: []const u8) u8 {
     };
 }
 
-/// Returns true when converting `source_tensors` to `target_dtype` would store
-/// data at a higher nominal precision than the source — meaning the extra bits
-/// are fill-in only, no information is recovered.
-/// Skipped when target_dtype is null (template-based conversion).
-pub fn detectUpscaling(source_tensors: []const types.Tensor, target_dtype: ?types.DataType) bool {
-    const tgt = target_dtype orelse return false;
-    const target_rank = precisionRank(@tagName(tgt));
-    if (target_rank == 255) return false;
+/// Whether converting `source_tensors` to `target_dtype`, or to the type a
+/// matching rule gives, stores any tensor above its source's nominal precision,
+/// where the extra bits are fill-in only. Rules match source names, so an HF
+/// checkpoint rarely hits a type file written for GGUF names.
+pub fn detectUpscaling(source_tensors: []const types.Tensor, target_dtype: ?types.DataType, rules: ?*const TensorTypeRules) bool {
     for (source_tensors) |t| {
+        const rule = if (rules) |r| r.find(t.name) else null;
+        const tgt = if (rule) |r| r.type else target_dtype orelse continue;
+        const target_rank = precisionRank(@tagName(tgt));
         const src_rank = precisionRank(t.type);
-        if (src_rank != 255 and target_rank > src_rank) return true;
+        if (target_rank != 255 and src_rank != 255 and target_rank > src_rank) return true;
     }
     return false;
 }
@@ -336,11 +342,7 @@ pub fn validateDatatypeForFiletype(datatype: ?types.DataType, filetype: types.Fi
 /// its old fallback rather than failing a filename.
 fn lowestTemplateType(opts: ConvertOptions, arena_alloc: std.mem.Allocator) ?types.DataType {
     const path = opts.template_path orelse return null;
-    const file = std.Io.Dir.cwd().openFile(opts.io, path, .{ .mode = .read_only }) catch return null;
-    defer file.close(opts.io);
-    var buf: [8192]u8 = undefined;
-    var reader = file.reader(opts.io, &buf);
-    const content = reader.interface.allocRemaining(arena_alloc, .unlimited) catch return null;
+    const content = readTemplate(opts.io, path, arena_alloc) catch return null;
     const parsed = std.json.parseFromSlice(std.json.Value, arena_alloc, content, .{}) catch return null;
     const tensors = switch (parsed.value.object.get("tensors") orelse return null) {
         .object => |o| o,
@@ -435,7 +437,7 @@ pub fn computeOutputPath(opts: ConvertOptions, hf_layout: bool, arena_alloc: std
     };
     const base_name = if (opts.output_name) |on| on else if (hf_layout) "model" else blk: {
         const stem = stripDtypeSuffix(std.fs.path.stem(opts.path));
-        const resolved = opts.datatype orelse lowestTemplateType(opts, arena_alloc);
+        const resolved = namingType(opts, arena_alloc);
         const dtype_str = switch (opts.filetype) {
             .gguf => @tagName(resolved orelse types.DataType.f16),
             .safetensors => @tagName(resolved orelse types.DataType.F16),
@@ -819,8 +821,16 @@ pub fn prepareConversion(
 
     // --- Assign quantization types (template or auto) -------------------------
     var template_metadata: ?std.json.ObjectMap = null;
-    if (opts.template_path) |tp| {
-        template_metadata = try applyTemplate(opts.io, tp, &model_tensors, opts.filetype, arena_alloc);
+    if (opts.tensor_type_rules) |rules| {
+        try assignWithRules(&model_tensors, arch, threshold, opts, rules, arena_alloc);
+    } else if (opts.template_path) |tp| {
+        const content = try readTemplate(opts.io, tp, arena_alloc);
+        if (TensorTypeRules.isRuleFile(content)) {
+            const rules = try parseTensorTypeRules(tp, content, opts.filetype, arena_alloc);
+            try assignWithRules(&model_tensors, arch, threshold, opts, rules, arena_alloc);
+        } else {
+            template_metadata = try applyTemplate(tp, content, &model_tensors, opts.filetype, arena_alloc);
+        }
     } else {
         try assignQuantTypes(&model_tensors, arch, threshold, opts, arena_alloc);
     }
@@ -870,12 +880,15 @@ pub fn prepareConversion(
 
 pub fn convert(
     f: anytype,
-    opts: ConvertOptions,
+    convert_opts: ConvertOptions,
     allocator: std.mem.Allocator,
     arena_alloc: std.mem.Allocator,
 ) !void {
+    var opts = convert_opts;
+    if (opts.tensor_type_rules == null) opts.tensor_type_rules = try loadTemplateRules(opts, arena_alloc);
+
     // --- Upscaling guard ------------------------------------------------------
-    if (!opts.allow_upscale and detectUpscaling(f.tensors.items, opts.datatype)) {
+    if (!opts.allow_upscale and detectUpscaling(f.tensors.items, opts.datatype, opts.tensor_type_rules)) {
         std.log.err(
             "Source contains lossy-quantized tensors; converting to a higher-precision " ++
                 "format will NOT recover lost information — the extra bits are fill-in only. " ++
@@ -1361,23 +1374,108 @@ fn filterAndStripTensors(
 // Step 2a — Apply a JSON template
 // ============================================================================
 
+/// Whether the template at `path` is a llama.cpp type file rather than a JSON template.
+pub fn isTensorTypeRuleFile(io: std.Io, path: []const u8, arena_alloc: std.mem.Allocator) !bool {
+    return TensorTypeRules.isRuleFile(try readTemplate(io, path, arena_alloc));
+}
+
+/// A template's text, without the UTF-8 byte order mark an editor may have added.
+fn readTemplate(io: std.Io, path: []const u8, arena_alloc: std.mem.Allocator) ![]const u8 {
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+    defer file.close(io);
+    var buf: [8192]u8 = undefined;
+    var reader = file.reader(io, &buf);
+    const content = try reader.interface.allocRemaining(arena_alloc, .unlimited);
+    const bom = "\xef\xbb\xbf";
+    return if (std.mem.startsWith(u8, content, bom)) content[bom.len..] else content;
+}
+
+/// The rules in the llama.cpp type file at `opts.template_path`, typed for
+/// `opts.filetype`. Null without a template or for a JSON one.
+pub fn loadTemplateRules(opts: ConvertOptions, arena_alloc: std.mem.Allocator) !?*TensorTypeRules {
+    const path = opts.template_path orelse return null;
+    const content = try readTemplate(opts.io, path, arena_alloc);
+    if (!TensorTypeRules.isRuleFile(content)) return null;
+    return try parseTensorTypeRules(path, content, opts.filetype, arena_alloc);
+}
+
+/// `datatype` lowered to the narrowest type the llama.cpp type file at `path`
+/// assigns, spelled for `filetype` or as written when that is null. Null when
+/// `path` holds no rules that parse, which the conversion itself reports.
+pub fn templateRuleFloor(io: std.Io, path: []const u8, filetype: ?types.FileType, datatype: ?types.DataType, arena_alloc: std.mem.Allocator) ?types.DataType {
+    const content = readTemplate(io, path, arena_alloc) catch return null;
+    if (!TensorTypeRules.isRuleFile(content)) return null;
+    var bad: []const u8 = "";
+    const rules = TensorTypeRules.parse(arena_alloc, content, filetype, &bad) catch return null;
+    return ruleFloorType(rules, datatype);
+}
+
+/// `datatype` lowered to the narrowest type `rules` assign, which names the
+/// output as `lowestTemplateType` does a JSON template's.
+fn ruleFloorType(rules: TensorTypeRules, datatype: ?types.DataType) ?types.DataType {
+    var floor = datatype;
+    for (rules.rules) |r| {
+        if (floor == null or bitsPerWeight(r.type) < bitsPerWeight(floor.?)) floor = r.type;
+    }
+    return floor;
+}
+
+/// The type an output is named after.
+fn namingType(opts: ConvertOptions, arena_alloc: std.mem.Allocator) ?types.DataType {
+    if (opts.tensor_type_rules) |rules| return ruleFloorType(rules.*, opts.datatype);
+    return opts.datatype orelse lowestTemplateType(opts, arena_alloc);
+}
+
+/// `assignQuantTypes` under `rules`, warning about any rule that set no tensor's type.
+fn assignWithRules(
+    model_tensors: *std.ArrayList(types.Tensor),
+    arch: *const imagearch.Arch,
+    threshold: u64,
+    opts: ConvertOptions,
+    rules: *TensorTypeRules,
+    arena_alloc: std.mem.Allocator,
+) !void {
+    var ropts = opts;
+    ropts.tensor_type_rules = rules;
+    for (rules.rules) |*r| r.hits = 0;
+    try assignQuantTypes(model_tensors, arch, threshold, ropts, arena_alloc);
+    for (rules.rules) |r| if (r.hits == 0) {
+        std.log.warn("type rule {s}={s} changed nothing: it matches no tensor that can take its type", .{ r.pattern, @tagName(r.type) });
+    };
+}
+
+/// Parses a llama.cpp type file's `content`, logging what is wrong with it against `path`.
+fn parseTensorTypeRules(path: []const u8, content: []const u8, filetype: types.FileType, arena_alloc: std.mem.Allocator) !*TensorTypeRules {
+    std.log.info("Using llama.cpp type rules from {s}", .{path});
+    var bad: []const u8 = "";
+    const rules = try arena_alloc.create(TensorTypeRules);
+    rules.* = TensorTypeRules.parse(arena_alloc, content, filetype, &bad) catch |e| {
+        switch (e) {
+            error.NoTensorTypeRules => std.log.err("{s} holds no type rules, and is not a JSON template", .{path}),
+            error.MalformedTensorTypeRule => std.log.err("{s}: \"{s}\" is not a pattern=type entry", .{ path, bad }),
+            error.InvalidTensorTypeRulePattern => std.log.err("{s}: the pattern in \"{s}\" is not a valid regular expression", .{ path, bad }),
+            error.UnsupportedTensorTypeRulePattern => std.log.err("{s}: the pattern in \"{s}\" uses lookaround, a backreference or another feature this tool's matcher lacks", .{ path, bad }),
+            error.TensorTypeRulePatternTooLarge => std.log.err("{s}: the pattern in \"{s}\" is too large to compile; use smaller repetition counts", .{ path, bad }),
+            error.UnknownTensorTypeRuleType => std.log.err("{s}: \"{s}\" names a type this tool cannot write", .{ path, bad }),
+            error.TensorTypeRuleTypeNotInFormat => std.log.err("{s}: the type in \"{s}\" cannot be stored in a {s} file", .{ path, bad, @tagName(filetype) }),
+            error.OutOfMemory => {},
+        }
+        return e;
+    };
+    return rules;
+}
+
 /// Filters `model_tensors` down to only the tensors listed in the template,
 /// applying the shapes and types specified there. Returns any template-level
 /// metadata found under the "metadata" key.
 fn applyTemplate(
-    io: std.Io,
     template_path: []const u8,
+    t_content: []const u8,
     model_tensors: *std.ArrayList(types.Tensor),
     output_filetype: types.FileType,
     arena_alloc: std.mem.Allocator,
 ) !?std.json.ObjectMap {
     std.log.info("Using template {s}", .{template_path});
-
-    const t_file = try std.Io.Dir.cwd().openFile(io, template_path, .{ .mode = .read_only });
-    defer t_file.close(io);
-    var t_reader_buf: [8192]u8 = undefined;
-    var t_reader = t_file.reader(io, &t_reader_buf);
-    const t_content = try t_reader.interface.allocRemaining(arena_alloc, .unlimited);
     const t_json = try std.json.parseFromSlice(std.json.Value, arena_alloc, t_content, .{});
 
     var template_metadata: ?std.json.ObjectMap = null;
@@ -1673,62 +1771,54 @@ fn assignTensorType(
         return nearestCompatibleType(t, opts, num_elements, arch, .family);
     }
 
+    // A type rule overrides the preferences below, as llama-quantize's does,
+    // but none of the loadability rules.
+    const rule: ?*TensorTypeRules.Rule = if (opts.tensor_type_rules) |rules| rules.find(t.name) else null;
+    const rule_type: ?types.DataType = if (rule) |r| r.type else null;
+
     // Too small to quantize - use nearest compatible type
-    if (num_elements < threshold) return nearestCompatibleType(t, opts, num_elements, arch, .family);
+    if (rule_type == null and num_elements < threshold) return nearestCompatibleType(t, opts, num_elements, arch, .family);
 
-    // High-precision tensors (e.g. norms, gates) - use nearest compatible type.
-    // The llama.cpp families protect only the MoE router here, which ggml
-    // multiplies against an f32 residual like a norm vector. Image arches
-    // protect whole 2-D weights, so an f32 floor there would double the bytes
-    // of a transformer block for nothing.
-    if (arch.isHighPrecision(t.name)) {
-        return if (arch.row_aligned_blocks)
-            nearestCompatibleType(t, opts, num_elements, arch, .f32)
-        else
-            nearestCompatibleType(t, opts, num_elements, arch, .family);
-    }
+    // ggml multiplies the MoE router against an f32 residual like a norm vector.
+    if (arch.row_aligned_blocks and arch.isHighPrecision(t.name)) return nearestCompatibleType(t, opts, num_elements, arch, .f32);
 
-    // Whole-name protected tables (token_embd, output, lm_head, MoE router)
-    if (arch.isHighPrecisionNamed(t.name)) return nearestCompatibleType(t, opts, num_elements, arch, .family);
+    var ttype: types.DataType = rule_type orelse blk: {
+        // Image arches protect whole 2-D weights, where an f32 floor would
+        // double the bytes of a transformer block for nothing.
+        if (arch.isHighPrecision(t.name)) return nearestCompatibleType(t, opts, num_elements, arch, .family);
 
-    // Same, for layers that only need protecting in a narrow-row form (see NarrowRule).
-    if (arch.isNarrowHighPrecision(t.name, t.dims)) return nearestCompatibleType(t, opts, num_elements, arch, .family);
+        // Whole-name protected tables (token_embd, output, lm_head, MoE router)
+        if (arch.isHighPrecisionNamed(t.name)) return nearestCompatibleType(t, opts, num_elements, arch, .family);
 
-    // Apply the target datatype, lifted to any precision floor this architecture
-    // declares for the tensor. The floor sits ahead of every format branch, so it
-    // holds for GGUF and SafeTensors alike and neither `-a` nor `-x` can undo it.
-    var ttype = opts.datatype orelse {
-        // No target keeps the source type, which for a block-quantized GGUF
-        // tensor has no SafeTensors spelling.
-        if (opts.filetype == .safetensors) nearestCompatibleType(t, opts, num_elements, arch, .family);
-        return;
-    };
-    if (arch.precisionFloor(t.name)) |min| {
-        const lifted = liftToFloor(ttype, min) orelse
+        // Same, for layers that only need protecting in a narrow-row form (see NarrowRule).
+        if (arch.isNarrowHighPrecision(t.name, t.dims)) return nearestCompatibleType(t, opts, num_elements, arch, .family);
+
+        // The target datatype, lifted to any precision floor this architecture
+        // declares for the tensor. The floor sits ahead of every format branch, so
+        // it holds for GGUF and SafeTensors alike and neither `-a` nor `-x` can undo it.
+        const dt = opts.datatype orelse {
+            // No target keeps the source type, which for a block-quantized GGUF
+            // tensor has no SafeTensors spelling.
+            if (opts.filetype == .safetensors) nearestCompatibleType(t, opts, num_elements, arch, .family);
+            return;
+        };
+        const min = arch.precisionFloor(t.name) orelse break :blk dt;
+        const lifted = liftToFloor(dt, min) orelse
             return nearestCompatibleType(t, opts, num_elements, arch, .family);
-        if (lifted != ttype) {
-            std.log.info("Precision floor: {s} {s} -> {s}", .{ t.name, @tagName(ttype), @tagName(lifted) });
-            ttype = lifted;
-        }
-    }
+        if (lifted != dt) std.log.info("Precision floor: {s} {s} -> {s}", .{ t.name, @tagName(dt), @tagName(lifted) });
+        break :blk lifted;
+    };
     if (opts.filetype == .gguf) {
         const ggml_type = gguf.GgmlType.fromString(@tagName(ttype)) catch unreachable;
         const bs = ggml_type.getBlockSize();
 
-        if (bs > 1 and num_elements % bs != 0) {
-            std.log.warn("Cannot convert tensor {s} to type {s} because {} is not a multiple of blocksize {}", .{ t.name, @tagName(ggml_type), num_elements, bs });
-            return;
-        }
-
-        // Flat blocking (above) scrambles a row-aligned consumer unless the rows
-        // themselves divide the block size. Drop to a narrower block before
-        // giving up on quantizing at all: n_embd 896 is a q4_k row misalignment
-        // on a stock Qwen2.5-0.5B, and sparing every 2-D weight there would
-        // write an f16 file against a q4_k request.
-        if (bs > 1 and arch.row_aligned_blocks and t.dims[t.dims.len - 1] % bs != 0) {
-            const narrower = rowAlignedFallback(ttype, num_elements, t.dims[t.dims.len - 1]) orelse
+        // Narrow the block before sparing the tensor: otherwise a q4_k request on
+        // an 896-wide model writes every 2-D weight as f16.
+        const row = blockRow(t, num_elements, arch);
+        if (bs > 1 and row % bs != 0) {
+            const narrower = blockFallback(ttype, row) orelse
                 return nearestCompatibleType(t, opts, num_elements, arch, .family);
-            std.log.info("Row blocking: {s} {s} -> {s}", .{ t.name, @tagName(ttype), @tagName(narrower) });
+            std.log.info("Block fallback: {s} {s} -> {s}", .{ t.name, @tagName(ttype), @tagName(narrower) });
             ttype = narrower;
         }
     }
@@ -1738,6 +1828,7 @@ fn assignTensorType(
     // is owned by TensorClusters.clusterWriteLayout, shared with the header/data writers.
     if (opts.filetype == .safetensors and TensorClusters.isClusterType(ttype)) {
         if (clusterEligible(t, ttype, num_elements, arch)) {
+            if (rule) |r| r.hits += 1;
             t.type = @tagName(ttype);
             t.size = (try TensorClusters.clusterWriteSize(arena_alloc, ttype, t.dims)).?;
             return;
@@ -1745,18 +1836,17 @@ fn assignTensorType(
         return nearestCompatibleType(t, opts, num_elements, arch, .family);
     }
 
-    if (use_sensitivity) {
+    if (use_sensitivity and rule_type == null) {
         const source_type = t.type;
         const source_size = t.size;
         try applySensitivityQuantization(t, num_elements, ttype, opts.quantization_aggressiveness, resolvedFamilies(opts), sensitivities.?);
         // The ladder runs across quant families, so it can hand back a larger
         // block size than the target was checked against above (q4_0's 32 up to
-        // q4_k's 256): re-run both blocking checks on the type actually picked.
+        // q4_k's 256): re-run the blocking check on the type actually picked.
         if (opts.filetype == .gguf) {
             const bs = (gguf.GgmlType.fromString(t.type) catch unreachable).getBlockSize();
-            if (bs > 1 and (num_elements % bs != 0 or
-                (arch.row_aligned_blocks and t.dims[t.dims.len - 1] % bs != 0)))
-            {
+            const row = blockRow(t, num_elements, arch);
+            if (bs > 1 and row % bs != 0) {
                 const picked = types.DataType.fromString(t.type) catch unreachable;
                 // Put the tensor back as it arrived: the fallback reads t.type as
                 // the source precision, and leaves both fields alone for a source
@@ -1764,18 +1854,20 @@ fn assignTensorType(
                 // into the output layout.
                 t.type = source_type;
                 t.size = source_size;
-                if (num_elements % bs == 0) {
-                    if (rowAlignedFallback(picked, num_elements, t.dims[t.dims.len - 1])) |narrower| {
-                        std.log.info("Row blocking: {s} {s} -> {s}", .{ t.name, @tagName(picked), @tagName(narrower) });
-                        t.type = @tagName(narrower);
-                        t.size = narrower.calcSizeInBytes(num_elements);
-                        return;
-                    }
+                if (blockFallback(picked, row)) |narrower| {
+                    std.log.info("Block fallback: {s} {s} -> {s}", .{ t.name, @tagName(picked), @tagName(narrower) });
+                    t.type = @tagName(narrower);
+                    t.size = narrower.calcSizeInBytes(num_elements);
+                    return;
                 }
                 return nearestCompatibleType(t, opts, num_elements, arch, .family);
             }
         }
     } else {
+        if (rule) |r| {
+            r.hits += 1;
+            std.log.info("Type rule {s}: {s} -> {s}", .{ r.pattern, t.name, @tagName(ttype) });
+        }
         std.log.debug("Will convert tensor {s} from type {s} to {s}", .{ t.name, t.type, @tagName(ttype) });
         t.type = @tagName(ttype);
         t.size = ttype.calcSizeInBytes(num_elements);
@@ -1810,21 +1902,28 @@ fn clusterEligible(t: *const types.Tensor, ttype: types.DataType, num_elements: 
     };
 }
 
-/// The type to quantize to when `ttype`'s 256-element blocks do not divide a
-/// row, following llama.cpp's convert_incompatible_tensor ladder down to a
-/// 32-element block type. Null when nothing narrower fits, which sends the
-/// tensor to nearestCompatibleType instead.
-fn rowAlignedFallback(ttype: types.DataType, num_elements: u64, row: u64) ?types.DataType {
+/// The dim a GGUF reader blocks `t` along: its last, or 256 when `applyShapeFix`
+/// will reshape it. Readers need whole blocks per row, not just per tensor.
+fn blockRow(t: *const types.Tensor, num_elements: u64, arch: *const imagearch.Arch) u64 {
+    if (t.dims.len == 0) return num_elements;
+    if (arch.shape_fix and shapeFixable(t.dims, num_elements)) return 256;
+    return t.dims[t.dims.len - 1];
+}
+
+/// The type to quantize to when `ttype`'s blocks do not divide `row`, following
+/// llama.cpp's tensor_type_fallback. Null when nothing narrower fits, which
+/// sends the tensor to nearestCompatibleType.
+fn blockFallback(ttype: types.DataType, row: u64) ?types.DataType {
     const narrower: types.DataType = switch (ttype) {
         .q4_k => .q5_0,
         .q5_k => .q5_1,
         .q6_k => .q8_0,
-        // llama.cpp sends these to iq4_nl, which ggufy has no encoder for.
         .q2_k, .q3_k => .q4_0,
+        .iq1_s, .iq1_m, .iq2_xxs, .iq2_xs, .iq2_s, .iq3_xxs, .iq3_s, .iq4_xs => .iq4_nl,
         else => return null,
     };
     const bs = (gguf.GgmlType.fromString(@tagName(narrower)) catch unreachable).getBlockSize();
-    if (num_elements % bs != 0 or row % bs != 0) return null;
+    if (row % bs != 0) return null;
     return narrower;
 }
 
@@ -1976,6 +2075,11 @@ fn restoreOrigShapes(
     }
 }
 
+/// Whether `applyShapeFix` can reshape a tensor to 256-wide rows.
+fn shapeFixable(dims: []const usize, n_elements: u64) bool {
+    return dims.len > 1 and n_elements >= REARRANGE_THRESHOLD and n_elements % 256 == 0;
+}
+
 /// Reshapes qualifying tensors to (N/256, 256) for ComfyUI compatibility and
 /// records their original shapes under "comfy.gguf.orig_shape.<name>" in
 /// `extra_metadata`.
@@ -1991,14 +2095,7 @@ fn applyShapeFix(
         const n_dims = t.dims.len;
         const last_dim = if (n_dims > 0) t.dims[n_dims - 1] else 0;
 
-        // Criteria:
-        //   1. More than one dimension
-        //   2. Total elements >= 512
-        //   3. Total elements divisible by 256
-        //   4. Last dimension NOT divisible by 256
-        if (n_dims <= 1) continue;
-        if (n_elements < REARRANGE_THRESHOLD) continue;
-        if (n_elements % 256 != 0) continue;
+        if (!shapeFixable(t.dims, n_elements)) continue;
         if (@mod(last_dim, 256) == 0) continue;
 
         // Record original shape.
@@ -3173,11 +3270,7 @@ pub fn templateTypeSuffix(
     filetype: types.FileType,
     arena_alloc: std.mem.Allocator,
 ) ![]const u8 {
-    const t_file = try std.Io.Dir.cwd().openFile(io, template_path, .{ .mode = .read_only });
-    defer t_file.close(io);
-    var t_reader_buf: [8192]u8 = undefined;
-    var t_reader = t_file.reader(io, &t_reader_buf);
-    const content = try t_reader.interface.allocRemaining(arena_alloc, .unlimited);
+    const content = try readTemplate(io, template_path, arena_alloc);
     const parsed = try std.json.parseFromSlice(std.json.Value, arena_alloc, content, .{});
 
     const tensors_val = parsed.value.object.get("tensors") orelse return error.InvalidTemplate;
@@ -3400,11 +3493,12 @@ test "assignTensorType: minimax_h3 pruned adaln_proj is kept float, full-width i
     try assignTensorType(&t, 96768 * 8, &imagearch.minimax_h3, QUANTIZATION_THRESHOLD, opts, false, null, std.testing.allocator);
     try testing.expectEqualStrings("F16", t.type);
 
-    // The unpruned form is 40% of the model's parameters and must still quantize.
+    // The unpruned form is 40% of the model's parameters and must still quantize,
+    // in 32-wide blocks: its 2688-wide rows hold no whole q4_k block.
     var full = [_]usize{ 96768, 2688 };
     var t2 = types.Tensor{ .name = "blocks.0.adaln_proj.linear.weight", .type = "BF16", .dims = &full, .size = 0, .offset = 0 };
     try assignTensorType(&t2, 96768 * 2688, &imagearch.minimax_h3, QUANTIZATION_THRESHOLD, opts, false, null, std.testing.allocator);
-    try testing.expectEqualStrings("q4_k", t2.type);
+    try testing.expectEqualStrings("q5_0", t2.type);
 }
 
 test "assignTensorType: minimax_h3 backbone linears quantize, conditioning path does not" {
@@ -4009,10 +4103,10 @@ test "assignTensorType: row_aligned_blocks narrows tensors whose rows break the 
     try assignTensorType(&aligned, 4096 * 1024, &llmish, QUANTIZATION_THRESHOLD, testOpts(.q4_k), false, null, a);
     try testing.expectEqualStrings("q4_k", aligned.type);
 
-    // Without the field, flat blocking still stands: same shape, same target.
+    // No field and no reshape: readers still block by rows.
     var legacy = types.Tensor{ .name = "model.layers.0.mlp.up_proj.weight", .type = "BF16", .dims = @constCast(dims_bad[0..]), .size = 0, .offset = 0 };
     try assignTensorType(&legacy, n, &imagearch.generic_arch, QUANTIZATION_THRESHOLD, testOpts(.q4_k), false, null, a);
-    try testing.expectEqualStrings("q4_k", legacy.type);
+    try testing.expectEqualStrings("q5_0", legacy.type);
 }
 
 test "assignTensorType: sensitivity promotion into a wider block gets narrowed back" {
@@ -4096,6 +4190,223 @@ test "assignTensorType: llama floors the head and token table, protects the rout
         try assignTensorType(&t, c.rows * c.cols, &imagearch.qwen35moe, QUANTIZATION_THRESHOLD, testOpts(c.target), false, null, a);
         try testing.expectEqualStrings(c.want, t.type);
     }
+}
+
+test "assignTensorType: a type rule beats -d, sensitivities and floors, but not what must stay float" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var bad: []const u8 = "";
+    var rules = try TensorTypeRules.parse(a,
+        \\blk\.0\.=q8_0 ffn_down=q6_k token_embd=q4_k ffn_gate_inp=q4_k
+        \\attn_k=q4_0
+    , .gguf, &bad);
+    // Scores high enough to route either tensor to bf16 at -a 50.
+    const sens = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"blk.1.ffn_down.weight": 99, "blk.1.attn_q.weight": 99}
+    , .{});
+    var opts = testOpts(.q4_k);
+    opts.skip_sensitivity = false;
+    opts.quantization_aggressiveness = 50;
+    opts.tensor_type_rules = &rules;
+
+    const Case = struct { name: []const u8, dims: []const usize, want: []const u8 };
+    const cases = [_]Case{
+        .{ .name = "blk.0.attn_q.weight", .dims = &.{ 4096, 2048 }, .want = "q8_0" },
+        // The rule wins over a score that would have routed it to bf16.
+        .{ .name = "blk.1.ffn_down.weight", .dims = &.{ 2048, 5120 }, .want = "q6_k" },
+        // Unmatched: sensitivity routing still applies.
+        .{ .name = "blk.1.attn_q.weight", .dims = &.{ 4096, 2048 }, .want = "bf16" },
+        // Unmatched and unscored: -d.
+        .{ .name = "blk.1.attn_v.weight", .dims = &.{ 512, 2048 }, .want = "q4_k" },
+        // Below the token table's six-bit floor, as asked.
+        .{ .name = "token_embd.weight", .dims = &.{ 151936, 2048 }, .want = "q4_k" },
+        // Smaller than the quantization threshold, quantized because a rule says so.
+        .{ .name = "blk.1.attn_k.weight", .dims = &.{ 16, 256 }, .want = "q4_0" },
+        // Must stay f32 for ggml whatever the rules say.
+        .{ .name = "blk.0.attn_norm.weight", .dims = &.{2048}, .want = "f32" },
+        .{ .name = "blk.0.ffn_gate_inp.weight", .dims = &.{ 256, 2048 }, .want = "f32" },
+        .{ .name = "blk.1.ffn_gate_inp.weight", .dims = &.{ 256, 2048 }, .want = "f32" },
+    };
+    for (cases) |c| {
+        var n: u64 = 1;
+        for (c.dims) |d| n *= d;
+        var t = types.Tensor{ .name = c.name, .type = "BF16", .dims = @constCast(c.dims), .size = 0, .offset = 0 };
+        try assignTensorType(&t, n, &imagearch.qwen35moe, QUANTIZATION_THRESHOLD, opts, true, &sens, a);
+        testing.expectEqualStrings(c.want, t.type) catch |e| {
+            std.debug.print("{s}\n", .{c.name});
+            return e;
+        };
+        try testing.expectEqual(types.DataType.calcSizeInBytes(try types.DataType.fromString(c.want), n), t.size);
+    }
+    // The router rule set nothing, so it must not count as used.
+    try testing.expectEqual(@as(usize, 0), rules.rules[3].hits);
+    try testing.expectEqual(@as(usize, 1), rules.rules[1].hits);
+}
+
+test "assignTensorType: a block type that does not fit falls back as llama.cpp's tensor_type_fallback does" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var bad: []const u8 = "";
+    var rules = try TensorTypeRules.parse(a, "attn_k=q4_k attn_v=iq4_xs attn_q=q2_k proj=q4_k", .gguf, &bad);
+    var opts = testOpts(.q4_k);
+    opts.tensor_type_rules = &rules;
+
+    const Case = struct { name: []const u8, dims: []const usize, arch: *const imagearch.Arch, want: []const u8 };
+    const cases = [_]Case{
+        // Below the threshold and through a rule: the row takes 32-wide blocks.
+        .{ .name = "blk.0.attn_k.weight", .dims = &.{ 16, 96 }, .arch = &imagearch.qwen35moe, .want = "q5_0" },
+        .{ .name = "blk.0.attn_v.weight", .dims = &.{ 16, 96 }, .arch = &imagearch.qwen35moe, .want = "iq4_nl" },
+        .{ .name = "blk.0.attn_q.weight", .dims = &.{ 16, 96 }, .arch = &imagearch.qwen35moe, .want = "q4_0" },
+        // Nothing fits a 100-wide row, so the tensor stays a float.
+        .{ .name = "blk.0.attn_k.weight", .dims = &.{ 16, 100 }, .arch = &imagearch.qwen35moe, .want = "f16" },
+        // A shape-fixed arch blocks along 256-wide rows when the reshape applies.
+        .{ .name = "blocks.0.linear.weight", .dims = &.{ 256, 400 }, .arch = &imagearch.flux, .want = "q4_k" },
+        // Without the reshape the last dim must hold whole blocks: 100000 elements
+        // are whole 32-blocks, a 400-wide row is not.
+        .{ .name = "blocks.0.linear.weight", .dims = &.{ 250, 400 }, .arch = &imagearch.flux, .want = "f32" },
+        .{ .name = "blocks.0.linear.weight", .dims = &.{ 250, 416 }, .arch = &imagearch.flux, .want = "q5_0" },
+        .{ .name = "blocks.0.linear.weight", .dims = &.{ 256, 400 }, .arch = &imagearch.generic_arch, .want = "f32" },
+        .{ .name = "blocks.0.linear.weight", .dims = &.{ 256, 416 }, .arch = &imagearch.generic_arch, .want = "q5_0" },
+        // Too small for the reshape, through a rule.
+        .{ .name = "blocks.0.proj.weight", .dims = &.{ 16, 16 }, .arch = &imagearch.flux, .want = "f32" },
+    };
+    for (cases) |c| {
+        var n: u64 = 1;
+        for (c.dims) |d| n *= d;
+        var t = types.Tensor{ .name = c.name, .type = "BF16", .dims = @constCast(c.dims), .size = 0, .offset = 0 };
+        try assignTensorType(&t, n, c.arch, QUANTIZATION_THRESHOLD, opts, false, null, a);
+        testing.expectEqualStrings(c.want, t.type) catch |e| {
+            std.debug.print("{s} {any}\n", .{ c.name, c.dims });
+            return e;
+        };
+        try testing.expectEqual(types.DataType.calcSizeInBytes(try types.DataType.fromString(c.want), n), t.size);
+    }
+}
+
+test "assignTensorType: a router under the quantization threshold keeps the family float without rules" {
+    const dims = [_]usize{ 8, 64 };
+    var t = types.Tensor{ .name = "blk.0.ffn_gate_inp.weight", .type = "BF16", .dims = @constCast(&dims), .size = 0, .offset = 0 };
+    try assignTensorType(&t, 8 * 64, &imagearch.qwen35moe, QUANTIZATION_THRESHOLD, testOpts(.q4_k), false, null, testing.allocator);
+    try testing.expectEqualStrings("f16", t.type);
+}
+
+test "assignTensorType: a type routed past what its row holds falls back like the target" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // q4_0 fits a 416-wide row; the q5_k this score routes to does not, and the
+    // reshape cannot help 104000 elements, so it falls back to q5_1.
+    const sens = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"blocks.0.linear.weight": 70}
+    , .{});
+    var opts = testOpts(.q4_0);
+    opts.skip_sensitivity = false;
+    opts.quantization_aggressiveness = 50;
+    opts.allowed_quant_families = .{ .allow_0 = true, .allow_k = true };
+
+    const dims = [_]usize{ 250, 416 };
+    var t = types.Tensor{ .name = "blocks.0.linear.weight", .type = "BF16", .dims = @constCast(&dims), .size = 0, .offset = 0 };
+    try assignTensorType(&t, 250 * 416, &imagearch.flux, QUANTIZATION_THRESHOLD, opts, true, &sens, a);
+    try testing.expectEqualStrings("q5_1", t.type);
+    try testing.expectEqual(types.DataType.q5_1.calcSizeInBytes(250 * 416), t.size);
+}
+
+test "detectUpscaling: a rule raises only the tensors it matches" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src = [_]types.Tensor{
+        .{ .name = "blk.0.ffn_up.weight", .type = "q4_k", .dims = &.{}, .size = 0, .offset = 0 },
+        .{ .name = "output.weight", .type = "f16", .dims = &.{}, .size = 0, .offset = 0 },
+    };
+    var bad: []const u8 = "";
+    const out = try TensorTypeRules.parse(a, "output=q8_0 attn=f32", .gguf, &bad);
+    const up = try TensorTypeRules.parse(a, "ffn_up=q8_0", .gguf, &bad);
+    try testing.expect(!detectUpscaling(&src, .q4_k, &out));
+    try testing.expect(detectUpscaling(&src, .q4_k, &up));
+    try testing.expect(detectUpscaling(&src, .q8_0, null));
+    try testing.expect(!detectUpscaling(&src, null, null));
+}
+
+test "a type file names, plans and guards the output by the types its rules assign" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const ts_ns: i96 = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    const token: u64 = @as(u64, @bitCast(@as(i64, @truncate(ts_ns)))) ^ @as(u64, @intFromPtr(&arena));
+    const dir = try std.fmt.allocPrint(a, "/tmp/ggufy_rules_test_{x}", .{token});
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const path = try std.fmt.allocPrint(a, "{s}/rules.txt", .{dir});
+    {
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+        defer file.close(io);
+        var buf: [256]u8 = undefined;
+        var fw = file.writer(io, &buf);
+        // An editor's byte order mark must not become part of the first pattern.
+        try fw.interface.writeAll("\xef\xbb\xbfffn_.*=q2_K\nattn=f32\n");
+        try fw.interface.flush();
+    }
+
+    try testing.expect(try isTensorTypeRuleFile(io, path, a));
+    try testing.expectEqual(types.DataType.q2_k, templateRuleFloor(io, path, .gguf, .q4_k, a).?);
+
+    var opts = testOpts(.q4_k);
+    opts.io = io;
+    opts.path = "/models/x-BF16.safetensors";
+    opts.template_path = path;
+    opts.tensor_type_rules = (try loadTemplateRules(opts, a)).?;
+    try testing.expectEqualStrings("ffn_.*", opts.tensor_type_rules.?.rules[0].pattern);
+    try testing.expectEqualStrings("/models/x-q2_k.gguf", try computeOutputPath(opts, false, a));
+
+    const fp8 = [_]types.Tensor{.{ .name = "blk.0.attn_q.weight", .type = "F8_E4M3", .dims = &.{}, .size = 0, .offset = 0 }};
+    try testing.expect(!detectUpscaling(&fp8, .q4_k, null));
+    try testing.expect(detectUpscaling(&fp8, .q4_k, opts.tensor_type_rules));
+
+    // A SafeTensors output is named in that container's spelling.
+    const st_path = try std.fmt.allocPrint(a, "{s}/st.txt", .{dir});
+    {
+        const file = try std.Io.Dir.cwd().createFile(io, st_path, .{ .truncate = true });
+        defer file.close(io);
+        var buf: [64]u8 = undefined;
+        var fw = file.writer(io, &buf);
+        try fw.interface.writeAll("attn=bf16\n");
+        try fw.interface.flush();
+    }
+    var st_opts = testOpts(.F16);
+    st_opts.datatype = null;
+    st_opts.io = io;
+    st_opts.path = "/models/x-F32.safetensors";
+    st_opts.filetype = .safetensors;
+    st_opts.template_path = st_path;
+    st_opts.tensor_type_rules = (try loadTemplateRules(st_opts, a)).?;
+    try testing.expectEqualStrings("/models/x-BF16.safetensors", try computeOutputPath(st_opts, false, a));
+
+    // -d picks the container, so a rule type only the other one holds cannot move it.
+    const mixed_path = try std.fmt.allocPrint(a, "{s}/mixed.txt", .{dir});
+    {
+        const file = try std.Io.Dir.cwd().createFile(io, mixed_path, .{ .truncate = true });
+        defer file.close(io);
+        var buf: [64]u8 = undefined;
+        var fw = file.writer(io, &buf);
+        try fw.interface.writeAll("img_attn=int8_convrot\n");
+        try fw.interface.flush();
+    }
+    var why: []const u8 = "";
+    var planned = targetTestOpts(io, "/models/x.safetensors", "/nonexistent", .comfyui, .q8_0);
+    planned.template_path = mixed_path;
+    const flux: TargetModel = .{ .kind = .diffusion, .arch_name = "flux" };
+    try testing.expectEqual(types.FileType.gguf, (try planTargetFor(flux, planned, false, a, &why)).filetype);
+    // Without -d the rule's type picks it.
+    planned.datatype = null;
+    try testing.expectEqual(types.FileType.safetensors, (try planTargetFor(flux, planned, false, a, &why)).filetype);
 }
 
 test "assignTensorType: a spared block-quantized tensor is floored to a float for safetensors" {

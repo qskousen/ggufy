@@ -195,6 +195,28 @@ pub fn build(b: *std.Build) void {
     ggml.link(b, arch_detect_test, target, optimize);
     test_step.dependOn(&b.addRunArtifact(arch_detect_test).step);
 
+    const regex_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/Regex.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(regex_test).step);
+
+    const tensor_type_rules_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/TensorTypeRules.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ggml.h", .module = ggml_h_module },
+            },
+        }),
+    });
+    ggml.link(b, tensor_type_rules_test, target, optimize);
+    test_step.dependOn(&b.addRunArtifact(tensor_type_rules_test).step);
+
     const data_transform_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/DataTransform.zig"),
