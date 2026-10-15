@@ -135,6 +135,8 @@ pub const State = struct {
     // Upscale confirmation
     upscale_pending: bool = false,
     allow_upscale: bool = false,
+    /// ComfyUI's attention preference; only a safetensors output carries one.
+    attention: ggufy.convert.AttentionMode = .keep,
 
     // Confirmation for an output the Use with target cannot load
     incompatible_pending: bool = false,
@@ -195,6 +197,7 @@ pub const State = struct {
         std.hash.autoHash(&h, self.model_only);
         std.hash.autoHash(&h, self.allow_unknown_arch);
         std.hash.autoHash(&h, self.allow_upscale);
+        std.hash.autoHash(&h, self.attention);
         // -H changes which tensors are written and under what names; an
         // imatrix decides whether an iq type can be encoded at all.
         std.hash.autoHash(&h, self.hf_names);

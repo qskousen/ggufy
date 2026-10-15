@@ -180,6 +180,7 @@ pub fn main(init: std.process.Init) !void {
             state.pretok_unknown = false;
             state.allow_upscale = false;
             state.upscale_pending = false;
+            state.attention = .keep;
             state.allow_incompatible = false;
             state.incompatible_pending = false;
             state.arch_override_buf = std.mem.zeroes([64]u8);
@@ -664,6 +665,28 @@ fn showInputFile() void {
                         _ = dvui.checkbox(@src(), &dummy_model_only, "Model only", .{ .gravity_y = 0.5, .color_text = dim_color, .data_out = &cwd });
                         dvui.tooltip(@src(), .{ .active_rect = cwd.borderRectScale().r },
                             "Only applies when outputting to safetensors.", .{}, .{});
+                    }
+                }
+
+                // ComfyUI attention preference - safetensors only
+                {
+                    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .all(2) });
+                    defer row.deinit();
+                    var lwd: dvui.WidgetData = undefined;
+                    dvui.label(@src(), "Attention", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 120 }, .color_text = if (is_safetensors_out) null else dim_color, .data_out = &lwd });
+                    dvui.tooltip(@src(), .{ .active_rect = lwd.borderRectScale().r }, "{s}", .{if (is_safetensors_out)
+                        "ComfyUI's per-block attention preference. Keep: whatever the source carries. Int8: comfy-kitchen int8 attention, as ComfyUI's own int8 bakes do; faster where the GPU has the kernel, slightly lower fidelity. Default: none. Independent of the data type: the A in W8A8 or W4A8 covers linear layers, not attention."
+                    else
+                        "A GGUF cannot carry an attention preference; ComfyUI's Model Attention Backend node sets one at load time."}, .{});
+                    const attention_names = [_][]const u8{ "Keep source's", "Int8 (comfy-kitchen)", "Default (none)" };
+                    var idx: usize = @intFromEnum(state.attention);
+                    if (is_safetensors_out) {
+                        if (dvui.dropdown(@src(), &attention_names, .{ .choice = &idx }, .{}, .{ .expand = .horizontal, .gravity_y = 0.5 })) {
+                            state.attention = @enumFromInt(idx);
+                        }
+                    } else {
+                        var dummy = idx;
+                        _ = dvui.dropdown(@src(), &attention_names, .{ .choice = &dummy }, .{}, .{ .expand = .horizontal, .gravity_y = 0.5, .color_text = dim_color });
                     }
                 }
 

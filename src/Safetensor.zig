@@ -986,6 +986,13 @@ pub fn saveWithSTData(self: Safetensors, source: anytype, threads: usize, callba
         var elements: usize = 1;
         for (t.dims) |d| elements *= d;
 
+        if (t.inline_data) |data| {
+            try writer.interface.writeAll(data);
+            callbacks.reportProgress(count, total_tensors, t.name, t.type, t.type, @intCast(elements));
+            count += 1;
+            continue;
+        }
+
         var matched = false;
 
         // Any cluster on either side must round-trip through F32. `dequantSourceToF32` is the single

@@ -151,6 +151,17 @@ test "mageflow names alone are indistinguishable from qwen-image" {
     try std.testing.expectEqualStrings("qwen_image", imagearch.detectArch(names).?.name);
 }
 
+// Dumped from the step-distilled bf16 single file, which the BFL and ComfyUI
+// releases share key for key.
+test "flux3 image klein" {
+    try expectArchWithShapes(@embedFile("test_fixtures/flux3_klein.json"), "flux3");
+}
+
+// ComfyUI's int8 bake fuses q/k/v into qkv and adds comfy_quant and attention configs.
+test "flux3 image klein with fused qkv" {
+    try expectArch(@embedFile("test_fixtures/flux3_klein_int8_convrot.json"), "flux3");
+}
+
 // Dumped from the bf16 single-file release, which ships the MLP fused.
 test "qwen image 2.1" {
     try expectArchWithShapes(@embedFile("test_fixtures/qwen21.json"), "qwen_image21");
@@ -214,4 +225,81 @@ test "qwen3moe HF and GGUF-native" {
 // A Qwen3VLModel text encoder: the towers at the top level, not under model.
 test "qwen3vl 4B HF" {
     try expectArch(@embedFile("test_fixtures/qwen3vl.hf.json"), "qwen3vl");
+}
+
+// ── Attention modules ─────────────────────────────────────────────────────────
+
+/// The attention config names ggufy derives from a checkpoint's tensor names are
+/// exactly the modules ComfyUI instantiates a ComfyAttention for in that
+/// checkpoint (gen_attention_fixtures.py), and the skipped ones are a subset.
+fn expectAttentionModules(fixture_json: []const u8, arch: *const imagearch.Arch) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Fixture = struct { source: []const u8, prefix: []const u8, tensors: []const []const u8, modules: []const []const u8 };
+    const fx = try std.json.parseFromSliceLeaky(Fixture, a, fixture_json, .{});
+
+    const got = try arch.attentionConfigNames(fx.tensors, true, a);
+    var want: std.ArrayList([]const u8) = .empty;
+    for (fx.modules) |m| try want.append(a, try std.mem.concat(a, u8, &.{ fx.prefix, m, ".comfy_attention.config" }));
+    const lt = struct {
+        fn f(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.f;
+    const got_sorted = try a.dupe([]const u8, got);
+    std.sort.block([]const u8, got_sorted, {}, lt);
+    std.sort.block([]const u8, want.items, {}, lt);
+    if (got_sorted.len != want.items.len) {
+        std.debug.print("{s}: {d} modules found, ComfyUI has {d}\n", .{ fx.source, got_sorted.len, want.items.len });
+        return error.TestExpectedEqual;
+    }
+    for (got_sorted, want.items) |g, w| try std.testing.expectEqualStrings(w, g);
+
+    const kept = try arch.attentionConfigNames(fx.tensors, false, a);
+    try std.testing.expect(kept.len > 0);
+    try std.testing.expect(kept.len == got.len or arch.attention_skip.len > 0);
+    for (arch.attention_skip) |skip| {
+        var listed = false;
+        for (arch.attention_modules) |m| listed = listed or std.mem.eql(u8, m, skip);
+        try std.testing.expect(listed);
+    }
+}
+
+test "attention modules match ComfyUI's for every family" {
+    const cases = .{
+        .{ "flux3", &imagearch.flux3 },          .{ "flux", &imagearch.flux },
+        .{ "sd1", &imagearch.sd1 },              .{ "sdxl", &imagearch.sdxl },
+        .{ "anima", &imagearch.anima },          .{ "cosmos", &imagearch.cosmos },
+        .{ "ernie", &imagearch.ernie },          .{ "krea2", &imagearch.krea2 },
+        .{ "mage_flow", &imagearch.mageflow },   .{ "qwen_image21", &imagearch.qwen21 },
+        .{ "qwen_image", &imagearch.qwen },      .{ "sensenova_u15", &imagearch.sensenova_u15 },
+        .{ "minimax_h3", &imagearch.minimax_h3 }, .{ "ltx2", &imagearch.ltx2 },
+        .{ "wan", &imagearch.wan },              .{ "lumina2", &imagearch.lumina2 },
+        .{ "sd3", &imagearch.sd3 },              .{ "aura", &imagearch.aura },
+        .{ "hidream", &imagearch.hidream },      .{ "hyvid", &imagearch.hyvid },
+        .{ "ltxv", &imagearch.ltxv },
+    };
+    inline for (cases) |c| {
+        expectAttentionModules(@embedFile("test_fixtures/attention/" ++ c[0] ++ ".json"), c[1]) catch |e| {
+            std.debug.print("family {s}\n", .{c[0]});
+            return e;
+        };
+    }
+}
+
+test "flux3 int8 attention leaves out the blocks ComfyUI's bake leaves out" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const names = try std.json.parseFromSliceLeaky([]const []const u8, a, @embedFile("test_fixtures/flux3_klein_int8_convrot.json"), .{});
+    var baked: std.ArrayList([]const u8) = .empty;
+    for (names) |n| if (std.mem.endsWith(u8, n, ".comfy_attention.config")) try baked.append(a, n);
+    const kept = try imagearch.flux3.attentionConfigNames(names, false, a);
+    try std.testing.expectEqual(baked.items.len, kept.len);
+    for (kept) |k| {
+        var hit = false;
+        for (baked.items) |b| hit = hit or std.mem.eql(u8, b, k);
+        try std.testing.expect(hit);
+    }
 }

@@ -86,8 +86,20 @@ pub const ConvertOptions = struct {
     target_issue: []const u8 = "",
     /// Optional GUI progress/cancel hooks.  No-ops when null.
     callbacks: cb.ConvertCallbacks = .{},
+    /// ComfyUI's per-block attention preference in a safetensors output.
+    attention: AttentionMode = .keep,
     /// The llama.cpp type file at `template_path`, parsed. `convert` fills it in when null.
     tensor_type_rules: ?*TensorTypeRules = null,
+};
+
+/// What happens to ComfyUI's `<module>.comfy_attention.config` tensors.
+pub const AttentionMode = enum {
+    /// Whatever the source carries.
+    keep,
+    /// comfy-kitchen int8 attention on the architecture's attention modules.
+    int8,
+    /// None, leaving ComfyUI's own attention selection.
+    default,
 };
 
 /// Set `filetype` and `hf_names` for `opts.target`, which leaves it resolved
@@ -277,6 +289,8 @@ fn precisionRank(type_str: []const u8) u8 {
 /// checkpoint rarely hits a type file written for GGUF names.
 pub fn detectUpscaling(source_tensors: []const types.Tensor, target_dtype: ?types.DataType, rules: ?*const TensorTypeRules) bool {
     for (source_tensors) |t| {
+        // ComfyUI's JSON blobs are U8 metadata, not quantized values.
+        if (std.mem.endsWith(u8, t.name, ".comfy_attention.config") or std.mem.endsWith(u8, t.name, ".comfy_quant")) continue;
         const rule = if (rules) |r| r.find(t.name) else null;
         const tgt = if (rule) |r| r.type else target_dtype orelse continue;
         const target_rank = precisionRank(@tagName(tgt));
@@ -815,8 +829,8 @@ pub fn prepareConversion(
     var groups = try TensorClusters.groupClusters(f, arena_alloc, allocator);
     groups.expert_stacks = expert_stacks;
     try TensorClusters.collapseModelTensors(&model_tensors, &groups, .dequant, arena_alloc);
-    if (Target.fusesMlp(opts.target, arch.name)) {
-        groups.expert_stacks = try fuseSplitMlp(f.tensors.items, &model_tensors, groups.expert_stacks, arena_alloc);
+    if (Target.fusion(opts.target, arch.name)) |fu| {
+        groups.expert_stacks = try fuseSplit(f.tensors.items, &model_tensors, groups.expert_stacks, fu, arena_alloc);
     }
 
     // --- Assign quantization types (template or auto) -------------------------
@@ -856,6 +870,9 @@ pub fn prepareConversion(
             }
         }.lessThan);
     }
+
+    // --- Attention preference ------------------------------------------------
+    try applyAttentionMode(&model_tensors, arch, opts, arena_alloc);
 
     // --- Assign final on-disk sizes/offsets (both template and auto paths) ----
     // Must run after any reordering so offsets describe the final tensor order.
@@ -1231,70 +1248,119 @@ fn hfDirCandidates(io: std.Io, path: []const u8) ?[]const u8 {
     return dir;
 }
 
-/// Replace each block's split `img_mlp.gate_layer` / `img_mlp.proj` pair with one
-/// `img_mlp.gate_up`, gate rows first, which is the order ComfyUI's SwiGLU chunks it in.
-/// Runs on collapsed tensors so a quantized half already has its logical shape; the
-/// returned stacks (`stacks` plus one per fused tensor) read each half from `sources`.
-fn fuseSplitMlp(
+/// Replace each set of split projections `fu.parts` with one `fu.fused` tensor.
+/// Runs on collapsed tensors so a quantized part already has its logical shape; the
+/// returned stacks (`stacks` plus one per fused tensor) read each part from `sources`.
+fn fuseSplit(
     sources: []const types.Tensor,
     model_tensors: *std.ArrayList(types.Tensor),
     stacks: []const TensorClusters.ExpertStack,
+    fu: Target.Fusion,
     arena_alloc: std.mem.Allocator,
 ) ![]const TensorClusters.ExpertStack {
-    const gate_tag = ".img_mlp.gate_layer.";
-    const up_tag = ".img_mlp.proj.";
     var out: std.ArrayList(TensorClusters.ExpertStack) = .empty;
     try out.appendSlice(arena_alloc, stacks);
-    var fused_ups: std.StringHashMapUnmanaged(void) = .empty;
+    var absorbed: std.StringHashMapUnmanaged(void) = .empty;
     var kept: std.ArrayList(types.Tensor) = .empty;
 
-    for (model_tensors.items) |t| {
-        const at = std.mem.indexOf(u8, t.name, gate_tag) orelse {
+    next: for (model_tensors.items) |t| {
+        const at = std.mem.indexOf(u8, t.name, fu.parts[0]) orelse {
             try kept.append(arena_alloc, t);
             continue;
         };
         const head = t.name[0..at];
-        const tail = t.name[at + gate_tag.len ..];
-        const up_name = try std.mem.concat(arena_alloc, u8, &.{ head, up_tag, tail });
-        const up = for (model_tensors.items) |u| {
-            if (std.mem.eql(u8, u.name, up_name)) break u;
-        } else {
-            std.log.warn("{s} has no {s} to fuse with; keeping the MLP split", .{ t.name, up_name });
-            try kept.append(arena_alloc, t);
-            continue;
-        };
-        const gate_src = TensorClusters.bestSourceMatch(sources, t.name);
-        const up_src = TensorClusters.bestSourceMatch(sources, up_name);
-        if (t.dims.len == 0 or !std.mem.eql(usize, t.dims, up.dims) or !std.mem.eql(u8, t.type, up.type) or gate_src == null or up_src == null) {
-            std.log.warn("{s} and {s} differ in shape or type; keeping the MLP split", .{ t.name, up_name });
-            try kept.append(arena_alloc, t);
-            continue;
-        }
-
+        const tail = t.name[at + fu.parts[0].len ..];
+        const n_parts = fu.parts.len;
+        const names = try arena_alloc.alloc([]const u8, n_parts);
+        const segments = try arena_alloc.alloc(types.StackSegment, n_parts);
         var n: usize = 1;
         for (t.dims) |d| n *= d;
+        for (fu.parts, 0..) |part, i| {
+            names[i] = try std.mem.concat(arena_alloc, u8, &.{ head, part, tail });
+            const p = for (model_tensors.items) |u| {
+                if (std.mem.eql(u8, u.name, names[i])) break u;
+            } else {
+                std.log.warn("{s} has no {s} to fuse with; keeping it split", .{ t.name, names[i] });
+                try kept.append(arena_alloc, t);
+                continue :next;
+            };
+            const src = TensorClusters.bestSourceMatch(sources, names[i]);
+            if (t.dims.len == 0 or !std.mem.eql(usize, t.dims, p.dims) or !std.mem.eql(u8, t.type, p.type) or src == null) {
+                std.log.warn("{s} and {s} differ in shape or type; keeping them split", .{ t.name, names[i] });
+                try kept.append(arena_alloc, t);
+                continue :next;
+            }
+            segments[i] = .{ .tensor = sources[src.?], .elem_offset = 0, .elem_count = n };
+        }
+
         const dims = try arena_alloc.dupe(usize, t.dims);
-        dims[0] *= 2;
-        const segments = try arena_alloc.dupe(types.StackSegment, &.{
-            .{ .tensor = sources[gate_src.?], .elem_offset = 0, .elem_count = n },
-            .{ .tensor = sources[up_src.?], .elem_offset = 0, .elem_count = n },
-        });
-        const name = try std.mem.concat(arena_alloc, u8, &.{ head, ".img_mlp.gate_up.", tail });
+        dims[0] *= n_parts;
+        const name = try std.mem.concat(arena_alloc, u8, &.{ head, fu.fused, tail });
         try out.append(arena_alloc, .{ .name = name, .dims = dims, .dtype = t.type, .segments = segments });
 
         var fused = t;
         fused.name = name;
         fused.dims = dims;
-        fused.size = (try types.DataType.fromString(t.type)).calcSizeInBytes(2 * n);
+        fused.size = (try types.DataType.fromString(t.type)).calcSizeInBytes(n_parts * n);
         try kept.append(arena_alloc, fused);
-        try fused_ups.put(arena_alloc, up_name, {});
+        for (names[1..]) |nm| try absorbed.put(arena_alloc, nm, {});
     }
 
-    if (fused_ups.count() == 0) return stacks;
+    if (absorbed.count() == 0) return stacks;
     model_tensors.clearRetainingCapacity();
-    for (kept.items) |t| if (!fused_ups.contains(t.name)) try model_tensors.append(arena_alloc, t);
-    std.log.info("fused {d} split MLP projections into gate_up, the layout ComfyUI's LoRA loader and int8 path expect", .{fused_ups.count()});
+    for (kept.items) |t| if (!absorbed.contains(t.name)) try model_tensors.append(arena_alloc, t);
+    std.log.info("fused {d} sets of split projections into {s}, the layout ComfyUI's LoRA loader and int8 path expect", .{ absorbed.count() / (fu.parts.len - 1), fu.fused });
     return out.items;
+}
+
+/// Replace the source's attention preferences per `opts.attention`. GGUF has no
+/// U8 type to carry them in, and ComfyUI-GGUF would not read them.
+fn applyAttentionMode(
+    model_tensors: *std.ArrayList(types.Tensor),
+    arch: *const imagearch.Arch,
+    opts: ConvertOptions,
+    arena_alloc: std.mem.Allocator,
+) !void {
+    if (opts.attention == .keep) return;
+    if (opts.filetype == .gguf) {
+        if (opts.attention == .int8) {
+            std.log.warn("a GGUF cannot carry an attention preference; ComfyUI's Model Attention Backend node sets one at load time", .{});
+            return error.AttentionNeedsSafetensors;
+        }
+        return;
+    }
+    var dropped: usize = 0;
+    var i: usize = 0;
+    while (i < model_tensors.items.len) {
+        if (std.mem.endsWith(u8, model_tensors.items[i].name, ".comfy_attention.config")) {
+            _ = model_tensors.orderedRemove(i);
+            dropped += 1;
+        } else i += 1;
+    }
+    if (opts.attention == .default) {
+        if (dropped > 0) std.log.info("dropped the attention preference of {d} modules", .{dropped});
+        return;
+    }
+    if (arch.attention_modules.len == 0) {
+        std.log.err("{s} has no attention modules ComfyUI takes a preference on", .{arch.name});
+        return error.NoAttentionModules;
+    }
+    const names = try arena_alloc.alloc([]const u8, model_tensors.items.len);
+    for (model_tensors.items, names) |t, *n| n.* = t.name;
+    const configs = try arch.attentionConfigNames(names, false, arena_alloc);
+    const blob = "{\"attention\": \"comfy_kitchen_int8\"}";
+    for (configs) |name| {
+        const dims = try arena_alloc.dupe(usize, &.{blob.len});
+        try model_tensors.append(arena_alloc, .{ .name = name, .type = "U8", .dims = dims, .size = blob.len, .offset = 0, .inline_data = blob });
+    }
+    std.log.info("int8 attention on {d} modules", .{configs.len});
+}
+
+/// Whether `name` survives into a GGUF or model-only output. ComfyUI's per-block
+/// attention config is a U8 blob only its safetensors loader reads.
+fn keepTensor(arch: *const imagearch.Arch, name: []const u8, output_filetype: types.FileType) bool {
+    if (arch.shouldIgnore(name)) return false;
+    return !(output_filetype == .gguf and std.mem.endsWith(u8, name, ".comfy_attention.config"));
 }
 
 /// Returns a new list containing only the tensors that should be converted,
@@ -1329,7 +1395,7 @@ fn filterAndStripTensors(
     // name; the prefix heuristic below would drop lm_head.weight and rename layers.
     if (!arch.component_filter) {
         for (f.tensors.items) |t| {
-            if (!arch.shouldIgnore(t.name)) {
+            if (keepTensor(arch, t.name, output_filetype)) {
                 try model_tensors.append(arena_alloc, try t.dupe(arena_alloc));
             }
         }
@@ -1349,14 +1415,14 @@ fn filterAndStripTensors(
     for (f.tensors.items) |t| {
         if (has_model_prefix) {
             if (std.mem.startsWith(u8, t.name, "model.")) {
-                if (!arch.shouldIgnore(t.name)) {
+                if (keepTensor(arch, t.name, output_filetype)) {
                     try model_tensors.append(arena_alloc, try t.dupe(arena_alloc));
                 }
             } else {
                 std.log.info("Filtering out tensor: {s}", .{t.name});
             }
         } else {
-            if (!arch.shouldIgnore(t.name)) {
+            if (keepTensor(arch, t.name, output_filetype)) {
                 try model_tensors.append(arena_alloc, try t.dupe(arena_alloc));
             }
         }
@@ -4330,6 +4396,11 @@ test "detectUpscaling: a rule raises only the tensors it matches" {
     try testing.expect(detectUpscaling(&src, .q4_k, &up));
     try testing.expect(detectUpscaling(&src, .q8_0, null));
     try testing.expect(!detectUpscaling(&src, null, null));
+    const blobs = [_]types.Tensor{
+        .{ .name = "single_blocks.0.comfy_attention.config", .type = "U8", .dims = &.{}, .size = 0, .offset = 0 },
+        .{ .name = "single_blocks.0.qkv.comfy_quant", .type = "U8", .dims = &.{}, .size = 0, .offset = 0 },
+    };
+    try testing.expect(!detectUpscaling(&blobs, .F32, null));
 }
 
 test "a type file names, plans and guards the output by the types its rules assign" {
@@ -5712,6 +5783,217 @@ test "the ComfyUI target fuses Qwen-Image 2.1's split MLP gate first, and custom
         defer out.deinit();
         try testing.expect(find(out.tensors.items, B ++ "img_mlp.gate_up.weight") == null);
         try testing.expect(find(out.tensors.items, B ++ "img_mlp.gate_layer.weight") != null);
+    }
+}
+
+test "the ComfyUI target fuses FLUX.3's q, k and v in that order, and custom keeps them split" {
+    testing.log_level = .err;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const dir = try targetTestDir(io, a, "flux3fuse");
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const B = "single_blocks.0.";
+    const specs = [_]StSpec{
+        .{ .name = "content_mode_blocks.image.0.attn_out.weight", .dims = &.{ 8, 8 } },
+        .{ .name = "single_stream_modulations.txt.lin.weight", .dims = &.{ 8, 8 } },
+        .{ .name = B ++ "q_proj.weight", .dims = &.{ 4, 8 } },
+        .{ .name = B ++ "k_proj.weight", .dims = &.{ 4, 8 } },
+        .{ .name = B ++ "v_proj.weight", .dims = &.{ 4, 8 } },
+        .{ .name = B ++ "norm.query_norm.scale", .dims = &.{8} },
+    };
+    const first_part = 2;
+    const src_path = try std.fmt.allocPrint(a, "{s}/m.safetensors", .{dir});
+    try writeF32Safetensors(io, a, src_path, &specs, 0, 1);
+
+    const find = struct {
+        fn f(tensors: []const types.Tensor, name: []const u8) ?types.Tensor {
+            for (tensors) |t| if (std.mem.eql(u8, t.name, name)) return t;
+            return null;
+        }
+    }.f;
+    const expectFused = struct {
+        fn f(g: anytype, t: types.Tensor, alloc: std.mem.Allocator) !void {
+            const buf = try alloc.alignedAlloc(u8, .of(f32), @intCast(t.size));
+            const file = try g.openFileForTensor(t.name);
+            _ = try file.readPositionalAll(g.io, buf, t.offset + g.current_data_begin);
+            const v = std.mem.bytesAsSlice(f32, buf);
+            try testing.expectEqual(@as(usize, 96), v.len);
+            for (0..3) |part| for (0..32) |i| {
+                try testing.expectEqual(@as(f32, @floatFromInt((first_part + part) * 1000 + i)), v[part * 32 + i]);
+            };
+        }
+    }.f;
+
+    var f = try st.init(src_path, io, gpa, a, false, false);
+    defer f.deinit();
+
+    const st_opts = try applyTarget(&f, targetTestOpts(io, src_path, dir, .comfyui, .F32), gpa, a);
+    try convert(&f, st_opts, gpa, a);
+    {
+        var out = try st.init(try std.fmt.allocPrint(a, "{s}/out.safetensors", .{dir}), io, gpa, a, false, false);
+        defer out.deinit();
+        const qkv = find(out.tensors.items, B ++ "qkv.weight") orelse return error.TestExpectedTensor;
+        try testing.expectEqualSlices(usize, &.{ 12, 8 }, qkv.dims);
+        try expectFused(&out, qkv, a);
+        for ([_][]const u8{ "q_proj", "k_proj", "v_proj" }) |p|
+            try testing.expect(find(out.tensors.items, try std.mem.concat(a, u8, &.{ B, p, ".weight" })) == null);
+        try testing.expect(find(out.tensors.items, B ++ "norm.query_norm.scale") != null);
+    }
+
+    const g_opts = try applyTarget(&f, targetTestOpts(io, src_path, dir, .comfyui, .f32), gpa, a);
+    try convert(&f, g_opts, gpa, a);
+    {
+        var out = try gguf.init(try std.fmt.allocPrint(a, "{s}/out.gguf", .{dir}), io, gpa, a, false);
+        defer out.deinit();
+        try testing.expectEqualStrings("flux3", out.metadata.get("general.architecture").?.string);
+        try expectFused(&out, find(out.tensors.items, B ++ "qkv.weight") orelse return error.TestExpectedTensor, a);
+    }
+
+    var custom = targetTestOpts(io, src_path, dir, .custom, .f32);
+    custom.output_name = "split";
+    try convert(&f, try applyTarget(&f, custom, gpa, a), gpa, a);
+    {
+        var out = try gguf.init(try std.fmt.allocPrint(a, "{s}/split.gguf", .{dir}), io, gpa, a, false);
+        defer out.deinit();
+        try testing.expect(find(out.tensors.items, B ++ "qkv.weight") == null);
+        try testing.expect(find(out.tensors.items, B ++ "k_proj.weight") != null);
+    }
+}
+
+test "--attention writes, keeps or drops ComfyUI's attention preferences, and GGUF refuses int8" {
+    testing.log_level = .err;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const dir = try targetTestDir(io, a, "flux3attn");
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const specs = [_]StSpec{
+        .{ .name = "content_mode_blocks.image.0.attn_out.weight", .dims = &.{ 8, 8 } },
+        .{ .name = "single_stream_modulations.txt.lin.weight", .dims = &.{ 8, 8 } },
+        .{ .name = "single_blocks.0.qkv.weight", .dims = &.{ 24, 8 } },
+        .{ .name = "single_blocks.1.qkv.weight", .dims = &.{ 24, 8 } },
+        .{ .name = "txt_mode_blocks.0.qkv.weight", .dims = &.{ 24, 8 } },
+    };
+    const src_path = try std.fmt.allocPrint(a, "{s}/m.safetensors", .{dir});
+    try writeF32Safetensors(io, a, src_path, &specs, 0, 1);
+
+    const configsIn = struct {
+        fn f(path: []const u8, io_: std.Io, alloc: std.mem.Allocator, gpa_: std.mem.Allocator) ![]const []const u8 {
+            var out = try st.init(path, io_, gpa_, alloc, false, false);
+            defer out.deinit();
+            var names: std.ArrayList([]const u8) = .empty;
+            for (out.tensors.items) |t| if (std.mem.endsWith(u8, t.name, ".comfy_attention.config")) {
+                const buf = try alloc.alloc(u8, @intCast(t.size));
+                const file = try out.openFileForTensor(t.name);
+                _ = try file.readPositionalAll(io_, buf, t.offset + out.current_data_begin);
+                try testing.expectEqualStrings("{\"attention\": \"comfy_kitchen_int8\"}", buf);
+                try testing.expectEqualStrings("U8", t.type);
+                try names.append(alloc, try alloc.dupe(u8, t.name));
+            };
+            std.sort.block([]const u8, names.items, {}, struct {
+                fn lt(_: void, x: []const u8, y: []const u8) bool {
+                    return std.mem.lessThan(u8, x, y);
+                }
+            }.lt);
+            return names.items;
+        }
+    }.f;
+
+    var f = try st.init(src_path, io, gpa, a, false, false);
+    defer f.deinit();
+
+    var on = try applyTarget(&f, targetTestOpts(io, src_path, dir, .comfyui, .F32), gpa, a);
+    on.attention = .int8;
+    on.output_name = "on";
+    try convert(&f, on, gpa, a);
+    const on_path = try std.fmt.allocPrint(a, "{s}/on.safetensors", .{dir});
+    const want = [_][]const u8{
+        "content_mode_blocks.image.0.comfy_attention.config",
+        "single_blocks.0.comfy_attention.config",
+        "single_blocks.1.comfy_attention.config",
+    };
+    const got = try configsIn(on_path, io, a, gpa);
+    try testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| try testing.expectEqualStrings(w, g);
+
+    // From a source that carries them: keep passes them through, default drops them.
+    var on_src = try st.init(on_path, io, gpa, a, false, false);
+    defer on_src.deinit();
+    var keep = try applyTarget(&on_src, targetTestOpts(io, on_path, dir, .comfyui, .F32), gpa, a);
+    keep.output_name = "keep";
+    try convert(&on_src, keep, gpa, a);
+    try testing.expectEqual(want.len, (try configsIn(try std.fmt.allocPrint(a, "{s}/keep.safetensors", .{dir}), io, a, gpa)).len);
+    var dflt = keep;
+    dflt.attention = .default;
+    dflt.output_name = "default";
+    try convert(&on_src, dflt, gpa, a);
+    try testing.expectEqual(@as(usize, 0), (try configsIn(try std.fmt.allocPrint(a, "{s}/default.safetensors", .{dir}), io, a, gpa)).len);
+
+    var g = try applyTarget(&f, targetTestOpts(io, src_path, dir, .comfyui, .f32), gpa, a);
+    g.attention = .int8;
+    try testing.expectError(error.AttentionNeedsSafetensors, convert(&f, g, gpa, a));
+}
+
+test "assignTensorType: flux3 spares what ComfyUI's bake spares and keeps BFL's 4-bit exclusions at 8 bits" {
+    const Case = struct { target: types.DataType, filetype: types.FileType, spared: []const u8, floored: []const u8 };
+    const cases = [_]Case{
+        .{ .target = .q4_k, .filetype = .gguf, .spared = "f32", .floored = "q8_0" },
+        .{ .target = .q8_0, .filetype = .gguf, .spared = "f32", .floored = "q8_0" },
+        .{ .target = .INT8_CONVROT, .filetype = .safetensors, .spared = "BF16", .floored = "INT8_CONVROT" },
+        .{ .target = .NVFP4, .filetype = .safetensors, .spared = "BF16", .floored = "MXFP8_E4M3" },
+        .{ .target = .INT4_CONVROT, .filetype = .safetensors, .spared = "BF16", .floored = "INT8_CONVROT" },
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const Probe = struct { name: []const u8, dims: []const usize, want: enum { target, spared, floored } };
+    const probes = [_]Probe{
+        .{ .name = "single_blocks.0.qkv.weight", .dims = &.{ 9216, 3072 }, .want = .target },
+        .{ .name = "single_blocks.23.mlp_out.weight", .dims = &.{ 3072, 9216 }, .want = .target },
+        .{ .name = "content_mode_blocks.image.1.mlp_in.weight", .dims = &.{ 18432, 3072 }, .want = .target },
+        .{ .name = "content_mode_blocks.image_cond.0.q_proj.weight", .dims = &.{ 3072, 3072 }, .want = .target },
+        .{ .name = "content_mode_blocks.image.0.mlp_in.weight", .dims = &.{ 18432, 3072 }, .want = .floored },
+        .{ .name = "txt_mode_blocks.3.attn_out.weight", .dims = &.{ 3072, 3072 }, .want = .floored },
+        .{ .name = "single_blocks.27.qkv.weight", .dims = &.{ 9216, 3072 }, .want = .floored },
+        .{ .name = "txt_in.weight", .dims = &.{ 3072, 20480 }, .want = .spared },
+        .{ .name = "time_in.out_layer.weight", .dims = &.{ 3072, 3072 }, .want = .spared },
+        .{ .name = "ref_time_in.out_layer.weight", .dims = &.{ 3072, 3072 }, .want = .spared },
+        .{ .name = "single_stream_modulations.image.lin.weight", .dims = &.{ 9216, 3072 }, .want = .spared },
+        .{ .name = "early_stream_modulations.txt.lin.weight", .dims = &.{ 9216, 3072 }, .want = .spared },
+        .{ .name = "final_layer.image.adaLN_modulation.1.weight", .dims = &.{ 6144, 3072 }, .want = .spared },
+    };
+    for (cases) |c| {
+        var opts = testOpts(c.target);
+        opts.filetype = c.filetype;
+        for (probes) |p| {
+            var n: u64 = 1;
+            for (p.dims) |d| n *= d;
+            var t = types.Tensor{ .name = p.name, .type = "BF16", .dims = @constCast(p.dims), .size = 0, .offset = 0 };
+            try assignTensorType(&t, n, &imagearch.flux3, QUANTIZATION_THRESHOLD, opts, false, null, a);
+            const want = switch (p.want) {
+                .target => @tagName(c.target),
+                .spared => c.spared,
+                .floored => c.floored,
+            };
+            testing.expectEqualStrings(want, t.type) catch |e| {
+                std.debug.print("{s} at {s}\n", .{ p.name, @tagName(c.target) });
+                return e;
+            };
+        }
     }
 }
 

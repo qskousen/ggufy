@@ -354,11 +354,18 @@ pub fn hfNames(target: Target, kind: Kind, arch_name: []const u8, ft: types.File
     };
 }
 
-/// Whether `target` takes this architecture's split MLP fused into one gate_up tensor.
-/// ComfyUI maps LoRAs under either naming onto a fused MLP but only the split names onto a
-/// split one, and only its fused MLP takes the int8 SwiGLU fast path.
-pub fn fusesMlp(target: Target, arch_name: []const u8) bool {
-    return target == .comfyui and std.mem.eql(u8, arch_name, "qwen_image21");
+/// Split projections stored as one tensor, `parts` stacked along rows in order.
+pub const Fusion = struct { parts: []const []const u8, fused: []const u8 };
+
+/// The split projections `target` takes fused for this architecture. ComfyUI maps LoRAs
+/// under either naming onto the fused layout but only the split names onto a split one,
+/// and runs a fused projection as one GEMM (with one activation quantization on int8).
+pub fn fusion(target: Target, arch_name: []const u8) ?Fusion {
+    if (target != .comfyui) return null;
+    // Gate rows first, the order ComfyUI's SwiGLU chunks it in.
+    if (std.mem.eql(u8, arch_name, "qwen_image21")) return .{ .parts = &.{ ".img_mlp.gate_layer.", ".img_mlp.proj." }, .fused = ".img_mlp.gate_up." };
+    if (std.mem.eql(u8, arch_name, "flux3")) return .{ .parts = &.{ ".q_proj.", ".k_proj.", ".v_proj." }, .fused = ".qkv." };
+    return null;
 }
 
 /// What a target asks of a conversion of `arch_name`. `datatype` null means the

@@ -331,6 +331,7 @@ pub fn buildConvertOptions(state: *guiState.State) conv.ConvertOptions {
         .model_only = state.model_only,
         .allow_unknown_arch = state.allow_unknown_arch,
         .allow_upscale = state.allow_upscale,
+        .attention = if (state.target_filetype == .safetensors) state.attention else .keep,
         .arch_override = state.archOverride(),
         // Any other target picks the naming itself.
         .hf_names = state.target == .custom and state.hf_names,

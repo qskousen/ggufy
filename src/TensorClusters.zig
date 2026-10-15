@@ -15,6 +15,7 @@ pub const Fp4Cluster = struct {
     comfy_quant: ?types.Tensor,
     rows: usize,
     cols: usize,
+    input_scale: ?types.Tensor = null, // activation scale, dropped on conversion
 };
 
 pub const Float8Cluster = struct {
@@ -26,6 +27,8 @@ pub const Float8Cluster = struct {
     comfy_quant: ?types.Tensor,
     rows: usize,
     cols: usize,
+    // One scale per row (BFL's fp8r) rather than ComfyUI's one per tensor.
+    per_row: bool = false,
 };
 
 /// MXFP4 cluster (OCP MX spec): E2M1 packed nibbles + E8M0 per-block scale, block size 32.
@@ -508,6 +511,8 @@ fn appendNvfp4Cluster(
     const weight = source.tensors.items[wi];
     const weight_scale = source.tensors.items[wsi];
     const weight_scale_2 = source.tensors.items[ws2i];
+    const isname = try std.fmt.allocPrint(allocator, "{s}.input_scale", .{base_name});
+    defer allocator.free(isname);
 
     try list.append(arena_alloc, .{
         .base_name = base_name,
@@ -517,6 +522,7 @@ fn appendNvfp4Cluster(
         .comfy_quant = comfy_quant,
         .rows = weight.dims[0],
         .cols = weight.dims[1] * 2,
+        .input_scale = if (name_map.get(isname)) |isi| source.tensors.items[isi] else null,
     });
     std.log.debug("TensorClusters: grouped nvfp4 cluster {s} [{}, {}]", .{
         base_name, weight.dims[0], weight.dims[1] * 2,
@@ -560,6 +566,14 @@ fn appendFloat8Cluster(
         source.tensors.items[isi]
     else
         null;
+    if (!std.mem.eql(u8, weight.type, "F8_E4M3")) {
+        std.log.warn("TensorClusters: fp8 cluster {s} has a {s} weight; skipping", .{ base_name, weight.type });
+        return false;
+    }
+    if (weight.dims.len != 2 or (weight_scale.size != 4 and weight_scale.size != weight.dims[0] * 4)) {
+        std.log.warn("TensorClusters: fp8 cluster {s} has a scale that is neither per tensor nor per row; skipping", .{base_name});
+        return false;
+    }
 
     try list.append(arena_alloc, .{
         .base_name = base_name,
@@ -569,6 +583,7 @@ fn appendFloat8Cluster(
         .comfy_quant = comfy_quant,
         .rows = weight.dims[0],
         .cols = weight.dims[1],
+        .per_row = weight_scale.size != 4,
     });
     std.log.debug("TensorClusters: grouped fp8 cluster {s} [{}, {}]", .{
         base_name, weight.dims[0], weight.dims[1],
@@ -793,6 +808,33 @@ fn groupFromQuantMetadata(
     }
 }
 
+/// Group the layers of one of BFL's own quantized exports, which name their format only
+/// in the header: `quantization` is "fp8r" (per-row F32 scales) or "nvfp4", with no
+/// per-layer map, so every `.weight_scale` marks a quantized layer.
+fn groupFromBflExport(
+    source: anytype,
+    name_map: *std.StringHashMap(usize),
+    quantization: []const u8,
+    fp4_list: *std.ArrayList(Fp4Cluster),
+    float8_list: *std.ArrayList(Float8Cluster),
+    seen: *std.StringHashMap(void),
+    arena_alloc: std.mem.Allocator,
+    allocator: std.mem.Allocator,
+) !void {
+    const nvfp4 = std.mem.eql(u8, quantization, "nvfp4");
+    if (!nvfp4 and !std.mem.eql(u8, quantization, "fp8r")) return;
+    for (source.tensors.items) |t| {
+        if (!std.mem.endsWith(u8, t.name, ".weight_scale")) continue;
+        const base_name = t.name[0 .. t.name.len - ".weight_scale".len];
+        if (seen.contains(base_name)) continue;
+        const grouped = if (nvfp4)
+            try appendNvfp4Cluster(source, name_map, base_name, null, fp4_list, arena_alloc, allocator)
+        else
+            try appendFloat8Cluster(source, name_map, base_name, null, float8_list, arena_alloc, allocator);
+        if (grouped) try seen.put(base_name, {});
+    }
+}
+
 /// Scan source tensors and group them into NVFP4/FP8/MXFP4/MXFP8/INT8-ConvRot clusters. Two
 /// encodings are supported and treated equivalently (as ComfyUI's convert_old_quants does): per-
 /// tensor `.comfy_quant` marker blobs, and a single file-level `_quantization_metadata` header that
@@ -871,6 +913,12 @@ pub fn groupClusters(
             if (qm_val == .string) {
                 try groupFromQuantMetadata(source, &name_map, qm_val.string, &fp4_list, &float8_list, &mxfp4_list, &mxfp8_list, &int8_convrot_list, &int4_list, &asym_w4a8_list, &seen_bases, arena_alloc, allocator);
             }
+        }
+    }
+
+    if (source.getSourceMetadata()) |meta| {
+        if (meta.get("quantization")) |q| {
+            if (q == .string) try groupFromBflExport(source, &name_map, q.string, &fp4_list, &float8_list, &seen_bases, arena_alloc, allocator);
         }
     }
 
@@ -1074,7 +1122,7 @@ pub fn quantizeToNvFp4Raw(
     return .{ .weight = weight, .scale = scale, .global_scale = global_scale };
 }
 
-/// Dequantize an FP8 (ComfyUI) cluster to F32: f8_weight × scalar_scale.
+/// Dequantize an FP8 cluster to F32: f8_weight times its tensor's or its row's scale.
 /// Caller owns the returned slice.
 pub fn dequantizeFloat8Cluster(
     cluster: Float8Cluster,
@@ -1085,15 +1133,18 @@ pub fn dequantizeFloat8Cluster(
     defer allocator.free(weight_bytes);
     const scale_buf = try readTensorBytes(source, cluster.weight_scale, allocator);
     defer allocator.free(scale_buf);
-    const scalar_scale: f32 = @bitCast(std.mem.readInt(u32, scale_buf[0..4], .little));
+    return dequantizeFloat8Raw(weight_bytes, scale_buf, if (cluster.per_row) cluster.cols else null, allocator);
+}
 
+/// `dequantizeFloat8Cluster` on raw bytes: one F32 scale, or one per row of `row_cols` elements.
+pub fn dequantizeFloat8Raw(weight_bytes: []const u8, scale_buf: []const u8, row_cols: ?usize, allocator: std.mem.Allocator) ![]f32 {
     const out = try allocator.alloc(f32, weight_bytes.len);
     errdefer allocator.free(out);
-
     for (weight_bytes, 0..) |byte, i| {
-        out[i] = DataTransform.Quantizer.lut_e4m3[byte] * scalar_scale;
+        const s = if (row_cols) |c| (i / c) * 4 else 0;
+        const scale: f32 = @bitCast(std.mem.readInt(u32, scale_buf[s..][0..4], .little));
+        out[i] = DataTransform.Quantizer.lut_e4m3[byte] * scale;
     }
-
     return out;
 }
 
@@ -1615,7 +1666,8 @@ pub fn collapseModelTensors(
             }
             if (nameSuffixMatch(cluster.weight_scale.name, t.name) or
                 nameSuffixMatch(cluster.weight_scale_2.name, t.name) or
-                (if (cluster.comfy_quant) |cq| nameSuffixMatch(cq.name, t.name) else false))
+                (if (cluster.comfy_quant) |cq| nameSuffixMatch(cq.name, t.name) else false) or
+                (if (cluster.input_scale) |is| nameSuffixMatch(is.name, t.name) else false))
             {
                 handled = true; // drop companion tensor
                 break;
@@ -1626,7 +1678,8 @@ pub fn collapseModelTensors(
             for (groups.float8_clusters) |cluster| {
                 if (nameSuffixMatch(cluster.weight.name, t.name)) {
                     var new_t = t;
-                    new_t.type = if (mode == .preserve_quant) "SCALED_F8_E4M3" else "BF16";
+                    // ComfyUI's scaled fp8 has one scale per tensor, so a per-row one cannot be kept.
+                    new_t.type = if (mode == .preserve_quant and !cluster.per_row) "SCALED_F8_E4M3" else "BF16";
                     var n: usize = 1;
                     for (t.dims) |d| n *= d;
                     new_t.size = n * 2;
@@ -2397,6 +2450,82 @@ test "groupFromQuantMetadata: routes every supported header scheme to its cluste
         try testing.expectEqual(want_bits, c.bits);
         try testing.expectEqual(std.mem.eql(u8, c.base_name, "w4"), c.weight_codebook != null);
         try testing.expectEqual(std.mem.eql(u8, c.base_name, "w4a"), c.weight_correction != null);
+    }
+}
+
+test "groupFromBflExport: groups per-row fp8r and nvfp4 with its input scale, and nothing else" {
+    testing.log_level = .err;
+    const T = types.Tensor;
+    const alloc = std.testing.allocator;
+    var d_full = [_]usize{ 4, 8 };
+    var d_half = [_]usize{ 4, 4 };
+    var d_rows = [_]usize{4};
+    var d_one = [_]usize{};
+    var d_bad = [_]usize{2};
+    var tensors = [_]T{
+        .{ .name = "a.weight", .type = "F8_E4M3", .dims = &d_full, .size = 32, .offset = 0 },
+        .{ .name = "a.weight_scale", .type = "F32", .dims = &d_rows, .size = 16, .offset = 0 },
+        .{ .name = "t.weight", .type = "F8_E4M3", .dims = &d_full, .size = 32, .offset = 0 },
+        .{ .name = "t.weight_scale", .type = "F32", .dims = &d_one, .size = 4, .offset = 0 },
+        // Neither one scale nor one per row: refused rather than misread.
+        .{ .name = "b.weight", .type = "F8_E4M3", .dims = &d_full, .size = 32, .offset = 0 },
+        .{ .name = "b.weight_scale", .type = "F32", .dims = &d_bad, .size = 8, .offset = 0 },
+        .{ .name = "norm.scale", .type = "BF16", .dims = &d_rows, .size = 8, .offset = 0 },
+        .{ .name = "nv.weight", .type = "U8", .dims = &d_half, .size = 16, .offset = 0 },
+        .{ .name = "nv.weight_scale", .type = "F8_E4M3", .dims = &d_rows, .size = 4, .offset = 0 },
+        .{ .name = "nv.weight_scale_2", .type = "F32", .dims = &d_one, .size = 4, .offset = 0 },
+        .{ .name = "nv.input_scale", .type = "F32", .dims = &d_one, .size = 4, .offset = 0 },
+    };
+    const src = .{ .tensors = .{ .items = @as([]T, &tensors) } };
+    var name_map = std.StringHashMap(usize).init(alloc);
+    defer name_map.deinit();
+    for (tensors, 0..) |t, i| try name_map.put(t.name, i);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    var fp4_list: std.ArrayList(Fp4Cluster) = .empty;
+    var float8_list: std.ArrayList(Float8Cluster) = .empty;
+    var seen = std.StringHashMap(void).init(alloc);
+    defer seen.deinit();
+    try groupFromBflExport(src, &name_map, "fp8r", &fp4_list, &float8_list, &seen, arena.allocator(), alloc);
+    try testing.expectEqual(@as(usize, 2), float8_list.items.len);
+    try testing.expectEqualStrings("a", float8_list.items[0].base_name);
+    try testing.expect(float8_list.items[0].per_row);
+    try testing.expect(!float8_list.items[1].per_row);
+    try testing.expectEqual(@as(usize, 0), fp4_list.items.len);
+
+    var seen2 = std.StringHashMap(void).init(alloc);
+    defer seen2.deinit();
+    try groupFromBflExport(src, &name_map, "nvfp4", &fp4_list, &float8_list, &seen2, arena.allocator(), alloc);
+    try testing.expectEqual(@as(usize, 1), fp4_list.items.len);
+    try testing.expectEqualStrings("nv.input_scale", fp4_list.items[0].input_scale.?.name);
+
+    // An unrelated header value groups nothing.
+    var seen3 = std.StringHashMap(void).init(alloc);
+    defer seen3.deinit();
+    try groupFromBflExport(src, &name_map, "int8", &fp4_list, &float8_list, &seen3, arena.allocator(), alloc);
+    try testing.expectEqual(@as(usize, 0), seen3.count());
+}
+
+test "fp8r dequant: fixture from BFL's per-row fp8 export matches torch" {
+    // gen_fp8r_fixtures.py: weight.float() * weight_scale[:, None] on an 8x64 slice.
+    const allocator = std.testing.allocator;
+    const weight = (try loadFixture(allocator, "fp8r_weight.u8")) orelse return error.SkipZigTest;
+    defer allocator.free(weight);
+    const scale = (try loadFixture(allocator, "fp8r_scale.f32")) orelse return error.SkipZigTest;
+    defer allocator.free(scale);
+    const expected_bytes = (try loadFixture(allocator, "fp8r_expected.f32")) orelse return error.SkipZigTest;
+    defer allocator.free(expected_bytes);
+    const expected: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(expected_bytes)));
+
+    const got = try dequantizeFloat8Raw(weight, scale, 64, allocator);
+    defer allocator.free(got);
+    try testing.expectEqual(expected.len, got.len);
+    for (got, expected, 0..) |g, e, i| {
+        if (g != e) {
+            std.debug.print("fp8r[{}]: got={d} expected={d}\n", .{ i, g, e });
+            return error.TestExpectedEqual;
+        }
     }
 }
 

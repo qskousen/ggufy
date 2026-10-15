@@ -58,6 +58,8 @@ fn exitIfExplained(err: anyerror) void {
         error.MmprojUnusable,
         error.UnexpectedVisionShape,
         error.TargetCannotLoad,
+        error.AttentionNeedsSafetensors,
+        error.NoAttentionModules,
         => std.process.exit(1),
         else => {},
     }
@@ -170,6 +172,7 @@ pub fn main(init: std.process.Init) !void {
         \\-I, --imatrix <FILENAME>       Importance matrix (llama.cpp imatrix GGUF) to steer the quantizer's scale search.
         \\-F, --force                    With --hf-names, overwrite existing HF sidecars (config.json, tokenizer.json, ...) instead of refusing.
         \\-u, --allow-unknown-arch       Allow converting files with unrecognized architectures, drop HF LLM tensors that have no llama.cpp name, and convert an LLM whose pre-tokenizer matches no llama.cpp tag (to GGUF: tagged "default", which llama.cpp tokenizes as gpt2; to an HF layout: without a tokenizer.json). Results may be suboptimal.
+        \\    --attention <ATTENTION>    ComfyUI's per-block attention preference in a safetensors output: keep (default, whatever the source carries), int8 (comfy-kitchen int8 attention, as ComfyUI's own int8 bakes do; ignored on a GPU without the kernel), or default (none, leaving ComfyUI's choice). Independent of -d: the A in W8A8 or W4A8 covers linear layers, not attention. GGUF cannot carry it; use ComfyUI's Model Attention Backend node there.
         \\-W, --allow-incompatible       Write an output the --target program cannot load, with a warning, instead of refusing.
         \\-U, --allow-upscale            Allow converting from a lower-precision (quantized/FP8) source to a higher-precision target. The extra bits are fill-in; no quality is recovered.
         \\-A, --arch <NAME>              Set the architecture name written to the GGUF metadata (GGUF output only). Free-form, but not empty: for an LLM it also prefixes the <arch>.block_count/embedding_length/... keys llama.cpp looks up.
@@ -184,6 +187,7 @@ pub fn main(init: std.process.Init) !void {
         .DATATYPE = clap.parsers.enumeration(types.DataType),
         .FILETYPE = clap.parsers.enumeration(types.FileType),
         .TARGET = clap.parsers.enumeration(Target.Target),
+        .ATTENTION = clap.parsers.enumeration(conv.AttentionMode),
         .COMMAND = clap.parsers.enumeration(Command),
         .FILENAME = clap.parsers.string,
         .DIR = clap.parsers.string,
@@ -304,6 +308,7 @@ pub fn main(init: std.process.Init) !void {
         .imatrix_path = res.args.imatrix,
         .stochastic_rounding = res.args.@"stochastic-rounding",
         .target = target,
+        .attention = res.args.attention orelse .keep,
         .filetype_requested = if (target == .custom) null else res.args.filetype,
         .allow_incompatible = res.args.@"allow-incompatible" != 0,
     };

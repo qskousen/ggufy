@@ -81,6 +81,8 @@ pub const Tensor = struct {
     size: u64,
     offset: u64,
     source_path: ?[]const u8 = null,
+    /// The bytes to write for a tensor made by the conversion rather than read from the source.
+    inline_data: ?[]const u8 = null,
 
     pub fn dupe(self: Tensor, allocator: std.mem.Allocator) !Tensor {
         return Tensor{
@@ -90,6 +92,7 @@ pub const Tensor = struct {
             .size = self.size,
             .offset = self.offset,
             .source_path = if (self.source_path) |sp| allocator.dupe(u8, sp) catch null else null,
+            .inline_data = if (self.inline_data) |d| try allocator.dupe(u8, d) else null,
         };
     }
 };
