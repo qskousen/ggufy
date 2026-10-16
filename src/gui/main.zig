@@ -73,6 +73,7 @@ const st_marked_names = markIssues(st_target_types, st_type_names);
 
 fn targetName(t: Target.Target) []const u8 {
     return switch (t) {
+        .sdcpp => "sd.cpp (stable-diffusion.cpp)",
         .llamacpp => "llama.cpp (also Ollama, LM Studio)",
         .transformers => "transformers (Hugging Face)",
         .custom => "Custom",
@@ -86,6 +87,7 @@ fn targetTip(t: Target.Target, kind: ?Target.Kind) []const u8 {
             "A text encoder for ComfyUI. Safetensors loads in ComfyUI itself, GGUF through a GGUF loader extension; the tensor naming each expects is chosen for you."
         else
             "Safetensors loads in ComfyUI itself, GGUF through a GGUF loader extension. A model family ComfyUI-GGUF does not load is warned about.",
+        .sdcpp => "Every tensor keeps its real shape, which sd.cpp checks; projections stay split where sd.cpp reads them split. GGUF or safetensors.",
         .llamacpp => "A GGUF with llama.cpp's tensor names and tokenizer, and a separate mmproj file for a vision tower.",
         .transformers => "A directory transformers' from_pretrained loads: HF tensor names in model.safetensors, with config.json and tokenizer files beside it.",
         .custom => "Choose the format and tensor naming yourself. Nothing is refused for being unloadable.",

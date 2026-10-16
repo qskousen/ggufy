@@ -858,7 +858,7 @@ pub fn prepareConversion(
 
     // --- Shape fix ------------------------------------------------------------
     var extra_metadata: std.json.ObjectMap = .empty;
-    if (arch.shape_fix and opts.filetype == .gguf) {
+    if (reshapesRows(arch, opts)) {
         try applyShapeFix(&model_tensors, &extra_metadata, arena_alloc);
     }
 
@@ -981,8 +981,16 @@ fn outputFacts(f: anytype, prep: *const PreparedConversion, opts: ConvertOptions
         .has_vision = prep.vision_plan != null or prep.hf_vision != null,
     };
     if (opts.filetype == .gguf) out.arch_name = ggufArchName(f, prep.arch, prep.template_metadata, opts, prep.hf);
+    var keys = prep.extra_metadata.iterator();
+    while (keys.next()) |kv| {
+        if (std.mem.startsWith(u8, kv.key_ptr.*, "comfy.gguf.orig_shape.")) out.reshaped += 1;
+    }
+    const fusion = Target.archFusion(prep.arch.name);
     var native = false;
     for (prep.model_tensors.items) |t| {
+        if (fusion) |fu| if (std.mem.indexOf(u8, t.name, fu.fused) != null) {
+            out.fused = fu;
+        };
         // A passthrough tensor can still carry its source's spelling of the type.
         if (types.DataType.fromString(t.type)) |d| out.dtypes.insert(d.forFormat(opts.filetype) catch d) else |_| {}
         if (std.mem.startsWith(u8, t.name, "blk.") or std.mem.startsWith(u8, t.name, "token_embd.")) native = true;
@@ -1015,7 +1023,7 @@ pub fn predictOutputSize(
 pub const Prediction = struct {
     size: u64,
     /// Every known consumer's verdict on the output, in Target.Consumer order.
-    verdicts: [3]Target.Verdict,
+    verdicts: [4]Target.Verdict,
 };
 
 /// `predictOutputSize` plus who can load the result. Unlike `convert`, an
@@ -1880,7 +1888,7 @@ fn assignTensorType(
 
         // Narrow the block before sparing the tensor: otherwise a q4_k request on
         // an 896-wide model writes every 2-D weight as f16.
-        const row = blockRow(t, num_elements, arch);
+        const row = blockRow(t, num_elements, arch, opts);
         if (bs > 1 and row % bs != 0) {
             const narrower = blockFallback(ttype, row) orelse
                 return nearestCompatibleType(t, opts, num_elements, arch, .family);
@@ -1911,7 +1919,7 @@ fn assignTensorType(
         // q4_k's 256): re-run the blocking check on the type actually picked.
         if (opts.filetype == .gguf) {
             const bs = (gguf.GgmlType.fromString(t.type) catch unreachable).getBlockSize();
-            const row = blockRow(t, num_elements, arch);
+            const row = blockRow(t, num_elements, arch, opts);
             if (bs > 1 and row % bs != 0) {
                 const picked = types.DataType.fromString(t.type) catch unreachable;
                 // Put the tensor back as it arrived: the fallback reads t.type as
@@ -1969,11 +1977,15 @@ fn clusterEligible(t: *const types.Tensor, ttype: types.DataType, num_elements: 
 }
 
 /// The dim a GGUF reader blocks `t` along: its last, or 256 when `applyShapeFix`
-/// will reshape it. Readers need whole blocks per row, not just per tensor.
-fn blockRow(t: *const types.Tensor, num_elements: u64, arch: *const imagearch.Arch) u64 {
+/// may reshape it. Readers need whole blocks per row, not just per tensor.
+fn blockRow(t: *const types.Tensor, num_elements: u64, arch: *const imagearch.Arch, opts: ConvertOptions) u64 {
     if (t.dims.len == 0) return num_elements;
-    if (arch.shape_fix and shapeFixable(t.dims, num_elements)) return 256;
+    if (reshapesRows(arch, opts) and shapeFixable(t.dims, num_elements)) return 256;
     return t.dims[t.dims.len - 1];
+}
+
+fn reshapesRows(arch: *const imagearch.Arch, opts: ConvertOptions) bool {
+    return arch.shape_fix and opts.filetype == .gguf and Target.reshapesRows(opts.target);
 }
 
 /// The type to quantize to when `ttype`'s blocks do not divide `row`, following
@@ -2034,8 +2046,10 @@ fn nearestCompatibleType(
             // ComfyUI cannot carry bf16 in its shape math, so float tensors
             // upcast to F32 there. llama.cpp-family arches instead follow the
             // target's float width for 2-D tables (llama.cpp's own converter
-            // casts bf16 checkpoints to f16).
-            const target: gguf.GgmlType = if (arch.row_aligned_blocks and t.dims.len > 1) blk: {
+            // casts bf16 checkpoints to f16), and so does sd.cpp, which runs
+            // every conv weight as f16 whatever the file holds.
+            const width_follows = arch.row_aligned_blocks or opts.target == .sdcpp;
+            const target: gguf.GgmlType = if (width_follows and t.dims.len > 1) blk: {
                 const want = opts.datatype orelse break :blk .f16;
                 const g = gguf.GgmlType.fromString(@tagName(want)) catch break :blk .f16;
                 break :blk switch (g) {
@@ -2146,9 +2160,9 @@ fn shapeFixable(dims: []const usize, n_elements: u64) bool {
     return dims.len > 1 and n_elements >= REARRANGE_THRESHOLD and n_elements % 256 == 0;
 }
 
-/// Reshapes qualifying tensors to (N/256, 256) for ComfyUI compatibility and
-/// records their original shapes under "comfy.gguf.orig_shape.<name>" in
-/// `extra_metadata`.
+/// Reshapes to (N/256, 256) each tensor whose block quant does not divide its
+/// real row, recording the real shape under "comfy.gguf.orig_shape.<name>" in
+/// `extra_metadata`. Only ComfyUI-GGUF reads that back, so nothing else is reshaped.
 fn applyShapeFix(
     model_tensors: *std.ArrayList(types.Tensor),
     extra_metadata: *std.json.ObjectMap,
@@ -2162,7 +2176,8 @@ fn applyShapeFix(
         const last_dim = if (n_dims > 0) t.dims[n_dims - 1] else 0;
 
         if (!shapeFixable(t.dims, n_elements)) continue;
-        if (@mod(last_dim, 256) == 0) continue;
+        const bs = (gguf.GgmlType.fromString(t.type) catch continue).getBlockSize();
+        if (last_dim % bs == 0) continue;
 
         // Record original shape.
         var orig_shape_arr = std.json.Array.init(arena_alloc);
@@ -4350,6 +4365,66 @@ test "assignTensorType: a block type that does not fit falls back as llama.cpp's
             return e;
         };
         try testing.expectEqual(types.DataType.calcSizeInBytes(try types.DataType.fromString(c.want), n), t.size);
+    }
+}
+
+test "applyShapeFix reshapes only a block quant its real row cannot hold" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const Case = struct { name: []const u8, type: []const u8, dims: []const usize, reshaped: bool };
+    const cases = [_]Case{
+        // q8_0's 32-wide blocks already fit a 128-wide row.
+        .{ .name = "img_in.weight", .type = "q8_0", .dims = &.{ 4096, 128 }, .reshaped = false },
+        .{ .name = "txt_in.weight", .type = "q4_k", .dims = &.{ 4096, 128 }, .reshaped = true },
+        .{ .name = "conv.weight", .type = "f16", .dims = &.{ 320, 320, 3, 3 }, .reshaped = false },
+        .{ .name = "conv2.weight", .type = "q4_k", .dims = &.{ 320, 320, 3, 3 }, .reshaped = true },
+        .{ .name = "linear.weight", .type = "q4_k", .dims = &.{ 3072, 3072 }, .reshaped = false },
+    };
+    var tensors: std.ArrayList(types.Tensor) = .empty;
+    for (cases) |c| try tensors.append(a, .{ .name = c.name, .type = c.type, .dims = try a.dupe(usize, c.dims), .size = 0, .offset = 0 });
+    var meta: std.json.ObjectMap = .empty;
+    try applyShapeFix(&tensors, &meta, a);
+
+    var n_reshaped: usize = 0;
+    for (cases, tensors.items) |c, t| {
+        const key = try std.fmt.allocPrint(a, "comfy.gguf.orig_shape.{s}", .{c.name});
+        try testing.expectEqual(c.reshaped, meta.contains(key));
+        if (c.reshaped) {
+            n_reshaped += 1;
+            try testing.expectEqual(@as(usize, 256), t.dims[t.dims.len - 1]);
+        } else try testing.expectEqualSlices(usize, c.dims, t.dims);
+    }
+    try testing.expectEqual(n_reshaped, meta.count());
+}
+
+test "assignTensorType: the sd.cpp target keeps real rows and spares bf16 as f16" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const Case = struct { target: Target.Target, dims: []const usize, want: []const u8 };
+    const cases = [_]Case{
+        // A 128-wide img_in: blocked as 256-wide rows only where it is reshaped.
+        .{ .target = .sdcpp, .dims = &.{ 4096, 128 }, .want = "q5_0" },
+        .{ .target = .comfyui, .dims = &.{ 4096, 128 }, .want = "q4_k" },
+        // A 3x3 conv holds no block in its 3-wide row; sd.cpp runs it as f16 anyway.
+        .{ .target = .sdcpp, .dims = &.{ 320, 320, 3, 3 }, .want = "f16" },
+        .{ .target = .comfyui, .dims = &.{ 320, 320, 3, 3 }, .want = "q4_k" },
+        .{ .target = .custom, .dims = &.{ 320, 320, 3, 3 }, .want = "q4_k" },
+    };
+    for (cases) |c| {
+        var n: u64 = 1;
+        for (c.dims) |d| n *= d;
+        var opts = testOpts(.q4_k);
+        opts.target = c.target;
+        var t = types.Tensor{ .name = "blocks.0.linear.weight", .type = "BF16", .dims = @constCast(c.dims), .size = 0, .offset = 0 };
+        try assignTensorType(&t, n, &imagearch.flux, QUANTIZATION_THRESHOLD, opts, false, null, a);
+        testing.expectEqualStrings(c.want, t.type) catch |e| {
+            std.debug.print("{s} {any}\n", .{ @tagName(c.target), c.dims });
+            return e;
+        };
     }
 }
 

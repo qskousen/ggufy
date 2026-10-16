@@ -10,6 +10,8 @@ pub const Target = enum {
     /// ComfyUI for a diffusion model, llama.cpp for an LLM.
     auto,
     comfyui,
+    /// stable-diffusion.cpp.
+    sdcpp,
     llamacpp,
     transformers,
     /// No derivation: -f, -H and -A as given.
@@ -19,6 +21,7 @@ pub const Target = enum {
         return switch (self) {
             .auto => "automatic",
             .comfyui => "ComfyUI",
+            .sdcpp => "sd.cpp",
             .llamacpp => "llama.cpp",
             .transformers => "transformers",
             .custom => "custom",
@@ -30,12 +33,14 @@ pub const Kind = enum { diffusion, llm };
 
 pub const Consumer = enum {
     comfyui,
+    sdcpp,
     llamacpp,
     transformers,
 
     pub fn label(self: Consumer) []const u8 {
         return switch (self) {
             .comfyui => "ComfyUI",
+            .sdcpp => "sd.cpp",
             .llamacpp => "llama.cpp",
             .transformers => "transformers",
         };
@@ -126,11 +131,31 @@ fn comfyIssue(ft: types.FileType, t: types.DataType) ?[]const u8 {
     };
 }
 
+// The archs stable-diffusion.cpp's get_sd_version (model_loader.cpp) detects from
+// this tool's tensor names. It also misreads lumina2 as Z-Image and ltxv as LTX-2.
+const sdcpp_archs = [_][]const u8{ "flux", "sd1", "sdxl", "sd3", "anima", "hyvid", "wan", "qwen_image", "qwen_image21", "mage_flow", "ernie", "krea2", "flux3", "minimax_h3", "sensenova_u15" };
+
+pub fn sdcppLoads(arch_name: []const u8) bool {
+    return listed(&sdcpp_archs, arch_name);
+}
+
+/// Why stable-diffusion.cpp cannot read a tensor of type `t`, or null when it can.
+/// Its ggml reads every GGUF type; its safetensors reader (safetensors_io.cpp)
+/// takes plain floats and ints, fp8 with a per-tensor scale, and int8_tensorwise.
+fn sdcppIssue(t: types.DataType) ?[]const u8 {
+    if (t.formatType() == .gguf) return null;
+    return switch (t) {
+        .F64, .F32, .F16, .BF16, .F8_E4M3, .F8_E5M2, .SCALED_F8_E4M3, .INT8, .INT8_CONVROT, .I8, .I32, .I64 => null,
+        else => "sd.cpp has no reader for this safetensors layout",
+    };
+}
+
 /// Why `target` cannot load a tensor of type `t`, or null when it can. Only
 /// the type is judged here; the architecture and naming are `assess`'s.
 pub fn dtypeIssue(target: Target, t: types.DataType) ?[]const u8 {
     return switch (target) {
         .comfyui => comfyIssue(t.formatType(), t),
+        .sdcpp => sdcppIssue(t),
         .llamacpp => if (t.formatType() == .gguf) null else "llama.cpp reads GGUF types only",
         .transformers => if (t.formatType() == .safetensors and (t.isFloatType() or plainInt(t))) null else "transformers cannot load this tool's quantized layouts; use F16, BF16 or F32",
         .auto, .custom => null,
@@ -173,6 +198,11 @@ pub const Output = struct {
     /// The model has a vision tower, wherever it ends up.
     has_vision: bool = false,
     llama_heads: ?struct { head_count: u32, head_count_kv: u32 } = null,
+    /// Tensors stored reshaped to (n/256, 256), with the real shape only in
+    /// comfy.gguf.orig_shape metadata.
+    reshaped: usize = 0,
+    /// The fused projection layout the file carries, if any.
+    fused: ?Fusion = null,
     dtypes: std.EnumSet(types.DataType) = .initEmpty(),
 };
 
@@ -187,9 +217,10 @@ pub const Verdict = struct {
     warn: bool = false,
 };
 
-pub fn assess(out: Output, alloc: std.mem.Allocator) ![3]Verdict {
+pub fn assess(out: Output, alloc: std.mem.Allocator) ![4]Verdict {
     return .{
         try assessComfy(out, alloc),
+        try assessSdCpp(out, alloc),
         assessLlamaCpp(out),
         try assessTransformers(out, alloc),
     };
@@ -248,6 +279,27 @@ fn assessComfyGguf(out: Output, alloc: std.mem.Allocator) !Verdict {
     return .{ .consumer = .comfyui, .level = .yes, .note = via_ext };
 }
 
+// stable-diffusion.cpp checks every tensor's stored shape against its graph and
+// reads no GGUF metadata, so a reshaped tensor never loads there.
+fn assessSdCpp(out: Output, alloc: std.mem.Allocator) !Verdict {
+    if (out.kind != .diffusion) return .{ .consumer = .sdcpp, .level = .no, .note = "sd.cpp's target here is diffusion models" };
+    var it = out.dtypes.iterator();
+    while (it.next()) |t| if (sdcppIssue(t)) |why| {
+        return .{ .consumer = .sdcpp, .level = .no, .note = try std.fmt.allocPrint(alloc, "{s}: {s}", .{ @tagName(t), why }) };
+    };
+    if (out.reshaped > 0) return .{ .consumer = .sdcpp, .level = .no, .note = try std.fmt.allocPrint(alloc, "{d} tensors are stored reshaped for ComfyUI-GGUF, and sd.cpp reads the stored shape (--target sdcpp)", .{out.reshaped}) };
+    if (out.fused) |fu| if (!sdcppReadsFused(out.arch_name, fu))
+        return .{ .consumer = .sdcpp, .level = .no, .note = try std.fmt.allocPrint(alloc, "sd.cpp reads {s} only as split projections, not fused into {s} (--target sdcpp)", .{ out.arch_name, std.mem.trim(u8, fu.fused, ".") }) };
+    if (!sdcppLoads(out.arch_name)) return .{ .consumer = .sdcpp, .level = .partial, .warn = true, .note = try std.fmt.allocPrint(alloc, "sd.cpp does not detect {s}", .{out.arch_name}) };
+    return .{ .consumer = .sdcpp, .level = .yes };
+}
+
+/// Qwen-Image 2.1's model (qwen_image_2_1.hpp) takes its MLP fused or split;
+/// FLUX.3's (flux3.hpp) has only split q/k/v.
+fn sdcppReadsFused(arch_name: []const u8, fu: Fusion) bool {
+    return std.mem.eql(u8, arch_name, "qwen_image21") and std.mem.eql(u8, fu.fused, ".img_mlp.gate_up.");
+}
+
 fn assessLlamaCpp(out: Output) Verdict {
     const no: Verdict = .{ .consumer = .llamacpp, .level = .no };
     if (out.filetype != .gguf) return no;
@@ -280,6 +332,7 @@ pub fn verdictFor(verdicts: []const Verdict, c: Consumer) Verdict {
 pub fn targetVerdict(verdicts: []const Verdict, t: Target) ?Verdict {
     return switch (t) {
         .comfyui => verdictFor(verdicts, .comfyui),
+        .sdcpp => verdictFor(verdicts, .sdcpp),
         .llamacpp => verdictFor(verdicts, .llamacpp),
         .transformers => verdictFor(verdicts, .transformers),
         .auto, .custom => null,
@@ -324,6 +377,7 @@ pub fn resolve(target: Target, kind: Kind) Target {
 pub fn readsContainer(target: Target, kind: Kind, ft: types.FileType) bool {
     return switch (resolve(target, kind)) {
         .comfyui => true,
+        .sdcpp => kind == .diffusion,
         .llamacpp => kind == .llm and ft == .gguf,
         .transformers => kind == .llm and ft == .safetensors,
         .auto, .custom => true,
@@ -334,6 +388,7 @@ pub fn readsContainer(target: Target, kind: Kind, ft: types.FileType) bool {
 pub fn containerReason(target: Target, kind: Kind) ?[]const u8 {
     if (readsContainer(target, kind, .gguf) and readsContainer(target, kind, .safetensors)) return null;
     return switch (resolve(target, kind)) {
+        .sdcpp => "sd.cpp runs diffusion models.",
         .llamacpp => "llama.cpp reads GGUF only.",
         .transformers => "transformers reads safetensors.",
         else => unreachable,
@@ -350,18 +405,28 @@ pub fn hfNames(target: Target, kind: Kind, arch_name: []const u8, ft: types.File
         // Qwen3-VL, whose tower it reads from the same file.
         .comfyui => if (ft == .safetensors) source_is_gguf else std.mem.eql(u8, arch_name, "qwen3vl"),
         .transformers => source_is_gguf,
-        .llamacpp, .auto, .custom => false,
+        .sdcpp, .llamacpp, .auto, .custom => false,
     };
 }
 
 /// Split projections stored as one tensor, `parts` stacked along rows in order.
 pub const Fusion = struct { parts: []const []const u8, fused: []const u8 };
 
+/// Whether a shape_fix arch's GGUF may store a tensor as (n/256, 256) so a block quant
+/// fits it. Only ComfyUI-GGUF restores the real shape; ggml consumers read the stored one.
+pub fn reshapesRows(target: Target) bool {
+    return target != .sdcpp;
+}
+
 /// The split projections `target` takes fused for this architecture. ComfyUI maps LoRAs
 /// under either naming onto the fused layout but only the split names onto a split one,
 /// and runs a fused projection as one GEMM (with one activation quantization on int8).
 pub fn fusion(target: Target, arch_name: []const u8) ?Fusion {
-    if (target != .comfyui) return null;
+    return if (target == .comfyui) archFusion(arch_name) else null;
+}
+
+/// The fused layout ComfyUI takes for `arch_name`, whichever target is asked for.
+pub fn archFusion(arch_name: []const u8) ?Fusion {
     // Gate rows first, the order ComfyUI's SwiGLU chunks it in.
     if (std.mem.eql(u8, arch_name, "qwen_image21")) return .{ .parts = &.{ ".img_mlp.gate_layer.", ".img_mlp.proj." }, .fused = ".img_mlp.gate_up." };
     if (std.mem.eql(u8, arch_name, "flux3")) return .{ .parts = &.{ ".q_proj.", ".k_proj.", ".v_proj." }, .fused = ".qkv." };
@@ -390,6 +455,18 @@ pub fn plan(target: Target, kind: Kind, arch_name: []const u8, datatype: ?types.
                 return error.TargetCannotLoad;
             }
             return .{ .target = t, .filetype = ft, .hf_names = hf };
+        },
+        .sdcpp => {
+            if (kind != .diffusion) {
+                why.* = try std.fmt.allocPrint(alloc, "sd.cpp's target here is diffusion models; {s} is an LLM", .{arch_name});
+                return error.TargetCannotLoad;
+            }
+            if (datatype) |d| if (sdcppIssue(d)) |reason| {
+                why.* = try std.fmt.allocPrint(alloc, "{s}: {s}", .{ @tagName(d), reason });
+                return error.TargetCannotLoad;
+            };
+            const ft = container orelse if (source_is_gguf) types.FileType.gguf else .safetensors;
+            return .{ .target = t, .filetype = ft, .hf_names = false };
         },
         .llamacpp => {
             if (kind != .llm) {
@@ -433,7 +510,7 @@ pub fn plan(target: Target, kind: Kind, arch_name: []const u8, datatype: ?types.
 pub fn targetsFor(kind: ?Kind) []const Target {
     const k = kind orelse return &.{.custom};
     return switch (k) {
-        .diffusion => &.{ .comfyui, .custom },
+        .diffusion => &.{ .comfyui, .sdcpp, .custom },
         .llm => &.{ .comfyui, .llamacpp, .transformers, .custom },
     };
 }
@@ -545,7 +622,7 @@ test "targetsFor offers exactly the targets that plan a model of that kind" {
     const a = arena.allocator();
     var why: []const u8 = "";
     for ([_]Kind{ .diffusion, .llm }) |k| {
-        for ([_]Target{ .comfyui, .llamacpp, .transformers }) |t| {
+        for ([_]Target{ .comfyui, .sdcpp, .llamacpp, .transformers }) |t| {
             const offered = std.mem.indexOfScalar(Target, targetsFor(k), t) != null;
             const plans = if (plan(t, k, "qwen3", null, null, false, true, a, &why)) |_| true else |_| false;
             try testing.expectEqual(plans, offered);
@@ -593,13 +670,13 @@ test "ComfyUI GGUF verdicts warn, never refuse, outside what ComfyUI-GGUF loads 
     const a = arena.allocator();
     const ok = try assess(.{ .kind = .diffusion, .filetype = .gguf, .arch_name = "flux", .dtypes = set(&.{ .q4_k, .f32, .bf16 }) }, a);
     try testing.expectEqual(Level.yes, verdictFor(&ok, .comfyui).level);
-    try testing.expectEqualStrings("ComfyUI (through a GGUF loader extension such as ComfyUI-GGUF)", try worksWith(&ok, a));
+    try testing.expectEqualStrings("ComfyUI (through a GGUF loader extension such as ComfyUI-GGUF); sd.cpp", try worksWith(&ok, a));
     try testing.expectEqualStrings("", try warning(&ok, .comfyui, a));
     const unlisted = try assess(.{ .kind = .diffusion, .filetype = .gguf, .arch_name = "qwen_image21", .dtypes = set(&.{.q4_k}) }, a);
     try testing.expectEqual(Level.partial, verdictFor(&unlisted, .comfyui).level);
     try testing.expectEqualStrings("", try problem("", &unlisted, .comfyui, a));
     try testing.expectEqualStrings("ComfyUI may not load this output, or may run it poorly: ComfyUI-GGUF does not load qwen_image21, so it needs a GGUF loader extension that does", try warning(&unlisted, .comfyui, a));
-    try testing.expectEqualStrings("ComfyUI (may not work, or work poorly: ComfyUI-GGUF does not load qwen_image21, so it needs a GGUF loader extension that does)", try worksWith(&unlisted, a));
+    try testing.expectEqualStrings("ComfyUI (may not work, or work poorly: ComfyUI-GGUF does not load qwen_image21, so it needs a GGUF loader extension that does); sd.cpp", try worksWith(&unlisted, a));
     try testing.expectEqualStrings("", try warning(&unlisted, .custom, a));
 
     // No decoder, a slow CPU-only one, and both problems at once all warn.
@@ -707,4 +784,46 @@ test "a llama GGUF with no head counts is not promised to ComfyUI-GGUF" {
     const v = try assess(.{ .kind = .llm, .filetype = .gguf, .arch_name = "llama", .dtypes = set(&.{.q4_k}) }, arena.allocator());
     try testing.expectEqual(Level.partial, verdictFor(&v, .comfyui).level);
     try testing.expect(verdictFor(&v, .comfyui).warn);
+}
+
+test "sd.cpp target plans diffusion models, in either container, and never reshapes" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var why: []const u8 = "";
+    try testing.expectEqual(types.FileType.gguf, (try plan(.sdcpp, .diffusion, "flux", .q4_k, null, false, false, a, &why)).filetype);
+    try testing.expectEqual(types.FileType.safetensors, (try plan(.sdcpp, .diffusion, "flux", .INT8_CONVROT, null, false, false, a, &why)).filetype);
+    try testing.expectError(error.TargetCannotLoad, plan(.sdcpp, .diffusion, "flux", .NVFP4, null, false, false, a, &why));
+    try testing.expectError(error.TargetCannotLoad, plan(.sdcpp, .llm, "qwen3", .q4_k, null, false, false, a, &why));
+    try testing.expect(!reshapesRows(.sdcpp));
+    try testing.expect(reshapesRows(.comfyui) and reshapesRows(.custom));
+    try testing.expect(fusion(.sdcpp, "flux3") == null);
+}
+
+test "sd.cpp verdicts refuse reshaped tensors and fusions it has no slot for" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const plain = try assess(.{ .kind = .diffusion, .filetype = .gguf, .arch_name = "flux", .dtypes = set(&.{ .q4_k, .q5_0, .f32 }) }, a);
+    try testing.expectEqual(Level.yes, verdictFor(&plain, .sdcpp).level);
+    try testing.expectEqual(Level.yes, verdictFor(&plain, .comfyui).level);
+
+    const reshaped = try assess(.{ .kind = .diffusion, .filetype = .gguf, .arch_name = "flux", .reshaped = 2, .dtypes = set(&.{.q4_k}) }, a);
+    try testing.expectEqual(Level.no, verdictFor(&reshaped, .sdcpp).level);
+    try testing.expectEqual(Level.yes, verdictFor(&reshaped, .comfyui).level);
+    try testing.expect(std.mem.indexOf(u8, try problem("", &reshaped, .sdcpp, a), "reshaped") != null);
+
+    const qkv = try assess(.{ .kind = .diffusion, .filetype = .gguf, .arch_name = "flux3", .fused = archFusion("flux3"), .dtypes = set(&.{.q4_k}) }, a);
+    try testing.expectEqual(Level.no, verdictFor(&qkv, .sdcpp).level);
+    const gate_up = try assess(.{ .kind = .diffusion, .filetype = .gguf, .arch_name = "qwen_image21", .fused = archFusion("qwen_image21"), .dtypes = set(&.{.q4_k}) }, a);
+    try testing.expectEqual(Level.yes, verdictFor(&gate_up, .sdcpp).level);
+
+    const unlisted = try assess(.{ .kind = .diffusion, .filetype = .gguf, .arch_name = "cosmos", .dtypes = set(&.{.q4_k}) }, a);
+    try testing.expect(verdictFor(&unlisted, .sdcpp).warn);
+    try testing.expectEqualStrings("", try problem("", &unlisted, .sdcpp, a));
+
+    const mx = try assess(.{ .kind = .diffusion, .filetype = .safetensors, .arch_name = "flux", .dtypes = set(&.{ .BF16, .MXFP8_E4M3 }) }, a);
+    try testing.expectEqual(Level.no, verdictFor(&mx, .sdcpp).level);
+    const int8 = try assess(.{ .kind = .diffusion, .filetype = .safetensors, .arch_name = "flux", .dtypes = set(&.{ .BF16, .F32, .INT8_CONVROT }) }, a);
+    try testing.expectEqual(Level.yes, verdictFor(&int8, .sdcpp).level);
 }
