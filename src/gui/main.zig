@@ -1035,9 +1035,17 @@ fn showInputFile() void {
                     .margin = .{ .x = 0, .y = 8, .w = 0, .h = 2 },
                     .color_text = dim_color,
                 });
+                if (state.predictProblem().len > 0) {
+                    var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal, .background = false, .margin = .{ .x = 0, .y = 2, .w = 0, .h = 2 } });
+                    tl.addText(state.predictProblem(), .{ .color_text = dvui.Color{ .r = 200, .g = 140, .b = 0, .a = 255 } });
+                    tl.deinit();
+                }
             }
             if (state.worksWith().len > 0) {
-                dvui.label(@src(), "Works with: {s}", .{state.worksWith()}, .{ .margin = .{ .x = 0, .y = 2, .w = 0, .h = 2 } });
+                var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal, .background = false, .margin = .{ .x = 0, .y = 2, .w = 0, .h = 2 } });
+                tl.addText("Works with: ", .{});
+                tl.addText(state.worksWith(), .{});
+                tl.deinit();
             }
         }
         const target_problem = state.targetProblem();
@@ -1305,7 +1313,7 @@ fn convertErrorHint(err: anyerror) ?[]const u8 {
 }
 
 fn showConvertError() void {
-    var outer = dvui.box(@src(), .{}, .{ .gravity_x = 0.5, .gravity_y = 0.5 });
+    var outer = dvui.box(@src(), .{}, .{ .gravity_y = 0.5, .expand = .horizontal, .padding = .{ .x = 24, .y = 0, .w = 24, .h = 0 } });
     defer outer.deinit();
 
     dvui.label(@src(), "Conversion failed: {}", .{state.convert_error.?}, .{ .gravity_x = 0.5, .font = .theme(.title) });
@@ -1315,6 +1323,11 @@ fn showConvertError() void {
     // wrong until you know the rule.
     if (convertErrorHint(state.convert_error.?)) |hint| {
         dvui.label(@src(), "{s}", .{hint}, .{ .gravity_x = 0.5 });
+    } else if (state.predictProblem().len > 0) {
+        // The prediction ran with these same options, so its reason is this failure's.
+        var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal, .background = false });
+        tl.addText(state.predictProblem(), .{});
+        tl.deinit();
     }
 
     {

@@ -127,6 +127,9 @@ pub const State = struct {
     works_with_len: usize = 0,
     target_problem_buf: [512]u8 = undefined,
     target_problem_len: usize = 0,
+    /// Why there is no prediction, when the reason is the template.
+    predict_problem_buf: [512]u8 = undefined,
+    predict_problem_len: usize = 0,
 
     // Overwrite confirmation
     overwrite_pending_path_buf: [std.fs.max_path_bytes]u8 = undefined,
@@ -182,6 +185,10 @@ pub const State = struct {
 
     pub fn targetProblem(self: *const State) []const u8 {
         return self.target_problem_buf[0..self.target_problem_len];
+    }
+
+    pub fn predictProblem(self: *const State) []const u8 {
+        return self.predict_problem_buf[0..self.predict_problem_len];
     }
 
     /// A hash of every option that affects the predicted output size. When it changes,

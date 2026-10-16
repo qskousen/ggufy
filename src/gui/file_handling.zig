@@ -355,6 +355,7 @@ pub fn predictSize(alloc: std.mem.Allocator, state: *guiState.State) ?u64 {
     if (!state.allow_unknown_arch) state.pretok_unknown = false;
     state.works_with_len = 0;
     state.target_problem_len = 0;
+    state.predict_problem_len = 0;
     if (state.file_selected == null or state.target_dtype == null) return null;
     const path = state.file_selected.?;
 
@@ -398,6 +399,9 @@ fn predictFor(f: anytype, base: conv.ConvertOptions, alloc: std.mem.Allocator, p
     if (why.len > 0) copyText(&state.target_problem_buf, &state.target_problem_len, why);
     const pred = conv.predictOutput(f, opts, alloc, pa) catch |e| {
         state.pretok_unknown = e == error.UnknownPretokenizer;
+        if (opts.template_path) |tp| {
+            if (conv.templateRuleProblem(state.io, tp, opts.filetype, pa)) |msg| copyText(&state.predict_problem_buf, &state.predict_problem_len, msg);
+        }
         return null;
     };
     copyText(&state.works_with_buf, &state.works_with_len, Target.worksWith(&pred.verdicts, pa) catch "");

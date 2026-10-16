@@ -1524,19 +1524,34 @@ fn parseTensorTypeRules(path: []const u8, content: []const u8, filetype: types.F
     var bad: []const u8 = "";
     const rules = try arena_alloc.create(TensorTypeRules);
     rules.* = TensorTypeRules.parse(arena_alloc, content, filetype, &bad) catch |e| {
-        switch (e) {
-            error.NoTensorTypeRules => std.log.err("{s} holds no type rules, and is not a JSON template", .{path}),
-            error.MalformedTensorTypeRule => std.log.err("{s}: \"{s}\" is not a pattern=type entry", .{ path, bad }),
-            error.InvalidTensorTypeRulePattern => std.log.err("{s}: the pattern in \"{s}\" is not a valid regular expression", .{ path, bad }),
-            error.UnsupportedTensorTypeRulePattern => std.log.err("{s}: the pattern in \"{s}\" uses lookaround, a backreference or another feature this tool's matcher lacks", .{ path, bad }),
-            error.TensorTypeRulePatternTooLarge => std.log.err("{s}: the pattern in \"{s}\" is too large to compile; use smaller repetition counts", .{ path, bad }),
-            error.UnknownTensorTypeRuleType => std.log.err("{s}: \"{s}\" names a type this tool cannot write", .{ path, bad }),
-            error.TensorTypeRuleTypeNotInFormat => std.log.err("{s}: the type in \"{s}\" cannot be stored in a {s} file", .{ path, bad, @tagName(filetype) }),
-            error.OutOfMemory => {},
-        }
+        if (e != error.OutOfMemory) std.log.err("{s}", .{try tensorTypeRuleMessage(arena_alloc, path, e, bad, filetype)});
         return e;
     };
     return rules;
+}
+
+fn tensorTypeRuleMessage(alloc: std.mem.Allocator, name: []const u8, err: TensorTypeRules.ParseError, bad: []const u8, filetype: types.FileType) ![]const u8 {
+    return switch (err) {
+        error.NoTensorTypeRules => std.fmt.allocPrint(alloc, "{s} holds no type rules, and is not a JSON template", .{name}),
+        error.MalformedTensorTypeRule => std.fmt.allocPrint(alloc, "{s}: \"{s}\" is not a pattern=type entry", .{ name, bad }),
+        error.InvalidTensorTypeRulePattern => std.fmt.allocPrint(alloc, "{s}: the pattern in \"{s}\" is not a valid regular expression", .{ name, bad }),
+        error.UnsupportedTensorTypeRulePattern => std.fmt.allocPrint(alloc, "{s}: the pattern in \"{s}\" uses lookaround, a backreference or another feature this tool's matcher lacks", .{ name, bad }),
+        error.TensorTypeRulePatternTooLarge => std.fmt.allocPrint(alloc, "{s}: the pattern in \"{s}\" is too large to compile; use smaller repetition counts", .{ name, bad }),
+        error.UnknownTensorTypeRuleType => std.fmt.allocPrint(alloc, "{s}: \"{s}\" names a type this tool cannot write", .{ name, bad }),
+        error.TensorTypeRuleTypeNotInFormat => std.fmt.allocPrint(alloc, "{s}: the type in \"{s}\" cannot be stored in a {s} file", .{ name, bad, @tagName(filetype) }),
+        error.OutOfMemory => error.OutOfMemory,
+    };
+}
+
+/// Why the llama.cpp type file at `path` cannot be used for a `filetype`
+/// output, as convert logs it; null when it parses or is a JSON template.
+pub fn templateRuleProblem(io: std.Io, path: []const u8, filetype: types.FileType, arena_alloc: std.mem.Allocator) ?[]const u8 {
+    const content = readTemplate(io, path, arena_alloc) catch |e| return std.fmt.allocPrint(arena_alloc, "{s}: cannot be read ({t})", .{ std.fs.path.basename(path), e }) catch null;
+    if (!TensorTypeRules.isRuleFile(content)) return null;
+    var bad: []const u8 = "";
+    _ = TensorTypeRules.parse(arena_alloc, content, filetype, &bad) catch |e|
+        return tensorTypeRuleMessage(arena_alloc, std.fs.path.basename(path), e, bad, filetype) catch null;
+    return null;
 }
 
 /// Filters `model_tensors` down to only the tensors listed in the template,
@@ -4534,6 +4549,12 @@ test "a type file names, plans and guards the output by the types its rules assi
     st_opts.template_path = st_path;
     st_opts.tensor_type_rules = (try loadTemplateRules(st_opts, a)).?;
     try testing.expectEqualStrings("/models/x-BF16.safetensors", try computeOutputPath(st_opts, false, a));
+
+    try testing.expect(templateRuleProblem(io, st_path, .safetensors, a) == null);
+    try testing.expectEqualStrings(
+        "rules.txt: the type in \"ffn_.*=q2_K\" cannot be stored in a safetensors file",
+        templateRuleProblem(io, path, .safetensors, a).?,
+    );
 
     // -d picks the container, so a rule type only the other one holds cannot move it.
     const mixed_path = try std.fmt.allocPrint(a, "{s}/mixed.txt", .{dir});
