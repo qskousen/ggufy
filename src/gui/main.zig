@@ -447,7 +447,7 @@ fn showInputFile() void {
         // Store base stem for later auto-regeneration. Stripped of any dtype the
         // source name already carries, so re-converting ggufy's own output does
         // not stack them - same rule the CLI path uses.
-        const stem = conv.stripDtypeSuffix(std.fs.path.stem(state.file_selected.?));
+        const stem = conv.stripDtypeSuffix(conv.sourceStem(state.io, state.file_selected.?));
         const stem_len = @min(stem.len, state.filename_base_stem_buf.len - 1);
         @memcpy(state.filename_base_stem_buf[0..stem_len], stem[0..stem_len]);
         state.filename_base_stem_len = stem_len;

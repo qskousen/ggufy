@@ -63,8 +63,12 @@ pub fn parse(arena: std.mem.Allocator, content: []const u8, filetype: ?types.Fil
 
 /// The first rule whose pattern occurs in `name`. The caller counts its `hits`.
 pub fn find(self: TensorTypeRules, name: []const u8) ?*Rule {
-    for (self.rules) |*r| {
-        if (r.regex.search(name)) return r;
+    return &self.rules[self.findIndex(name) orelse return null];
+}
+
+pub fn findIndex(self: TensorTypeRules, name: []const u8) ?usize {
+    for (self.rules, 0..) |*r, i| {
+        if (r.regex.search(name)) return i;
     }
     return null;
 }

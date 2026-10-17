@@ -441,6 +441,12 @@ fn looksLikeDtype(suffix: []const u8) bool {
     return types.DataType.fromString(lower[0..underscore]) != error.InvalidDataType;
 }
 
+/// A checkpoint directory's whole name, since `Qwen3.5-9B` has no extension to drop.
+pub fn sourceStem(io: std.Io, path: []const u8) []const u8 {
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return std.fs.path.stem(path);
+    return if (stat.kind == .directory) std.fs.path.basename(path) else std.fs.path.stem(path);
+}
+
 /// Compute the output file path that `convert` would write to, without
 /// performing any actual conversion.  Useful for overwrite checks in the GUI.
 pub fn computeOutputPath(opts: ConvertOptions, hf_layout: bool, arena_alloc: std.mem.Allocator) ![]const u8 {
@@ -450,7 +456,7 @@ pub fn computeOutputPath(opts: ConvertOptions, hf_layout: bool, arena_alloc: std
         .safetensors => "safetensors",
     };
     const base_name = if (opts.output_name) |on| on else if (hf_layout) "model" else blk: {
-        const stem = stripDtypeSuffix(std.fs.path.stem(opts.path));
+        const stem = stripDtypeSuffix(sourceStem(opts.io, opts.path));
         const resolved = namingType(opts, arena_alloc);
         const dtype_str = switch (opts.filetype) {
             .gguf => @tagName(resolved orelse types.DataType.f16),
@@ -1500,7 +1506,7 @@ fn namingType(opts: ConvertOptions, arena_alloc: std.mem.Allocator) ?types.DataT
     return opts.datatype orelse lowestTemplateType(opts, arena_alloc);
 }
 
-/// `assignQuantTypes` under `rules`, warning about any rule that set no tensor's type.
+/// `assignQuantTypes` under `rules`, warning about any rule that doesn't hit any tensors.
 fn assignWithRules(
     model_tensors: *std.ArrayList(types.Tensor),
     arch: *const imagearch.Arch,
@@ -1513,9 +1519,25 @@ fn assignWithRules(
     ropts.tensor_type_rules = rules;
     for (rules.rules) |*r| r.hits = 0;
     try assignQuantTypes(model_tensors, arch, threshold, ropts, arena_alloc);
-    for (rules.rules) |r| if (r.hits == 0) {
-        std.log.warn("type rule {s}={s} changed nothing: it matches no tensor that can take its type", .{ r.pattern, @tagName(r.type) });
+    const first = try arena_alloc.alloc(?usize, model_tensors.items.len);
+    for (model_tensors.items, first) |t, *f| f.* = rules.findIndex(t.name);
+    for (rules.rules, 0..) |*r, i| if (r.hits == 0) {
+        if (shadowingRule(model_tensors.items, first, r, i)) |s| {
+            const w = rules.rules[s.rule];
+            std.log.warn("type rule {s}={s} applied to no tensors: the earlier rule {s}={s} matches {s} first", .{ r.pattern, @tagName(r.type), w.pattern, @tagName(w.type), s.tensor });
+        } else {
+            std.log.warn("type rule {s}={s} does not match any tensors, so it was not used", .{ r.pattern, @tagName(r.type) });
+        }
     };
+}
+
+/// An earlier rule that `rule` (at `index`) loses a tensor to, given each tensor's first matching rule.
+fn shadowingRule(tensors: []const types.Tensor, first: []const ?usize, rule: *TensorTypeRules.Rule, index: usize) ?struct { rule: usize, tensor: []const u8 } {
+    for (tensors, first) |t, f| {
+        const w = f orelse continue;
+        if (w < index and rule.regex.search(t.name)) return .{ .rule = w, .tensor = t.name };
+    }
+    return null;
 }
 
 /// Parses a llama.cpp type file's `content`, logging what is wrong with it against `path`.
@@ -1535,9 +1557,9 @@ fn tensorTypeRuleMessage(alloc: std.mem.Allocator, name: []const u8, err: Tensor
         error.NoTensorTypeRules => std.fmt.allocPrint(alloc, "{s} holds no type rules, and is not a JSON template", .{name}),
         error.MalformedTensorTypeRule => std.fmt.allocPrint(alloc, "{s}: \"{s}\" is not a pattern=type entry", .{ name, bad }),
         error.InvalidTensorTypeRulePattern => std.fmt.allocPrint(alloc, "{s}: the pattern in \"{s}\" is not a valid regular expression", .{ name, bad }),
-        error.UnsupportedTensorTypeRulePattern => std.fmt.allocPrint(alloc, "{s}: the pattern in \"{s}\" uses lookaround, a backreference or another feature this tool's matcher lacks", .{ name, bad }),
+        error.UnsupportedTensorTypeRulePattern => std.fmt.allocPrint(alloc, "{s}: the pattern in \"{s}\" uses lookaround, a backreference or another feature ggufy does not support", .{ name, bad }),
         error.TensorTypeRulePatternTooLarge => std.fmt.allocPrint(alloc, "{s}: the pattern in \"{s}\" is too large to compile; use smaller repetition counts", .{ name, bad }),
-        error.UnknownTensorTypeRuleType => std.fmt.allocPrint(alloc, "{s}: \"{s}\" names a type this tool cannot write", .{ name, bad }),
+        error.UnknownTensorTypeRuleType => std.fmt.allocPrint(alloc, "{s}: \"{s}\" is an unknown type", .{ name, bad }),
         error.TensorTypeRuleTypeNotInFormat => std.fmt.allocPrint(alloc, "{s}: the type in \"{s}\" cannot be stored in a {s} file", .{ name, bad, @tagName(filetype) }),
         error.OutOfMemory => error.OutOfMemory,
     };
@@ -4339,6 +4361,27 @@ test "assignTensorType: a type rule beats -d, sensitivities and floors, but not 
     // The router rule set nothing, so it must not count as used.
     try testing.expectEqual(@as(usize, 0), rules.rules[3].hits);
     try testing.expectEqual(@as(usize, 1), rules.rules[1].hits);
+}
+
+test "a rule an earlier, shorter pattern always beats names that rule" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var bad: []const u8 = "";
+    const rules = try TensorTypeRules.parse(a, "blk.0.ssm_a=f32 blk.0.ssm_alpha.weight=bf16 blk.0.ssm_beta.weight=bf16 blk.9.attn_q=q8_0", .gguf, &bad);
+    const tensors = [_]types.Tensor{
+        .{ .name = "blk.0.ssm_a", .type = "f32", .dims = &.{}, .size = 0, .offset = 0 },
+        .{ .name = "blk.0.ssm_alpha.weight", .type = "f32", .dims = &.{}, .size = 0, .offset = 0 },
+        .{ .name = "blk.0.ssm_beta.weight", .type = "bf16", .dims = &.{}, .size = 0, .offset = 0 },
+    };
+    var first: [tensors.len]?usize = undefined;
+    for (tensors, &first) |t, *f| f.* = rules.findIndex(t.name);
+
+    const s = shadowingRule(&tensors, &first, &rules.rules[1], 1).?;
+    try testing.expectEqual(@as(usize, 0), s.rule);
+    try testing.expectEqualStrings("blk.0.ssm_alpha.weight", s.tensor);
+    try testing.expect(shadowingRule(&tensors, &first, &rules.rules[2], 2) == null);
+    try testing.expect(shadowingRule(&tensors, &first, &rules.rules[3], 3) == null);
 }
 
 test "assignTensorType: a block type that does not fit falls back as llama.cpp's tensor_type_fallback does" {
@@ -7205,6 +7248,31 @@ test "computeOutputPath names a template's output after its average bit rate" {
     opts.template_path = "/nonexistent/none.json";
     const fallback = try computeOutputPath(opts, false, a);
     try testing.expect(std.mem.endsWith(u8, fallback, "model-f16.gguf"));
+}
+
+test "a checkpoint directory with a dot in its name keeps the whole name" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const ts_ns: i96 = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    const token: u64 = @as(u64, @bitCast(@as(i64, @truncate(ts_ns)))) ^ @as(u64, @intFromPtr(&arena));
+    const root = try std.fmt.allocPrint(a, "/tmp/ggufy_stem_test_{x}", .{token});
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const model_dir = try std.fmt.allocPrint(a, "{s}/Qwen3.5-9B", .{root});
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io, model_dir, .default_dir);
+
+    var opts = testOpts(.q4_k);
+    opts.io = io;
+    opts.path = model_dir;
+    const out = try computeOutputPath(opts, false, a);
+    try testing.expectEqualStrings("Qwen3.5-9B-q4_k.gguf", std.fs.path.basename(out));
+    try testing.expectEqualStrings("mmproj-Qwen3.5-9B-q4_k.gguf", std.fs.path.basename(try mmprojPath(out, a)));
+
+    // A file still loses its extension, and only that.
+    opts.path = "/models/Qwen2.5-0.5B-Instruct.safetensors";
+    try testing.expectEqualStrings("Qwen2.5-0.5B-Instruct-q4_k.gguf", std.fs.path.basename(try computeOutputPath(opts, false, a)));
 }
 
 test "stripDtypeSuffix removes a trailing dtype and nothing else" {
