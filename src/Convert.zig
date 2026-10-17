@@ -1522,22 +1522,45 @@ fn assignWithRules(
     const first = try arena_alloc.alloc(?usize, model_tensors.items.len);
     for (model_tensors.items, first) |t, *f| f.* = rules.findIndex(t.name);
     for (rules.rules, 0..) |*r, i| if (r.hits == 0) {
-        if (shadowingRule(model_tensors.items, first, r, i)) |s| {
-            const w = rules.rules[s.rule];
-            std.log.warn("type rule {s}={s} applied to no tensors: the earlier rule {s}={s} matches {s} first", .{ r.pattern, @tagName(r.type), w.pattern, @tagName(w.type), s.tensor });
-        } else {
-            std.log.warn("type rule {s}={s} does not match any tensors, so it was not used", .{ r.pattern, @tagName(r.type) });
+        const p = r.pattern;
+        const ty = @tagName(r.type);
+        switch (unusedRule(model_tensors.items, first, r, i)) {
+            .shadowed => |s| {
+                const w = rules.rules[s.rule];
+                std.log.warn("type rule {s}={s} not applied: earlier rule {s}={s} matches {s} first", .{ p, ty, w.pattern, @tagName(w.type), s.tensor });
+            },
+            .kept => |k| std.log.warn("type rule {s}={s} not applied: {s} is kept as {s}", .{ p, ty, k.tensor, k.type }),
+            .unmatched => std.log.warn("type rule {s}={s} matches no tensor", .{ p, ty }),
+            .satisfied => {},
         }
     };
 }
 
-/// An earlier rule that `rule` (at `index`) loses a tensor to, given each tensor's first matching rule.
-fn shadowingRule(tensors: []const types.Tensor, first: []const ?usize, rule: *TensorTypeRules.Rule, index: usize) ?struct { rule: usize, tensor: []const u8 } {
+const UnusedRule = union(enum) {
+    /// An earlier rule matches this tensor first.
+    shadowed: struct { rule: usize, tensor: []const u8 },
+    /// The tensor's type is fixed before rules are consulted, as a 1-D tensor's is f32.
+    kept: struct { tensor: []const u8, type: []const u8 },
+    /// Every tensor it matches already has its type.
+    satisfied,
+    unmatched,
+};
+
+/// Why `rule` (at `index`) set no tensor's type, given each tensor's first matching rule.
+fn unusedRule(tensors: []const types.Tensor, first: []const ?usize, rule: *TensorTypeRules.Rule, index: usize) UnusedRule {
+    var kept: ?UnusedRule = null;
+    var matched = false;
     for (tensors, first) |t, f| {
-        const w = f orelse continue;
-        if (w < index and rule.regex.search(t.name)) return .{ .rule = w, .tensor = t.name };
+        if (!rule.regex.search(t.name)) continue;
+        matched = true;
+        if (f.? < index) return .{ .shadowed = .{ .rule = f.?, .tensor = t.name } };
+        if (kept != null) continue;
+        // A tensor left at its source type is still spelled for the source container.
+        const dt = types.DataType.fromString(t.type) catch continue;
+        const out = dt.forFormat(rule.type.formatType()) catch dt;
+        if (out != rule.type) kept = .{ .kept = .{ .tensor = t.name, .type = @tagName(out) } };
     }
-    return null;
+    return kept orelse if (matched) .satisfied else .unmatched;
 }
 
 /// Parses a llama.cpp type file's `content`, logging what is wrong with it against `path`.
@@ -4363,25 +4386,33 @@ test "assignTensorType: a type rule beats -d, sensitivities and floors, but not 
     try testing.expectEqual(@as(usize, 1), rules.rules[1].hits);
 }
 
-test "a rule an earlier, shorter pattern always beats names that rule" {
+test "a rule that set no tensor's type is told apart by why" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     var bad: []const u8 = "";
-    const rules = try TensorTypeRules.parse(a, "blk.0.ssm_a=f32 blk.0.ssm_alpha.weight=bf16 blk.0.ssm_beta.weight=bf16 blk.9.attn_q=q8_0", .gguf, &bad);
+    const rules = try TensorTypeRules.parse(a,
+        \\blk.0.ssm_a=f32 blk.0.ssm_alpha.weight=bf16 blk.0.attn_norm.weight=f32
+        \\blk.0.ssm_conv1d.weight=bf16 blk.9.attn_q=q8_0
+    , .gguf, &bad);
+    // Types as assignTensorType leaves them.
     const tensors = [_]types.Tensor{
         .{ .name = "blk.0.ssm_a", .type = "f32", .dims = &.{}, .size = 0, .offset = 0 },
         .{ .name = "blk.0.ssm_alpha.weight", .type = "f32", .dims = &.{}, .size = 0, .offset = 0 },
-        .{ .name = "blk.0.ssm_beta.weight", .type = "bf16", .dims = &.{}, .size = 0, .offset = 0 },
+        .{ .name = "blk.0.attn_norm.weight", .type = "F32", .dims = &.{}, .size = 0, .offset = 0 },
+        .{ .name = "blk.0.ssm_conv1d.weight", .type = "f32", .dims = &.{}, .size = 0, .offset = 0 },
     };
     var first: [tensors.len]?usize = undefined;
     for (tensors, &first) |t, *f| f.* = rules.findIndex(t.name);
 
-    const s = shadowingRule(&tensors, &first, &rules.rules[1], 1).?;
+    const s = unusedRule(&tensors, &first, &rules.rules[1], 1).shadowed;
     try testing.expectEqual(@as(usize, 0), s.rule);
     try testing.expectEqualStrings("blk.0.ssm_alpha.weight", s.tensor);
-    try testing.expect(shadowingRule(&tensors, &first, &rules.rules[2], 2) == null);
-    try testing.expect(shadowingRule(&tensors, &first, &rules.rules[3], 3) == null);
+    try testing.expect(unusedRule(&tensors, &first, &rules.rules[2], 2) == .satisfied);
+    const k = unusedRule(&tensors, &first, &rules.rules[3], 3).kept;
+    try testing.expectEqualStrings("blk.0.ssm_conv1d.weight", k.tensor);
+    try testing.expectEqualStrings("f32", k.type);
+    try testing.expect(unusedRule(&tensors, &first, &rules.rules[4], 4) == .unmatched);
 }
 
 test "assignTensorType: a block type that does not fit falls back as llama.cpp's tensor_type_fallback does" {

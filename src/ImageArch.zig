@@ -1120,11 +1120,18 @@ pub const sensenova_u15 = Arch{
     // why llama.cpp's k-quant mixes upgrade `ffn_down` too.
     //
     // Base copy only: the `_mot_gen` tower sits at cosine 0.9889 on a fixed prefix
-    // and taking its `down_proj` dense moves that by 0.0002, so the sensitivity is
-    // the deep causal text pass rather than the layer's shape. The substring keeps
+    // and taking its `down_proj` dense moves that by 0.0002. The substring keeps
     // the two apart on its own - `mlp_mot_gen.down_proj` does not contain `mlp.`.
+    //
+    // The generation tower's gate and up projections are floored for the velocity
+    // instead. At int4 convrot (16% weight error, per-row scale) each alone costs a
+    // 0.27 / 0.17 rel L2 velocity error where every other role costs under 0.02,
+    // and the whole file renders as noise; at 8 bits the file renders clean and its
+    // velocity error drops from 0.22 to 0.043. Measured on int4 convrot only.
     .precision_floor = &.{
         .{ .key = "mlp.down_proj", .min = .bits8 },
+        .{ .key = "mlp_mot_gen.gate_proj", .min = .bits8 },
+        .{ .key = "mlp_mot_gen.up_proj", .min = .bits8 },
     },
     // RMSNorm scales: each branch's per-head q/k norms (over half a head_dim,
     // split again for the h/w rope halves), its two per-block stream norms, and
@@ -1970,6 +1977,21 @@ test "sensenova_u15 protects the IO path and quantizes both MoT branches" {
         "language_model.lm_head.weight",
     };
     for (backbone) |k| try std.testing.expect(!sensenova_u15.isHighPrecision(k));
+}
+
+test "sensenova_u15 floors the base down projection and the generation gate and up at 8 bits" {
+    for ([_][]const u8{
+        "language_model.model.layers.0.mlp.down_proj.weight",
+        "language_model.model.layers.41.mlp_mot_gen.gate_proj.weight",
+        "language_model.model.layers.7.mlp_mot_gen.up_proj.weight",
+    }) |k| try std.testing.expectEqual(Precision.bits8, sensenova_u15.precisionFloor(k).?);
+
+    for ([_][]const u8{
+        "language_model.model.layers.0.mlp_mot_gen.down_proj.weight",
+        "language_model.model.layers.0.mlp.gate_proj.weight",
+        "language_model.model.layers.0.mlp.up_proj.weight",
+        "language_model.model.layers.0.self_attn.q_proj_mot_gen.weight",
+    }) |k| try std.testing.expect(sensenova_u15.precisionFloor(k) == null);
 }
 
 test "sensenova_u15 upcasts every RMSNorm scale of both branches" {

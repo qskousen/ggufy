@@ -106,10 +106,10 @@ pub fn comfyMinVersion(t: types.DataType) ?[]const u8 {
     };
 }
 
-/// What every ComfyUI release gets wrong about a type it does load, or null.
+/// If there are things ComfyUI gets wrong about a certain format
 pub fn comfyCaveat(t: types.DataType) ?[]const u8 {
     return if (t == .ASYM_W4A8_INT8_ZP)
-        "every ComfyUI release drops weight_correction on load and decodes these layers wrong; comfy_kitchen reads them"
+        "ComfyUI drops weight_correction on load and decodes these layers wrong, despite comfy_kitchen reading them correctly"
     else
         null;
 }
@@ -451,7 +451,7 @@ pub fn plan(target: Target, kind: Kind, arch_name: []const u8, datatype: ?types.
             const hf = hfNames(t, kind, arch_name, ft, source_is_gguf);
             // HF names out of a GGUF take the HF layout, config.json and all.
             if (hf and ft == .safetensors and !hf_config_writable) {
-                why.* = try std.fmt.allocPrint(alloc, "ComfyUI takes a text encoder as safetensors under HF names, and this tool writes that layout for {s} only, not {s}", .{ HfLlm.hf_config_archs_text, arch_name });
+                why.* = try std.fmt.allocPrint(alloc, "ComfyUI takes a text encoder as safetensors under HF names, but ggufy writes that layout for {s} only, not {s}", .{ HfLlm.hf_config_archs_text, arch_name });
                 return error.TargetCannotLoad;
             }
             return .{ .target = t, .filetype = ft, .hf_names = hf };
