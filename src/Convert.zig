@@ -7281,6 +7281,71 @@ test "computeOutputPath names a template's output after its average bit rate" {
     try testing.expect(std.mem.endsWith(u8, fallback, "model-f16.gguf"));
 }
 
+/// A sink whose drain takes only what is buffered and none of `data`, which
+/// std.Io.Writer allows and some file writers do.
+const BufferOnlySink = struct {
+    out: std.ArrayList(u8) = .empty,
+    alloc: std.mem.Allocator,
+    writer: std.Io.Writer,
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        _ = data;
+        _ = splat;
+        const self: *BufferOnlySink = @alignCast(@fieldParentPtr("writer", w));
+        self.out.appendSlice(self.alloc, w.buffered()) catch return error.WriteFailed;
+        w.end = 0;
+        return 0;
+    }
+};
+
+test "a GGUF string that crosses the write buffer's end is written whole" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var buf: [16]u8 = undefined;
+    var sink: BufferOnlySink = .{ .alloc = arena.allocator(), .writer = .{ .vtable = &.{ .drain = BufferOnlySink.drain }, .buffer = &buf } };
+    const w = &sink.writer;
+
+    try w.writeAll("0123456789ab");
+    // The 9-byte body does not fit the 8 bytes left after its length.
+    try testing.expectEqual(@as(u64, 17), try gguf.writeStringTracked(w, "\xc4\xa0Unified"));
+    try w.flush();
+    try testing.expectEqualSlices(u8, "0123456789ab" ++ "\x09\x00\x00\x00\x00\x00\x00\x00" ++ "\xc4\xa0Unified", sink.out.items);
+}
+
+test "a GGUF whose metadata claims more bytes than the file holds is refused before allocating them" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const ts_ns: i96 = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    const token: u64 = @as(u64, @bitCast(@as(i64, @truncate(ts_ns)))) ^ @as(u64, @intFromPtr(&arena));
+    const dir = try std.fmt.allocPrint(a, "/tmp/ggufy_corrupt_test_{x}", .{token});
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    // Version 3, no tensors, one key "name".
+    const head = "GGUF" ++ "\x03\x00\x00\x00" ++ "\x00\x00\x00\x00\x00\x00\x00\x00" ++ "\x01\x00\x00\x00\x00\x00\x00\x00" ++ "\x04\x00\x00\x00\x00\x00\x00\x00" ++ "name";
+    const cases = [_][]const u8{
+        // A string value 23 GB long.
+        head ++ "\x08\x00\x00\x00" ++ "\x73\x0e\x6a\x6e\x05\x00\x00\x00" ++ "abc",
+        // An array of strings with 2^63 entries.
+        head ++ "\x09\x00\x00\x00" ++ "\x08\x00\x00\x00" ++ "\x00\x00\x00\x00\x00\x00\x00\x80" ++ "\x01\x00\x00\x00\x00\x00\x00\x00" ++ "a",
+    };
+    for (cases, 0..) |bytes, i| {
+        const path = try std.fmt.allocPrint(a, "{s}/{d}.gguf", .{ dir, i });
+        {
+            const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+            defer file.close(io);
+            var buf: [64]u8 = undefined;
+            var fw = file.writer(io, &buf);
+            try fw.interface.writeAll(bytes);
+            try fw.interface.flush();
+        }
+        try testing.expectError(error.CorruptGguf, gguf.init(path, io, testing.allocator, a, false));
+    }
+}
+
 test "a checkpoint directory with a dot in its name keeps the whole name" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

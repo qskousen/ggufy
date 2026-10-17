@@ -967,7 +967,7 @@ pub fn saveWithSTData(self: Safetensors, source: anytype, threads: usize, callba
     // write header size
     try writer.interface.writeInt(u64, header_size, .little);
     // write header
-    _ = try writer.interface.write(header_bytes);
+    try writer.interface.writeAll(header_bytes);
 
     var pool: thread_pool_mod.ThreadPool = undefined;
     try pool.init(.{ .allocator = self.allocator, .n_jobs = threads });

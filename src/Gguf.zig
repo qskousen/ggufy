@@ -133,30 +133,32 @@ pub fn init(path: []const u8, io: std.Io, mem_allocator: std.mem.Allocator, aren
     defer mem_allocator.free(metadata_count_buf);
     bytes_read += 8;
     const metadata_count = std.mem.readInt(u64, metadata_count_buf[0..8], .little);
+    _ = try lenWithin(metadata_count, bytes_read, file_size);
 
     var i: u64 = 0;
     while (i < metadata_count) : (i += 1) {
-        var metadata = try GgufMetadata.read(&reader.interface, arena_alloc, &bytes_read);
+        var metadata = try GgufMetadata.read(&reader.interface, arena_alloc, &bytes_read, file_size);
         defer metadata.deinit(arena_alloc);
 
         const val = try self.readGgufValueAsJson(&reader.interface, metadata.value_type, &bytes_read);
         try self.metadata.put(arena_alloc, try arena_alloc.dupe(u8, metadata.title), val);
     }
 
-    try self.tensors.ensureTotalCapacity(self.arena_alloc, tensor_count);
+    try self.tensors.ensureTotalCapacity(self.arena_alloc, try lenWithin(tensor_count, bytes_read, file_size));
     var ti: u64 = 0;
     while (ti < tensor_count) : (ti += 1) {
         const str_len_buf = try reader.interface.readAllocAll(mem_allocator, 8);
         defer mem_allocator.free(str_len_buf);
         bytes_read += 8;
-        const str_len = std.mem.readInt(i64, str_len_buf[0..8], .little);
-        const name = try reader.interface.readAllocAll(arena_alloc, @intCast(str_len));
-        bytes_read += @intCast(str_len);
+        const str_len = try lenWithin(std.mem.readInt(u64, str_len_buf[0..8], .little), bytes_read, file_size);
+        const name = try reader.interface.readAllocAll(arena_alloc, str_len);
+        bytes_read += str_len;
 
         const dim_count_buf = try reader.interface.readAllocAll(mem_allocator, 4);
         defer mem_allocator.free(dim_count_buf);
         bytes_read += 4;
         const dim_count = std.mem.readInt(u32, dim_count_buf[0..4], .little);
+        if (dim_count > 4) return error.CorruptGguf;
 
         var dims = try arena_alloc.alloc(usize, dim_count);
 
@@ -407,22 +409,23 @@ pub const GgmlType = enum(u32) {
     }
 };
 
+/// `len` bytes, or items of at least a byte each, refused when they would run past the end of the file.
+fn lenWithin(len: u64, pos: u64, file_size: u64) error{CorruptGguf}!usize {
+    if (len > file_size -| pos) return error.CorruptGguf;
+    return @intCast(len);
+}
+
 const GgufMetadata = struct {
     title_len: u64,
     title: []const u8,
     value_type: GgufValueType,
 
-    pub fn read(reader: *std.Io.Reader, allocator: std.mem.Allocator, bytes_read: *u64) !GgufMetadata {
+    pub fn read(reader: *std.Io.Reader, allocator: std.mem.Allocator, bytes_read: *u64, file_size: u64) !GgufMetadata {
         var len_buffer = try reader.readAllocAll(allocator, 8);
         defer allocator.free(len_buffer);
         bytes_read.* += 8;
-        const title_len = std.mem.readInt(u64, len_buffer[0..8], .little);
-
-        // Add sanity check for title length
-        if (title_len == 0 or title_len > 1024 * 1024) { // 1 MiB cap for title length
-            std.debug.print("Invalid metadata title length: {}\n", .{title_len});
-            return error.InvalidMetadataTitleLength;
-        }
+        const title_len = try lenWithin(std.mem.readInt(u64, len_buffer[0..8], .little), bytes_read.*, file_size);
+        if (title_len == 0) return error.CorruptGguf;
 
         const title = try reader.readAllocAll(allocator, title_len);
         bytes_read.* += title_len;
@@ -430,7 +433,7 @@ const GgufMetadata = struct {
         const type_buf = try reader.readAllocAll(allocator, 4);
         defer allocator.free(type_buf);
         bytes_read.* += 4;
-        const value_type = @as(GgufValueType, @fromBackingInt(std.mem.readInt(u32, type_buf[0..4], .little)));
+        const value_type = std.enums.fromInt(GgufValueType, std.mem.readInt(u32, type_buf[0..4], .little)) orelse return error.CorruptGguf;
 
         return GgufMetadata{
             .title_len = title_len,
@@ -696,7 +699,7 @@ pub fn calculateFileSize(tensors: []const types.Tensor, metadata: *std.json.Obje
 }
 
 pub fn writeHeaderTracked(writer: *std.Io.Writer, tensor_count: u64, metadata_count: u64) !u64 {
-    _ = try writer.write("GGUF");
+    try writer.writeAll("GGUF");
     try writer.writeInt(u32, 3, .little); // Version 3
     try writer.writeInt(u64, tensor_count, .little);
     try writer.writeInt(u64, metadata_count, .little);
@@ -705,7 +708,7 @@ pub fn writeHeaderTracked(writer: *std.Io.Writer, tensor_count: u64, metadata_co
 
 pub fn writeStringTracked(writer: *std.Io.Writer, str: []const u8) !u64 {
     try writer.writeInt(u64, str.len, .little);
-    _ = try writer.write(str);
+    try writer.writeAll(str);
     return 8 + str.len;
 }
 
@@ -1085,22 +1088,22 @@ fn readGgufValueAsJson(self: Gguf, reader: *std.Io.Reader, value_type: GgufValue
         .string => {
             const buf = try reader.readAllocAll(self.arena_alloc, 8);
             bytes_read.* += 8;
-            const str_len = std.mem.readInt(i64, buf[0..8], .little);
-            const str = try reader.readAllocAll(self.arena_alloc, @intCast(str_len));
-            bytes_read.* += @intCast(str_len);
+            const str_len = try lenWithin(std.mem.readInt(u64, buf[0..8], .little), bytes_read.*, self.file_size);
+            const str = try reader.readAllocAll(self.arena_alloc, str_len);
+            bytes_read.* += str_len;
             return std.json.Value{ .string = str };
         },
         .array => {
             const type_buf = try reader.readAllocAll(self.arena_alloc, 4);
             bytes_read.* += 4;
-            const array_type = @as(GgufValueType, @fromBackingInt(std.mem.readInt(u32, type_buf[0..4], .little)));
+            const array_type = std.enums.fromInt(GgufValueType, std.mem.readInt(u32, type_buf[0..4], .little)) orelse return error.CorruptGguf;
             var len_buf = try reader.readAllocAll(self.arena_alloc, 8);
             bytes_read.* += 8;
-            const arr_len = std.mem.readInt(i64, len_buf[0..8], .little);
+            const arr_len = try lenWithin(std.mem.readInt(u64, len_buf[0..8], .little), bytes_read.*, self.file_size);
 
             var arr = std.json.Array.init(self.arena_alloc);
             errdefer arr.deinit();
-            var j: i64 = 0;
+            var j: usize = 0;
             while (j < arr_len) : (j += 1) {
                 try arr.append(try self.readGgufValueAsJson(reader, array_type, bytes_read));
             }
