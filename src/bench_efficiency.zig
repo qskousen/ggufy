@@ -47,11 +47,11 @@ fn loadSafetensorsF32(io: std.Io, allocator: std.mem.Allocator, path: []const u8
     var read_buf: [4096]u8 = undefined;
     var rdr = file.reader(io, &read_buf);
 
-    const hdr_len_bytes = try rdr.interface.readAlloc(allocator, 8);
+    const hdr_len_bytes = try rdr.interface.readAllocAll(allocator, 8);
     defer allocator.free(hdr_len_bytes);
     const header_size = std.mem.readInt(u64, hdr_len_bytes[0..8], .little);
 
-    const json_buf = try rdr.interface.readAlloc(allocator, header_size);
+    const json_buf = try rdr.interface.readAllocAll(allocator, header_size);
     defer allocator.free(json_buf);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_buf, .{});
@@ -101,9 +101,7 @@ fn printMetrics(
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = init.gpa;
 
     const n_threads = std.Thread.getCpuCount() catch 4;
     var pool: ThreadPool.ThreadPool = .{};
@@ -134,7 +132,8 @@ pub fn main(init: std.process.Init) !void {
     print("\nQuantization Round-Trip Efficiency  (N={d}, real F32 model weights)\n\n", .{N});
     print("{s:<6} {s:<16} {s:>9}  {s:>7}   {s:<12} {s:>10}   {s:>10}\n",
         .{ "Group", "Type", "Bits/elem", "vs F32", "MSE", "PSNR(dB)", "Max|err|" });
-    print("{s}\n", .{"-" ** 78});
+    const rule: [78]u8 = @splat('-');
+    print("{s}\n", .{&rule});
 
     // -------------------------------------------------------------------------
     // Simple single-tensor types via convertTensorData

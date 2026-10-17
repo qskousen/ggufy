@@ -1,8 +1,4 @@
-const c = @cImport({
-    @cDefine("NDEBUG", "1");
-    @cInclude("ggml.h");
-    @cInclude("gguf.h");
-});
+const c = @import("ggml_c");
 
 // Re-export only what we need
 pub const ggml_quantize_chunk = c.ggml_quantize_chunk;

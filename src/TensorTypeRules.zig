@@ -43,7 +43,7 @@ pub fn parse(arena: std.mem.Allocator, content: []const u8, filetype: ?types.Fil
     var it = std.mem.tokenizeAny(u8, content, " \t\r\n\x0b\x0c");
     while (it.next()) |entry| {
         bad.* = entry;
-        const eq = std.mem.indexOfScalar(u8, entry, '=') orelse return error.MalformedTensorTypeRule;
+        const eq = std.mem.findScalar(u8, entry, '=') orelse return error.MalformedTensorTypeRule;
         if (eq == 0 or eq + 1 == entry.len) return error.MalformedTensorTypeRule;
         const pattern = try std.ascii.allocLowerString(arena, entry[0..eq]);
         const dt = parseType(entry[eq + 1 ..]) orelse return error.UnknownTensorTypeRuleType;

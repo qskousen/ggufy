@@ -530,11 +530,11 @@ pub fn siblingTokenizerDir(io: std.Io, dir: std.Io.Dir, alloc: std.mem.Allocator
     var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const n = dir.realPath(io, &buf) catch return null;
     const real = buf[0..n];
-    const base = std.fs.path.basename(real);
+    const base = std.Io.Dir.path.basename(real);
     const prefix = "text_encoder";
     if (!std.mem.startsWith(u8, base, prefix)) return null;
-    const parent = std.fs.path.dirname(real) orelse return null;
-    const path = try std.fmt.allocPrint(alloc, "{s}/tokenizer{s}", .{ parent, base[prefix.len..] });
+    const parent = std.Io.Dir.path.dirname(real) orelse return null;
+    const path = try alloc.print("{s}/tokenizer{s}", .{ parent, base[prefix.len..] });
     const sd = std.Io.Dir.cwd().openDir(io, path, .{}) catch return null;
     if (!anyTokenizerFile(io, sd)) {
         sd.close(io);
@@ -893,7 +893,7 @@ fn loadTokenizer(io: std.Io, dir: std.Io.Dir, alloc: std.mem.Allocator, model: *
             scores[i] = p.score;
         }
         for (pieces.len..n) |i| {
-            tokens[i] = try std.fmt.allocPrint(alloc, "[PAD{d}]", .{i});
+            tokens[i] = try alloc.print("[PAD{d}]", .{i});
             types_[i] = GGUF_TOKEN_TYPE_UNUSED;
             scores[i] = -10000;
         }
@@ -983,7 +983,7 @@ fn loadTokenizer(io: std.Io, dir: std.Io.Dir, alloc: std.mem.Allocator, model: *
         for (tokens, 0..) |maybe_tok, i| {
             final_tokens[i] = maybe_tok orelse blk: {
                 types_[i] = GGUF_TOKEN_TYPE_UNUSED;
-                break :blk try std.fmt.allocPrint(alloc, "[PAD{d}]", .{i});
+                break :blk try alloc.print("[PAD{d}]", .{i});
             };
         }
         model.tokens = final_tokens;
@@ -1009,7 +1009,7 @@ fn loadMerges(tmod: std.json.ObjectMap, io: std.Io, dir: std.Io.Dir, alloc: std.
                     .string => |s| s,
                     .array => |pair| if (pair.items.len == 2 and
                         pair.items[0] == .string and pair.items[1] == .string)
-                        std.fmt.allocPrint(alloc, "{s} {s}", .{ pair.items[0].string, pair.items[1].string }) catch return
+                        alloc.print("{s} {s}", .{ pair.items[0].string, pair.items[1].string }) catch return
                     else
                         null,
                     else => null,
@@ -1271,7 +1271,7 @@ pub fn expertPart(name: []const u8, mtp_base: ?u32) ?ExpertPart {
             name["model.layers.".len..]
         else
             return null;
-        const dot = std.mem.indexOfScalar(u8, body, '.') orelse return null;
+        const dot = std.mem.findScalar(u8, body, '.') orelse return null;
         block = std.fmt.parseInt(u32, body[0..dot], 10) catch return null;
         rest = body[dot + 1 ..];
     }
@@ -1289,7 +1289,7 @@ pub fn expertPart(name: []const u8, mtp_base: ?u32) ?ExpertPart {
             return .{ .block = block, .expert = null, .proj = f.proj };
     }
 
-    const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return null;
+    const dot = std.mem.findScalar(u8, rest, '.') orelse return null;
     const expert = std.fmt.parseInt(u32, rest[0..dot], 10) catch return null;
     const Per = struct { from: []const u8, proj: ExpertProj };
     for ([_]Per{
@@ -1321,7 +1321,7 @@ pub fn planExpertStacks(
     // Keyed by block and output projection; gate_up feeds both gate and up.
     const Key = struct { block: u32, proj: ExpertProj };
     const Slot = struct { per: []?types.Tensor, fused: ?types.Tensor = null, fused_half: u1 = 0 };
-    var slots: std.AutoArrayHashMapUnmanaged(Key, Slot) = .empty;
+    var slots: std.array_hash_map.Auto(Key, Slot) = .empty;
 
     for (tensors) |t| {
         const part = expertPart(t.name, mtp_base) orelse continue;
@@ -1351,7 +1351,7 @@ pub fn planExpertStacks(
     while (it.next()) |e| {
         const key = e.key_ptr.*;
         const slot = e.value_ptr.*;
-        const name = try std.fmt.allocPrint(alloc, "blk.{d}.ffn_{s}_exps.weight", .{ key.block, @tagName(key.proj) });
+        const name = try alloc.print("blk.{d}.ffn_{s}_exps.weight", .{ key.block, @tagName(key.proj) });
         var any_per = false;
         for (slot.per) |p| any_per = any_per or p != null;
         if (slot.fused) |f| {
@@ -1430,8 +1430,8 @@ pub const VisionProjector = enum {
     }
 
     pub fn fromClipName(s: []const u8) ?VisionProjector {
-        inline for (std.meta.fields(VisionProjector)) |f| {
-            const p: VisionProjector = @enumFromInt(f.value);
+        inline for (@typeInfo(VisionProjector).@"enum".field_names) |name| {
+            const p = @field(VisionProjector, name);
             if (std.mem.eql(u8, s, p.clipName())) return p;
         }
         return null;
@@ -1653,7 +1653,7 @@ const deepstack_pairs = [_]NamePair{
 fn indexed(body: []const u8, prefix: []const u8) ?struct { n: u32, rest: []const u8 } {
     if (!std.mem.startsWith(u8, body, prefix)) return null;
     const after = body[prefix.len..];
-    const dot = std.mem.indexOfScalar(u8, after, '.') orelse return null;
+    const dot = std.mem.findScalar(u8, after, '.') orelse return null;
     const n = std.fmt.parseInt(u32, after[0..dot], 10) catch return null;
     return .{ .n = n, .rest = after[dot + 1 ..] };
 }
@@ -1663,13 +1663,13 @@ fn indexed(body: []const u8, prefix: []const u8) ?struct { n: u32, rest: []const
 /// (see planVision), which a name map cannot express.
 pub fn mapVisionName(alloc: std.mem.Allocator, v: Vision, name: []const u8) !?[]const u8 {
     if (!isVisionTensor(name)) return null;
-    const body = name[std.mem.indexOf(u8, name, "visual.").? + "visual.".len ..];
+    const body = name[std.mem.find(u8, name, "visual.").? + "visual.".len ..];
 
     for (visionTopPairs(v.projector)) |p| if (std.mem.eql(u8, body, p.from)) return p.to;
 
     if (indexed(body, "blocks.")) |b| {
         for (visionBlockPairs(v.projector)) |p| {
-            if (std.mem.eql(u8, b.rest, p.from)) return try std.fmt.allocPrint(alloc, "v.blk.{d}.{s}", .{ b.n, p.to });
+            if (std.mem.eql(u8, b.rest, p.from)) return try alloc.print("v.blk.{d}.{s}", .{ b.n, p.to });
         }
         return null;
     }
@@ -1679,7 +1679,7 @@ pub fn mapVisionName(alloc: std.mem.Allocator, v: Vision, name: []const u8) !?[]
         if (d.n >= v.deepstack_indexes.len) return null;
         for (deepstack_pairs) |p| {
             if (std.mem.eql(u8, d.rest, p.from)) {
-                return try std.fmt.allocPrint(alloc, "v.deepstack.{d}.{s}", .{ v.deepstack_indexes[d.n], p.to });
+                return try alloc.print("v.deepstack.{d}.{s}", .{ v.deepstack_indexes[d.n], p.to });
             }
         }
     }
@@ -1689,18 +1689,18 @@ pub fn mapVisionName(alloc: std.mem.Allocator, v: Vision, name: []const u8) !?[]
 /// mapVisionName read backwards, onto `prefix` ("model.visual." or "visual.").
 pub fn mapVisionNameReverse(alloc: std.mem.Allocator, v: Vision, prefix: []const u8, name: []const u8) !?[]const u8 {
     for (visionTopPairs(v.projector)) |p| {
-        if (std.mem.eql(u8, name, p.to)) return try std.fmt.allocPrint(alloc, "{s}{s}", .{ prefix, p.from });
+        if (std.mem.eql(u8, name, p.to)) return try alloc.print("{s}{s}", .{ prefix, p.from });
     }
     if (indexed(name, "v.blk.")) |b| {
         for (visionBlockPairs(v.projector)) |p| {
-            if (std.mem.eql(u8, b.rest, p.to)) return try std.fmt.allocPrint(alloc, "{s}blocks.{d}.{s}", .{ prefix, b.n, p.from });
+            if (std.mem.eql(u8, b.rest, p.to)) return try alloc.print("{s}blocks.{d}.{s}", .{ prefix, b.n, p.from });
         }
         return null;
     }
     if (indexed(name, "v.deepstack.")) |d| {
-        const slot = std.mem.indexOfScalar(u32, v.deepstack_indexes, d.n) orelse return null;
+        const slot = std.mem.findScalar(u32, v.deepstack_indexes, d.n) orelse return null;
         for (deepstack_pairs) |p| {
-            if (std.mem.eql(u8, d.rest, p.to)) return try std.fmt.allocPrint(alloc, "{s}deepstack_merger_list.{d}.{s}", .{ prefix, slot, p.from });
+            if (std.mem.eql(u8, d.rest, p.to)) return try alloc.print("{s}deepstack_merger_list.{d}.{s}", .{ prefix, slot, p.from });
         }
     }
     return null;
@@ -1755,7 +1755,7 @@ pub fn planVision(alloc: std.mem.Allocator, v: Vision, tensors: []const types.Te
             }
             continue;
         }
-        if (v.projector == .qwen25vl) if (indexed(t.name[std.mem.indexOf(u8, t.name, "visual.").? + "visual.".len ..], "blocks.")) |b| {
+        if (v.projector == .qwen25vl) if (indexed(t.name[std.mem.find(u8, t.name, "visual.").? + "visual.".len ..], "blocks.")) |b| {
             const is_w = std.mem.eql(u8, b.rest, "attn.qkv.weight");
             if (is_w or std.mem.eql(u8, b.rest, "attn.qkv.bias")) {
                 if (t.dims[0] % 3 != 0 or t.dims.len != @as(usize, if (is_w) 2 else 1)) {
@@ -1767,7 +1767,7 @@ pub fn planVision(alloc: std.mem.Allocator, v: Vision, tensors: []const types.Te
                 const dims = if (is_w) try alloc.dupe(usize, &.{ rows, width }) else try alloc.dupe(usize, &.{rows});
                 try sources.append(alloc, t);
                 for ([_][]const u8{ "q", "k", "v" }, 0..) |which, i| {
-                    const name = try std.fmt.allocPrint(alloc, "v.blk.{d}.attn_{s}.{s}", .{ b.n, which, if (is_w) "weight" else "bias" });
+                    const name = try alloc.print("v.blk.{d}.attn_{s}.{s}", .{ b.n, which, if (is_w) "weight" else "bias" });
                     try appendStack(alloc, &outputs, &stacks, t, name, dims, &.{.{
                         .tensor = t,
                         .elem_offset = i * rows * width,
@@ -1949,7 +1949,7 @@ pub fn planVisionReverse(alloc: std.mem.Allocator, v: Vision, prefix: []const u8
             try sources.append(alloc, t);
             try sources.append(alloc, other);
             try stacks.append(alloc, .{
-                .name = try std.fmt.allocPrint(alloc, "{s}patch_embed.proj.weight", .{prefix}),
+                .name = try alloc.print("{s}patch_embed.proj.weight", .{prefix}),
                 .dims = dims,
                 .dtype = t.type,
                 .segments = try alloc.dupe(types.StackSegment, &segs),
@@ -1967,7 +1967,7 @@ pub fn planVisionReverse(alloc: std.mem.Allocator, v: Vision, prefix: []const u8
                 const kind = if (is_w) "weight" else "bias";
                 var parts: [3]types.Tensor = undefined;
                 for ([_][]const u8{ "q", "k", "v" }, 0..) |which, i| {
-                    const n = try std.fmt.allocPrint(alloc, "v.blk.{d}.attn_{s}.{s}", .{ b.n, which, kind });
+                    const n = try alloc.print("v.blk.{d}.attn_{s}.{s}", .{ b.n, which, kind });
                     parts[i] = findTensor(tensors, n) orelse {
                         std.log.warn("the mmproj has {s} but not {s}", .{ t.name, n });
                         return error.UnexpectedVisionShape;
@@ -1987,7 +1987,7 @@ pub fn planVisionReverse(alloc: std.mem.Allocator, v: Vision, prefix: []const u8
                     try sources.append(alloc, part);
                 }
                 try stacks.append(alloc, .{
-                    .name = try std.fmt.allocPrint(alloc, "{s}blocks.{d}.attn.qkv.{s}", .{ prefix, b.n, kind }),
+                    .name = try alloc.print("{s}blocks.{d}.attn.qkv.{s}", .{ prefix, b.n, kind }),
                     .dims = dims,
                     .dtype = t.type,
                     .segments = try alloc.dupe(types.StackSegment, &segs),
@@ -2070,7 +2070,7 @@ fn mapQwen35(alloc: std.mem.Allocator, name: []const u8, mtp_base: ?u32) !?[]con
         };
         for (head) |pair| {
             if (std.mem.eql(u8, rest, pair.from)) {
-                return try std.fmt.allocPrint(alloc, "blk.{d}.{s}", .{ base, pair.to });
+                return try alloc.print("blk.{d}.{s}", .{ base, pair.to });
             }
         }
         // The head's own transformer layer. Only one is defined today, and a
@@ -2079,7 +2079,7 @@ fn mapQwen35(alloc: std.mem.Allocator, name: []const u8, mtp_base: ?u32) !?[]con
             const suffix = rest["layers.0.".len..];
             for (qwen35_suffix) |pair| {
                 if (std.mem.eql(u8, suffix, pair.from)) {
-                    return try std.fmt.allocPrint(alloc, "blk.{d}.{s}", .{ base, pair.to });
+                    return try alloc.print("blk.{d}.{s}", .{ base, pair.to });
                 }
             }
         }
@@ -2100,12 +2100,12 @@ fn mapQwen35(alloc: std.mem.Allocator, name: []const u8, mtp_base: ?u32) !?[]con
 
     if (!std.mem.startsWith(u8, body, "layers.")) return null;
     const after = body["layers.".len..];
-    const dot = std.mem.indexOfScalar(u8, after, '.') orelse return null;
+    const dot = std.mem.findScalar(u8, after, '.') orelse return null;
     const layer = std.fmt.parseInt(u32, after[0..dot], 10) catch return null;
     const suffix = after[dot + 1 ..];
     for (qwen35_suffix) |pair| {
         if (std.mem.eql(u8, suffix, pair.from)) {
-            return try std.fmt.allocPrint(alloc, "blk.{d}.{s}", .{ layer, pair.to });
+            return try alloc.print("blk.{d}.{s}", .{ layer, pair.to });
         }
     }
     return null;
@@ -2118,7 +2118,7 @@ pub fn mapName(alloc: std.mem.Allocator, arch: *const imagearch.Arch, name: []co
         // layouts and at model.* in qwen2vl's legacy one.
         for ([_][]const u8{ "model.language_model.", "language_model." }) |pre| {
             if (std.mem.startsWith(u8, name, pre)) {
-                const flat = try std.fmt.allocPrint(alloc, "model.{s}", .{name[pre.len..]});
+                const flat = try alloc.print("model.{s}", .{name[pre.len..]});
                 return mapName(alloc, text, flat, mtp_base);
             }
         }
@@ -2133,7 +2133,7 @@ pub fn mapName(alloc: std.mem.Allocator, arch: *const imagearch.Arch, name: []co
     const prefix = "model.layers.";
     if (!std.mem.startsWith(u8, name, prefix)) return null;
     const after = name[prefix.len..];
-    const dot = std.mem.indexOfScalar(u8, after, '.') orelse return null;
+    const dot = std.mem.findScalar(u8, after, '.') orelse return null;
     const layer = std.fmt.parseInt(u32, after[0..dot], 10) catch return null;
     const suffix = after[dot + 1 ..];
 
@@ -2153,16 +2153,16 @@ pub fn mapName(alloc: std.mem.Allocator, arch: *const imagearch.Arch, name: []co
     } ++ moe_suffix;
     for (map) |pair| {
         if (std.mem.eql(u8, suffix, pair.from)) {
-            return try std.fmt.allocPrint(alloc, "blk.{d}.{s}", .{ layer, pair.to });
+            return try alloc.print("blk.{d}.{s}", .{ layer, pair.to });
         }
     }
     // Head norms exist only where llama.cpp models them: qwen3 yes, qwen2/llama no.
     if (hasHeadNorms(arch.name)) {
         if (std.mem.eql(u8, suffix, "self_attn.q_norm.weight")) {
-            return try std.fmt.allocPrint(alloc, "blk.{d}.attn_q_norm.weight", .{layer});
+            return try alloc.print("blk.{d}.attn_q_norm.weight", .{layer});
         }
         if (std.mem.eql(u8, suffix, "self_attn.k_norm.weight")) {
-            return try std.fmt.allocPrint(alloc, "blk.{d}.attn_k_norm.weight", .{layer});
+            return try alloc.print("blk.{d}.attn_k_norm.weight", .{layer});
         }
     }
     return null;
@@ -2189,7 +2189,7 @@ fn mapQwen35Reverse(alloc: std.mem.Allocator, name: []const u8, mtp_base: ?u32) 
 
     if (!std.mem.startsWith(u8, name, "blk.")) return null;
     const after = name["blk.".len..];
-    const dot = std.mem.indexOfScalar(u8, after, '.') orelse return null;
+    const dot = std.mem.findScalar(u8, after, '.') orelse return null;
     const block = std.fmt.parseInt(u32, after[0..dot], 10) catch return null;
     const suffix = after[dot + 1 ..];
 
@@ -2203,12 +2203,12 @@ fn mapQwen35Reverse(alloc: std.mem.Allocator, name: []const u8, mtp_base: ?u32) 
         };
         for (head) |pair| {
             if (std.mem.eql(u8, suffix, pair.from)) {
-                return try std.fmt.allocPrint(alloc, "mtp.{s}", .{pair.to});
+                return try alloc.print("mtp.{s}", .{pair.to});
             }
         }
         for (qwen35_suffix) |pair| {
             if (std.mem.eql(u8, suffix, pair.to)) {
-                return try std.fmt.allocPrint(alloc, "mtp.layers.0.{s}", .{pair.from});
+                return try alloc.print("mtp.layers.0.{s}", .{pair.from});
             }
         }
         return null;
@@ -2216,7 +2216,7 @@ fn mapQwen35Reverse(alloc: std.mem.Allocator, name: []const u8, mtp_base: ?u32) 
 
     for (qwen35_suffix) |pair| {
         if (std.mem.eql(u8, suffix, pair.to)) {
-            return try std.fmt.allocPrint(alloc, "model.language_model.layers.{d}.{s}", .{ block, pair.from });
+            return try alloc.print("model.language_model.layers.{d}.{s}", .{ block, pair.from });
         }
     }
     return null;
@@ -2232,7 +2232,7 @@ pub fn mapNameReverse(alloc: std.mem.Allocator, arch: *const imagearch.Arch, nam
     if (std.mem.eql(u8, arch.name, "qwen3vl")) {
         const flat = (try mapNameReverse(alloc, &imagearch.qwen3, name, mtp_base)) orelse return null;
         if (!std.mem.startsWith(u8, flat, "model.")) return flat;
-        return try std.fmt.allocPrint(alloc, "model.language_model.{s}", .{flat["model.".len..]});
+        return try alloc.print("model.language_model.{s}", .{flat["model.".len..]});
     }
     if (std.mem.eql(u8, name, "token_embd.weight")) return "model.embed_tokens.weight";
     if (std.mem.eql(u8, name, "output.weight")) return "lm_head.weight";
@@ -2241,7 +2241,7 @@ pub fn mapNameReverse(alloc: std.mem.Allocator, arch: *const imagearch.Arch, nam
     const prefix = "blk.";
     if (!std.mem.startsWith(u8, name, prefix)) return null;
     const after = name[prefix.len..];
-    const dot = std.mem.indexOfScalar(u8, after, '.') orelse return null;
+    const dot = std.mem.findScalar(u8, after, '.') orelse return null;
     const layer = std.fmt.parseInt(u32, after[0..dot], 10) catch return null;
     const suffix = after[dot + 1 ..];
 
@@ -2262,15 +2262,15 @@ pub fn mapNameReverse(alloc: std.mem.Allocator, arch: *const imagearch.Arch, nam
     };
     for (map) |pair| {
         if (std.mem.eql(u8, suffix, pair.from)) {
-            return try std.fmt.allocPrint(alloc, "model.layers.{d}.{s}", .{ layer, pair.to });
+            return try alloc.print("model.layers.{d}.{s}", .{ layer, pair.to });
         }
     }
     if (hasHeadNorms(arch.name)) {
         if (std.mem.eql(u8, suffix, "attn_q_norm.weight")) {
-            return try std.fmt.allocPrint(alloc, "model.layers.{d}.self_attn.q_norm.weight", .{layer});
+            return try alloc.print("model.layers.{d}.self_attn.q_norm.weight", .{layer});
         }
         if (std.mem.eql(u8, suffix, "attn_k_norm.weight")) {
-            return try std.fmt.allocPrint(alloc, "model.layers.{d}.self_attn.k_norm.weight", .{layer});
+            return try alloc.print("model.layers.{d}.self_attn.k_norm.weight", .{layer});
         }
     }
     return null;
@@ -2341,14 +2341,14 @@ fn idToTitle(alloc: std.mem.Allocator, s: []const u8) ![]const u8 {
 fn cardEntryFromId(alloc: std.mem.Allocator, id: []const u8) !CardEntry {
     var org_raw: ?[]const u8 = null;
     var name_raw: []const u8 = id;
-    if (std.mem.indexOfScalar(u8, id, '/')) |slash| {
+    if (std.mem.findScalar(u8, id, '/')) |slash| {
         org_raw = id[0..slash];
         name_raw = id[slash + 1 ..];
     }
     const name = try idToTitle(alloc, name_raw);
     const org = if (org_raw) |o| try idToTitle(alloc, o) else null;
     const url = if (org_raw) |o|
-        try std.fmt.allocPrint(alloc, "https://huggingface.co/{s}/{s}", .{ o, name_raw })
+        try alloc.print("https://huggingface.co/{s}/{s}", .{ o, name_raw })
     else
         null;
     return .{ .name = name, .organization = org, .repo_url = url };
@@ -2367,7 +2367,7 @@ fn findCardField(fields: []const CardField, key: []const u8) ?std.ArrayList([]co
 fn loadCard(io: std.Io, dir: std.Io.Dir, alloc: std.mem.Allocator, model: *Model) void {
     const txt = dir.readFileAlloc(io, "README.md", alloc, .limited64(16 * 1024 * 1024)) catch return;
     if (!std.mem.startsWith(u8, txt, "---\n")) return;
-    const end = std.mem.indexOfPos(u8, txt, 4, "\n---") orelse return;
+    const end = std.mem.findPos(u8, txt, 4, "\n---") orelse return;
     var fields: std.ArrayList(CardField) = .empty;
     var lines = std.mem.splitScalar(u8, txt[4..end], '\n');
     var cur: ?*CardField = null;
@@ -2380,7 +2380,7 @@ fn loadCard(io: std.Io, dir: std.Io.Dir, alloc: std.mem.Allocator, model: *Model
             }
             continue;
         }
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
         const key = std.mem.trim(u8, line[0..colon], " ");
         var value = std.mem.trim(u8, line[colon + 1 ..], " \r\"'");
         if (value.len == 2 and std.mem.startsWith(u8, value, "[") and std.mem.endsWith(u8, value, "]")) value = "";
@@ -2491,10 +2491,10 @@ fn addRopeScaling(self: Model, metadata: *std.json.ObjectMap, a: []const u8, all
         );
         return;
     }
-    try putStr(metadata, alloc, try std.fmt.allocPrint(alloc, "{s}.rope.scaling.type", .{a}), rs.kind);
-    try putFloat(metadata, alloc, try std.fmt.allocPrint(alloc, "{s}.rope.scaling.factor", .{a}), rs.factor);
+    try putStr(metadata, alloc, try alloc.print("{s}.rope.scaling.type", .{a}), rs.kind);
+    try putFloat(metadata, alloc, try alloc.print("{s}.rope.scaling.factor", .{a}), rs.factor);
     if (rs.orig_ctx) |ctx| {
-        try putNum(metadata, alloc, try std.fmt.allocPrint(alloc, "{s}.rope.scaling.original_context_length", .{a}), ctx);
+        try putNum(metadata, alloc, try alloc.print("{s}.rope.scaling.original_context_length", .{a}), ctx);
     }
 }
 
@@ -2512,22 +2512,22 @@ pub fn addMetadata(self: Model, metadata: *std.json.ObjectMap, arch_name: []cons
     // The MTP head is one more block on the end, so the count the file declares
     // is past the text tower's. mapName places it at self.block_count.
     const gguf_blocks = self.block_count + if (self.qwen35) |q| q.nextn_layers else 0;
-    try putNum(metadata, alloc, try std.fmt.allocPrint(alloc, "{s}.block_count", .{a}), gguf_blocks);
-    try putNum(metadata, alloc, try std.fmt.allocPrint(alloc, "{s}.embedding_length", .{a}), self.embedding_length);
+    try putNum(metadata, alloc, try alloc.print("{s}.block_count", .{a}), gguf_blocks);
+    try putNum(metadata, alloc, try alloc.print("{s}.embedding_length", .{a}), self.embedding_length);
     if (self.feed_forward_length > 0) {
-        try putNum(metadata, alloc, try std.fmt.allocPrint(alloc, "{s}.feed_forward_length", .{a}), self.feed_forward_length);
+        try putNum(metadata, alloc, try alloc.print("{s}.feed_forward_length", .{a}), self.feed_forward_length);
     }
     if (self.expert_count > 0) {
-        try putNum(metadata, alloc, try std.fmt.allocPrint(alloc, "{s}.expert_count", .{a}), self.expert_count);
-        try putNum(metadata, alloc, try std.fmt.allocPrint(alloc, "{s}.expert_used_count", .{a}), self.expert_used_count);
-        if (self.expert_feed_forward_length) |n| try putNum(metadata, alloc, try std.fmt.allocPrint(alloc, "{s}.expert_feed_forward_length", .{a}), n);
-        if (self.expert_shared_feed_forward_length) |n| try putNum(metadata, alloc, try std.fmt.allocPrint(alloc, "{s}.expert_shared_feed_forward_length", .{a}), n);
+        try putNum(metadata, alloc, try alloc.print("{s}.expert_count", .{a}), self.expert_count);
+        try putNum(metadata, alloc, try alloc.print("{s}.expert_used_count", .{a}), self.expert_used_count);
+        if (self.expert_feed_forward_length) |n| try putNum(metadata, alloc, try alloc.print("{s}.expert_feed_forward_length", .{a}), n);
+        if (self.expert_shared_feed_forward_length) |n| try putNum(metadata, alloc, try alloc.print("{s}.expert_shared_feed_forward_length", .{a}), n);
     }
-    try putNum(metadata, alloc, try std.fmt.allocPrint(alloc, "{s}.attention.head_count", .{a}), self.head_count);
-    try putNum(metadata, alloc, try std.fmt.allocPrint(alloc, "{s}.attention.head_count_kv", .{a}), self.head_count_kv);
-    try putNum(metadata, alloc, try std.fmt.allocPrint(alloc, "{s}.context_length", .{a}), self.context_length);
-    try putFloat(metadata, alloc, try std.fmt.allocPrint(alloc, "{s}.rope.freq_base", .{a}), self.rope_theta);
-    try putFloat(metadata, alloc, try std.fmt.allocPrint(alloc, "{s}.attention.layer_norm_rms_epsilon", .{a}), self.rms_eps);
+    try putNum(metadata, alloc, try alloc.print("{s}.attention.head_count", .{a}), self.head_count);
+    try putNum(metadata, alloc, try alloc.print("{s}.attention.head_count_kv", .{a}), self.head_count_kv);
+    try putNum(metadata, alloc, try alloc.print("{s}.context_length", .{a}), self.context_length);
+    try putFloat(metadata, alloc, try alloc.print("{s}.rope.freq_base", .{a}), self.rope_theta);
+    try putFloat(metadata, alloc, try alloc.print("{s}.attention.layer_norm_rms_epsilon", .{a}), self.rms_eps);
 
     // Every architecture needs the rope dimension count: llama.cpp otherwise
     // falls back to embedding_length / head_count, which is wrong exactly when
@@ -2537,37 +2537,37 @@ pub fn addMetadata(self: Model, metadata: *std.json.ObjectMap, arch_name: []cons
     // A partial rotary factor makes the rotated width narrower than the head,
     // so the two are not the same number on this hybrid (64 against 256).
     const rope_dims = if (self.qwen35) |q| q.rope_dim_count else key_len;
-    try putNum(metadata, alloc, try std.fmt.allocPrint(alloc, "{s}.rope.dimension_count", .{a}), rope_dims);
+    try putNum(metadata, alloc, try alloc.print("{s}.rope.dimension_count", .{a}), rope_dims);
 
     if (self.qwen35) |q| {
-        try putNum(metadata, alloc, try std.fmt.allocPrint(alloc, "{s}.ssm.conv_kernel", .{a}), q.conv_kernel);
-        try putNum(metadata, alloc, try std.fmt.allocPrint(alloc, "{s}.ssm.state_size", .{a}), q.state_size);
-        try putNum(metadata, alloc, try std.fmt.allocPrint(alloc, "{s}.ssm.group_count", .{a}), q.group_count);
-        try putNum(metadata, alloc, try std.fmt.allocPrint(alloc, "{s}.ssm.time_step_rank", .{a}), q.time_step_rank);
-        try putNum(metadata, alloc, try std.fmt.allocPrint(alloc, "{s}.ssm.inner_size", .{a}), q.inner_size);
-        try putNum(metadata, alloc, try std.fmt.allocPrint(alloc, "{s}.nextn_predict_layers", .{a}), q.nextn_layers);
-        try putNum(metadata, alloc, try std.fmt.allocPrint(alloc, "{s}.full_attention_interval", .{a}), q.full_attention_interval);
-        try putBoolArray(metadata, alloc, try std.fmt.allocPrint(alloc, "{s}.attention.recurrent_layers", .{a}), q.recurrent);
-        try putI64Array(metadata, alloc, try std.fmt.allocPrint(alloc, "{s}.rope.dimension_sections", .{a}), &q.rope_sections);
+        try putNum(metadata, alloc, try alloc.print("{s}.ssm.conv_kernel", .{a}), q.conv_kernel);
+        try putNum(metadata, alloc, try alloc.print("{s}.ssm.state_size", .{a}), q.state_size);
+        try putNum(metadata, alloc, try alloc.print("{s}.ssm.group_count", .{a}), q.group_count);
+        try putNum(metadata, alloc, try alloc.print("{s}.ssm.time_step_rank", .{a}), q.time_step_rank);
+        try putNum(metadata, alloc, try alloc.print("{s}.ssm.inner_size", .{a}), q.inner_size);
+        try putNum(metadata, alloc, try alloc.print("{s}.nextn_predict_layers", .{a}), q.nextn_layers);
+        try putNum(metadata, alloc, try alloc.print("{s}.full_attention_interval", .{a}), q.full_attention_interval);
+        try putBoolArray(metadata, alloc, try alloc.print("{s}.attention.recurrent_layers", .{a}), q.recurrent);
+        try putI64Array(metadata, alloc, try alloc.print("{s}.rope.dimension_sections", .{a}), &q.rope_sections);
     }
 
     // llama.cpp's converter writes key/value length for the llama and qwen3
     // classes (and whenever head_dim is explicit); the llama class also adds
     // vocab_size.
     if (self.head_dim != null or std.mem.eql(u8, family, "llama") or std.mem.eql(u8, family, "qwen3")) {
-        try putNum(metadata, alloc, try std.fmt.allocPrint(alloc, "{s}.attention.key_length", .{a}), key_len);
-        try putNum(metadata, alloc, try std.fmt.allocPrint(alloc, "{s}.attention.value_length", .{a}), key_len);
+        try putNum(metadata, alloc, try alloc.print("{s}.attention.key_length", .{a}), key_len);
+        try putNum(metadata, alloc, try alloc.print("{s}.attention.value_length", .{a}), key_len);
         if (std.mem.eql(u8, family, "llama")) {
-            try putNum(metadata, alloc, try std.fmt.allocPrint(alloc, "{s}.vocab_size", .{a}), self.vocab_size);
+            try putNum(metadata, alloc, try alloc.print("{s}.vocab_size", .{a}), self.vocab_size);
         }
     }
 
     try addRopeScaling(self, metadata, a, alloc);
     if (self.rope_sections) |rs| {
-        try putI64Array(metadata, alloc, try std.fmt.allocPrint(alloc, "{s}.rope.dimension_sections", .{a}), &rs);
+        try putI64Array(metadata, alloc, try alloc.print("{s}.rope.dimension_sections", .{a}), &rs);
     }
     if (self.deepstack_layers) |n| {
-        try putNum(metadata, alloc, try std.fmt.allocPrint(alloc, "{s}.n_deepstack_layers", .{a}), n);
+        try putNum(metadata, alloc, try alloc.print("{s}.n_deepstack_layers", .{a}), n);
     }
 
     if (self.sampling_temp) |t| try putFloat(metadata, alloc, "general.sampling.temp", t);
@@ -2581,17 +2581,17 @@ pub fn addMetadata(self: Model, metadata: *std.json.ObjectMap, arch_name: []cons
     if (self.datasets.len > 0) {
         try putNum(metadata, alloc, "general.dataset.count", @as(i64, @intCast(self.datasets.len)));
         for (self.datasets, 0..) |d, i| {
-            try putStr(metadata, alloc, try std.fmt.allocPrint(alloc, "general.dataset.{d}.name", .{i}), d.name);
-            if (d.organization) |o| try putStr(metadata, alloc, try std.fmt.allocPrint(alloc, "general.dataset.{d}.organization", .{i}), o);
-            if (d.repo_url) |u| try putStr(metadata, alloc, try std.fmt.allocPrint(alloc, "general.dataset.{d}.repo_url", .{i}), u);
+            try putStr(metadata, alloc, try alloc.print("general.dataset.{d}.name", .{i}), d.name);
+            if (d.organization) |o| try putStr(metadata, alloc, try alloc.print("general.dataset.{d}.organization", .{i}), o);
+            if (d.repo_url) |u| try putStr(metadata, alloc, try alloc.print("general.dataset.{d}.repo_url", .{i}), u);
         }
     }
     if (self.base_models.len > 0) {
         try putNum(metadata, alloc, "general.base_model.count", @as(i64, @intCast(self.base_models.len)));
         for (self.base_models, 0..) |bm, i| {
-            try putStr(metadata, alloc, try std.fmt.allocPrint(alloc, "general.base_model.{d}.name", .{i}), bm.name);
-            if (bm.organization) |o| try putStr(metadata, alloc, try std.fmt.allocPrint(alloc, "general.base_model.{d}.organization", .{i}), o);
-            if (bm.repo_url) |u| try putStr(metadata, alloc, try std.fmt.allocPrint(alloc, "general.base_model.{d}.repo_url", .{i}), u);
+            try putStr(metadata, alloc, try alloc.print("general.base_model.{d}.name", .{i}), bm.name);
+            if (bm.organization) |o| try putStr(metadata, alloc, try alloc.print("general.base_model.{d}.organization", .{i}), o);
+            if (bm.repo_url) |u| try putStr(metadata, alloc, try alloc.print("general.base_model.{d}.repo_url", .{i}), u);
         }
     }
 
@@ -2638,9 +2638,9 @@ pub fn addMetadata(self: Model, metadata: *std.json.ObjectMap, arch_name: []cons
 fn checkpointDirName(path: []const u8) ?[]const u8 {
     var p = path;
     while (p.len > 1 and p[p.len - 1] == '/') p = p[0 .. p.len - 1];
-    const base = std.fs.path.basename(p);
+    const base = std.Io.Dir.path.basename(p);
     const name = if (std.mem.endsWith(u8, base, ".safetensors") or std.mem.endsWith(u8, base, ".json"))
-        std.fs.path.basename(std.fs.path.dirname(p) orelse return null)
+        std.Io.Dir.path.basename(std.Io.Dir.path.dirname(p) orelse return null)
     else
         base;
     if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return null;
@@ -3011,7 +3011,7 @@ pub fn sidecarPrecheck(meta: std.json.ObjectMap) !void {
     // 0-wide model loads far enough to be confusing, so refuse it here instead.
     var buf: [256]u8 = undefined;
     for ([_][]const u8{ "block_count", "embedding_length", "feed_forward_length", "attention.head_count" }) |suffix| {
-        const key = std.fmt.bufPrint(&buf, "{s}.{s}", .{ arch, suffix }) catch return error.MissingDimensions;
+        const key = std.mem.print(&buf, "{s}.{s}", .{ arch, suffix }) catch return error.MissingDimensions;
         if (ggU64(meta, key) == null) return error.MissingDimensions;
     }
     if (ggArr(meta, "tokenizer.ggml.tokens") == null) return error.MissingVocabulary;
@@ -3127,7 +3127,7 @@ pub fn writeSidecars(
 /// config.json most likely said.
 fn f32Json(v: f64) std.json.Value {
     var buf: [64]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "{d}", .{@as(f32, @floatCast(v))}) catch return .{ .float = v };
+    const s = std.mem.print(&buf, "{d}", .{@as(f32, @floatCast(v))}) catch return .{ .float = v };
     return .{ .float = std.fmt.parseFloat(f64, s) catch v };
 }
 
@@ -3145,7 +3145,7 @@ fn minTransformersVersion(arch_name: []const u8) ?[]const u8 {
 }
 
 fn keyPref(alloc: std.mem.Allocator, arch: []const u8, suffix: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(alloc, "{s}.{s}", .{ arch, suffix });
+    return alloc.print("{s}.{s}", .{ arch, suffix });
 }
 
 fn writeConfig(
@@ -3164,7 +3164,7 @@ fn writeConfig(
     vision: ?Vision,
 ) !void {
     var entries: std.ArrayList(KeyStr) = .empty;
-    const cls = try std.fmt.allocPrint(alloc, "{s}ForCausalLM", .{try pyTitle(alloc, arch_name)});
+    const cls = try alloc.print("{s}ForCausalLM", .{try pyTitle(alloc, arch_name)});
     try entries.append(alloc, .{ .k = "architectures", .v = try jsonArr(alloc, &[_]std.json.Value{try jsonStr(alloc, cls)}) });
     try entries.append(alloc, .{ .k = "model_type", .v = try jsonStr(alloc, arch_name) });
     try entries.append(alloc, .{ .k = "hidden_size", .v = .{ .integer = @intCast(emb) } });
@@ -3483,9 +3483,9 @@ fn buildCard(meta: std.json.ObjectMap, alloc: std.mem.Allocator) !?[]const u8 {
             // one from another host stores a url we cannot turn back into an id,
             // so the usable indices are not a contiguous run: walk to count and
             // skip the gaps rather than stopping at the first one.
-            const n = ggU64(m, try std.fmt.allocPrint(a, "{s}.count", .{prefix})) orelse 0;
+            const n = ggU64(m, try a.print("{s}.count", .{prefix})) orelse 0;
             for (0..n) |i| {
-                const url = ggStr(m, try std.fmt.allocPrint(a, "{s}.{d}.repo_url", .{ prefix, i })) orelse continue;
+                const url = ggStr(m, try a.print("{s}.{d}.repo_url", .{ prefix, i })) orelse continue;
                 const cut = "https://huggingface.co/";
                 if (std.mem.startsWith(u8, url, cut)) try ids.append(a, url[cut.len..]);
             }
@@ -3862,7 +3862,7 @@ fn generateMerges(alloc: std.mem.Allocator, names: []const []const u8, scores: [
 
     var arr: std.json.Array = .init(alloc);
     for (list.items) |rec| {
-        const joined = try std.fmt.allocPrint(alloc, "{s} {s}", .{ rec.l, rec.r });
+        const joined = try alloc.print("{s} {s}", .{ rec.l, rec.r });
         arr.append(try jsonStr(alloc, joined)) catch return error.OutOfMemory;
     }
     return arr;
@@ -4489,9 +4489,9 @@ test "HfLlm.mapName places the qwen35 hybrid, its MTP head and its vision tower"
         .{ .hf = "self_attn.k_norm.weight", .gg = "attn_k_norm.weight" },
     };
     for (cases) |c| {
-        const hf = try std.fmt.allocPrint(a, "model.language_model.layers.5.{s}", .{c.hf});
+        const hf = try a.print("model.language_model.layers.5.{s}", .{c.hf});
         defer a.free(hf);
-        const want = try std.fmt.allocPrint(a, "blk.5.{s}", .{c.gg});
+        const want = try a.print("blk.5.{s}", .{c.gg});
         defer a.free(want);
         const got = (try m(a, q, hf, 64)).?;
         defer a.free(got);
@@ -4702,7 +4702,7 @@ test "HfLlm.mapVisionName maps both towers into the clip namespace, and back" {
     inline for (.{ .{ VisionProjector.qwen3vl, &q3 }, .{ VisionProjector.qwen25vl, &q25 } }) |pc| {
         const v = testVision(pc[0]);
         for (pc[1]) |c| for ([_][]const u8{ "model.visual.", "visual." }) |pre| {
-            const hf = try std.fmt.allocPrint(a, "{s}{s}", .{ pre, c.hf });
+            const hf = try a.print("{s}{s}", .{ pre, c.hf });
             try testing.expectEqualStrings(c.gg, (try mapVisionName(a, v, hf)).?);
             try testing.expectEqualStrings(hf, (try mapVisionNameReverse(a, v, pre, c.gg)).?);
         };
@@ -5008,7 +5008,7 @@ test "a path that names no directory still gets the checkpoint's name" {
         try testing.expectEqual(@as(?[]const u8, null), checkpointDirName(path));
         const m = (try load(io, t.dir, path, arena.allocator(), null)).?;
         const name = checkpointDirName(m.dir).?;
-        try testing.expect(std.fs.path.isAbsolute(m.dir));
+        try testing.expect(std.Io.Dir.path.isAbsolute(m.dir));
         try testing.expect(!std.mem.eql(u8, name, "model.safetensors"));
     }
 
@@ -5084,7 +5084,7 @@ test "rope scaling reaches the metadata, or says why it cannot" {
         var t = testing.tmpDir(.{});
         defer t.cleanup();
         _ = try makeMiniDir(&t, io);
-        const cfg = try std.fmt.allocPrint(a,
+        const cfg = try a.print(
             \\{{ "model_type": "qwen2", "num_hidden_layers": 2, "hidden_size": 4,
             \\   "intermediate_size": 8, "num_attention_heads": 2, "num_key_value_heads": 1,
             \\   "max_position_embeddings": 131072, "rms_norm_eps": 1e-5, {s} "vocab_size": 6 }}
@@ -5833,7 +5833,7 @@ test "a card keeps the entries after one with no huggingface url" {
     try putStr(&meta, a, "general.base_model.2.repo_url", "https://huggingface.co/org/other");
 
     const card = (try buildCard(meta, a)).?;
-    try testing.expect(std.mem.indexOf(u8, card, "- org/other\n") != null);
+    try testing.expect(std.mem.find(u8, card, "- org/other\n") != null);
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, card, "base_model:\n"));
 }
 
@@ -5878,7 +5878,7 @@ test "writeCard names each frontmatter list once" {
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, card, "tags:\n"));
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, card, "language:\n"));
     for ([_][]const u8{ "- text-generation\n", "- gguf\n", "- qwen\n", "- en\n", "- fr\n" }) |item| {
-        try testing.expect(std.mem.indexOf(u8, card, item) != null);
+        try testing.expect(std.mem.find(u8, card, item) != null);
     }
 }
 
@@ -5997,6 +5997,6 @@ test "parseSpmModel rejects a length that would wrap the offset" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     // Field 1, wire type 2, length 2^64-1: pos + len wraps back under bytes.len.
-    const bytes = [_]u8{0x0A} ++ [_]u8{0xFF} ** 9 ++ [_]u8{0x01};
+    const bytes = [_]u8{0x0A} ++ @as([9]u8, @splat(0xFF)) ++ [_]u8{0x01};
     try testing.expectError(error.BadProtobuf, parseSpmModel(arena.allocator(), &bytes));
 }

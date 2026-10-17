@@ -114,7 +114,7 @@ pub fn link(
     b: *std.Build,
     exe: *std.Build.Step.Compile,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
 ) void {
     const lib = buildLib(b, target, optimize);
     exe.root_module.linkLibrary(lib);
@@ -125,7 +125,7 @@ pub fn link(
 pub fn buildLib(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
 ) *std.Build.Step.Compile {
     const lib = b.addLibrary(.{
         .name = "ggml",
@@ -206,5 +206,5 @@ fn addSources(
 }
 
 fn thisDir() []const u8 {
-    return std.fs.path.dirname(@src().file) orelse ".";
+    return std.Io.Dir.path.dirname(@src().file) orelse ".";
 }

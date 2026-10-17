@@ -95,7 +95,7 @@ pub fn init(path: []const u8, io: std.Io, mem_allocator: std.mem.Allocator, aren
     var bytes_read: u64 = 0;
 
     // Read and verify magic number
-    const magic = try reader.interface.readAlloc(mem_allocator, 4);
+    const magic = try reader.interface.readAllocAll(mem_allocator, 4);
     defer mem_allocator.free(magic);
     bytes_read += 4;
     if (!std.mem.eql(u8, magic, "GGUF")) {
@@ -119,17 +119,17 @@ pub fn init(path: []const u8, io: std.Io, mem_allocator: std.mem.Allocator, aren
         self.tensors.deinit(arena_alloc);
     }
 
-    const version_buffer = try reader.interface.readAlloc(mem_allocator, 4);
+    const version_buffer = try reader.interface.readAllocAll(mem_allocator, 4);
     defer mem_allocator.free(version_buffer);
     bytes_read += 4;
     self.version = std.mem.readInt(u32, version_buffer[0..4], .little);
 
-    const tensor_count_buf = try reader.interface.readAlloc(mem_allocator, 8);
+    const tensor_count_buf = try reader.interface.readAllocAll(mem_allocator, 8);
     defer mem_allocator.free(tensor_count_buf);
     bytes_read += 8;
     const tensor_count = std.mem.readInt(u64, tensor_count_buf[0..8], .little);
 
-    const metadata_count_buf = try reader.interface.readAlloc(mem_allocator, 8);
+    const metadata_count_buf = try reader.interface.readAllocAll(mem_allocator, 8);
     defer mem_allocator.free(metadata_count_buf);
     bytes_read += 8;
     const metadata_count = std.mem.readInt(u64, metadata_count_buf[0..8], .little);
@@ -146,14 +146,14 @@ pub fn init(path: []const u8, io: std.Io, mem_allocator: std.mem.Allocator, aren
     try self.tensors.ensureTotalCapacity(self.arena_alloc, tensor_count);
     var ti: u64 = 0;
     while (ti < tensor_count) : (ti += 1) {
-        const str_len_buf = try reader.interface.readAlloc(mem_allocator, 8);
+        const str_len_buf = try reader.interface.readAllocAll(mem_allocator, 8);
         defer mem_allocator.free(str_len_buf);
         bytes_read += 8;
         const str_len = std.mem.readInt(i64, str_len_buf[0..8], .little);
-        const name = try reader.interface.readAlloc(arena_alloc, @intCast(str_len));
+        const name = try reader.interface.readAllocAll(arena_alloc, @intCast(str_len));
         bytes_read += @intCast(str_len);
 
-        const dim_count_buf = try reader.interface.readAlloc(mem_allocator, 4);
+        const dim_count_buf = try reader.interface.readAllocAll(mem_allocator, 4);
         defer mem_allocator.free(dim_count_buf);
         bytes_read += 4;
         const dim_count = std.mem.readInt(u32, dim_count_buf[0..4], .little);
@@ -162,18 +162,18 @@ pub fn init(path: []const u8, io: std.Io, mem_allocator: std.mem.Allocator, aren
 
         var j: u64 = 0;
         while (j < dim_count) : (j += 1) {
-            const buf = try reader.interface.readAlloc(mem_allocator, 8);
+            const buf = try reader.interface.readAllocAll(mem_allocator, 8);
             defer mem_allocator.free(buf);
             bytes_read += 8;
             dims[j] = @intCast(std.mem.readInt(u64, buf[0..8], .little));
         }
 
-        const type_buf = try reader.interface.readAlloc(mem_allocator, 4);
+        const type_buf = try reader.interface.readAllocAll(mem_allocator, 4);
         defer mem_allocator.free(type_buf);
         bytes_read += 4;
         const tensor_type = try GgmlType.fromInt(std.mem.readInt(u32, type_buf[0..4], .little));
 
-        const offset_buf = try reader.interface.readAlloc(mem_allocator, 8);
+        const offset_buf = try reader.interface.readAllocAll(mem_allocator, 8);
         defer mem_allocator.free(offset_buf);
         bytes_read += 8;
         const tensor_offset = std.mem.readInt(u64, offset_buf[0..8], .little);
@@ -312,16 +312,16 @@ pub const GgmlType = enum(u32) {
     count = 42, // Tracks how many types there are
 
     pub fn fromInt(value: u32) !GgmlType {
-        const max_val = @intFromEnum(GgmlType.count);
+        const max_val = @backingInt(GgmlType.count);
         if (value >= max_val) return error.InvalidGgmlType;
-        return @enumFromInt(value);
+        return @fromBackingInt(value);
     }
 
     pub fn fromString(value: []const u8) !GgmlType {
         // Longer than any name in this enum is simply not one of them. Without
         // this, lowerString asserts and takes the process down - and callers
         // hand it safetensors type names (INT4_CONVROT_SR) that are longer.
-        var lower: [12]u8 = [_]u8{0} ** 12;
+        var lower: [12]u8 = @splat(0);
         if (value.len > lower.len) return error.InvalidGgmlType;
         return std.meta.stringToEnum(GgmlType, std.ascii.lowerString(lower[0..value.len], value)) orelse error.InvalidGgmlType;
     }
@@ -413,7 +413,7 @@ const GgufMetadata = struct {
     value_type: GgufValueType,
 
     pub fn read(reader: *std.Io.Reader, allocator: std.mem.Allocator, bytes_read: *u64) !GgufMetadata {
-        var len_buffer = try reader.readAlloc(allocator, 8);
+        var len_buffer = try reader.readAllocAll(allocator, 8);
         defer allocator.free(len_buffer);
         bytes_read.* += 8;
         const title_len = std.mem.readInt(u64, len_buffer[0..8], .little);
@@ -424,13 +424,13 @@ const GgufMetadata = struct {
             return error.InvalidMetadataTitleLength;
         }
 
-        const title = try reader.readAlloc(allocator, title_len);
+        const title = try reader.readAllocAll(allocator, title_len);
         bytes_read.* += title_len;
 
-        const type_buf = try reader.readAlloc(allocator, 4);
+        const type_buf = try reader.readAllocAll(allocator, 4);
         defer allocator.free(type_buf);
         bytes_read.* += 4;
-        const value_type = @as(GgufValueType, @enumFromInt(std.mem.readInt(u32, type_buf[0..4], .little)));
+        const value_type = @as(GgufValueType, @fromBackingInt(std.mem.readInt(u32, type_buf[0..4], .little)));
 
         return GgufMetadata{
             .title_len = title_len,
@@ -606,7 +606,7 @@ fn maybeWritePadding(self: Gguf, size: u64, writer: *std.Io.Writer) !void {
     while (padding_len > 0) {
         // to work with any alignment value, we will iteratively write 0's
         // typically this is 32 though, so in most cases this will be a single loop
-        const zeros = [_]u8{0} ** 32;
+        const zeros: [32]u8 = @splat(0);
         const lt = @min(padding_len, 32);
         try writer.writeAll(zeros[0..lt]);
         padding_len -= lt;
@@ -712,7 +712,7 @@ pub fn writeStringTracked(writer: *std.Io.Writer, str: []const u8) !u64 {
 pub fn writeMetadataKVStringTracked(writer: *std.Io.Writer, key: []const u8, value: []const u8) !u64 {
     var bytes: u64 = 0;
     bytes += try writeStringTracked(writer, key);
-    try writer.writeInt(u32, @intFromEnum(GgufValueType.string), .little);
+    try writer.writeInt(u32, @backingInt(GgufValueType.string), .little);
     bytes += 4;
     bytes += try writeStringTracked(writer, value);
     return bytes;
@@ -721,7 +721,7 @@ pub fn writeMetadataKVStringTracked(writer: *std.Io.Writer, key: []const u8, val
 pub fn writeMetadataKVU32Tracked(writer: *std.Io.Writer, key: []const u8, value: u32) !u64 {
     var bytes: u64 = 0;
     bytes += try writeStringTracked(writer, key);
-    try writer.writeInt(u32, @intFromEnum(GgufValueType.uint32), .little);
+    try writer.writeInt(u32, @backingInt(GgufValueType.uint32), .little);
     bytes += 4;
     try writer.writeInt(u32, value, .little);
     bytes += 4;
@@ -734,37 +734,37 @@ pub fn writeMetadataKVJsonTracked(writer: *std.Io.Writer, key: []const u8, value
 
     switch (value) {
         .bool => |b| {
-            try writer.writeInt(u32, @intFromEnum(GgufValueType.bool), .little);
+            try writer.writeInt(u32, @backingInt(GgufValueType.bool), .little);
             bytes += 4;
             try writer.writeByte(if (b) 1 else 0);
             bytes += 1;
         },
         .integer => |i| {
             if (i >= 0 and i <= std.math.maxInt(u32)) {
-                try writer.writeInt(u32, @intFromEnum(GgufValueType.uint32), .little);
+                try writer.writeInt(u32, @backingInt(GgufValueType.uint32), .little);
                 bytes += 4;
                 try writer.writeInt(u32, @intCast(i), .little);
                 bytes += 4;
             } else {
-                try writer.writeInt(u32, @intFromEnum(GgufValueType.int64), .little);
+                try writer.writeInt(u32, @backingInt(GgufValueType.int64), .little);
                 bytes += 4;
                 try writer.writeInt(i64, i, .little);
                 bytes += 8;
             }
         },
         .float => |f| {
-            try writer.writeInt(u32, @intFromEnum(GgufValueType.float32), .little);
+            try writer.writeInt(u32, @backingInt(GgufValueType.float32), .little);
             bytes += 4;
             try writer.writeInt(u32, @bitCast(@as(f32, @floatCast(f))), .little);
             bytes += 4;
         },
         .string => |s| {
-            try writer.writeInt(u32, @intFromEnum(GgufValueType.string), .little);
+            try writer.writeInt(u32, @backingInt(GgufValueType.string), .little);
             bytes += 4;
             bytes += try writeStringTracked(writer, s);
         },
         .array => |a| {
-            try writer.writeInt(u32, @intFromEnum(GgufValueType.array), .little);
+            try writer.writeInt(u32, @backingInt(GgufValueType.array), .little);
             bytes += 4;
 
             if (a.items.len == 0) return error.EmptyMetadataArray;
@@ -776,7 +776,7 @@ pub fn writeMetadataKVJsonTracked(writer: *std.Io.Writer, key: []const u8, value
                 .string => .string,
                 else => return error.UnsupportedMetadataArrayType,
             };
-            try writer.writeInt(u32, @intFromEnum(array_type), .little);
+            try writer.writeInt(u32, @backingInt(array_type), .little);
             bytes += 4;
             try writer.writeInt(u64, a.items.len, .little);
             bytes += 8;
@@ -820,7 +820,7 @@ pub fn writeTensorInfoTracked(writer: *std.Io.Writer, name: []const u8, dims: []
         try writer.writeInt(u64, @intCast(dims[i]), .little);
         bytes += 8;
     }
-    try writer.writeInt(u32, @intFromEnum(type_), .little);
+    try writer.writeInt(u32, @backingInt(type_), .little);
     bytes += 4;
     try writer.writeInt(u64, offset, .little);
     bytes += 8;
@@ -1028,73 +1028,73 @@ pub fn writeTemplate(self: Gguf, writer: *std.Io.Writer) !void {
 fn readGgufValueAsJson(self: Gguf, reader: *std.Io.Reader, value_type: GgufValueType, bytes_read: *u64) !std.json.Value {
     return switch (value_type) {
         .bool => {
-            const buf = try reader.readAlloc(self.arena_alloc, 1);
+            const buf = try reader.readAllocAll(self.arena_alloc, 1);
             bytes_read.* += 1;
             return std.json.Value{ .bool = buf[0] != 0 };
         },
         .uint8 => {
-            const buf = try reader.readAlloc(self.arena_alloc, 1);
+            const buf = try reader.readAllocAll(self.arena_alloc, 1);
             bytes_read.* += 1;
             return std.json.Value{ .integer = buf[0] };
         },
         .int8 => {
-            const buf = try reader.readAlloc(self.arena_alloc, 1);
+            const buf = try reader.readAllocAll(self.arena_alloc, 1);
             bytes_read.* += 1;
             return std.json.Value{ .integer = @as(i8, @bitCast(buf[0])) };
         },
         .uint16 => {
-            const buf = try reader.readAlloc(self.arena_alloc, 2);
+            const buf = try reader.readAllocAll(self.arena_alloc, 2);
             bytes_read.* += 2;
             return std.json.Value{ .integer = std.mem.readInt(u16, buf[0..2], .little) };
         },
         .int16 => {
-            const buf = try reader.readAlloc(self.arena_alloc, 2);
+            const buf = try reader.readAllocAll(self.arena_alloc, 2);
             bytes_read.* += 2;
             return std.json.Value{ .integer = std.mem.readInt(i16, buf[0..2], .little) };
         },
         .uint32 => {
-            const buf = try reader.readAlloc(self.arena_alloc, 4);
+            const buf = try reader.readAllocAll(self.arena_alloc, 4);
             bytes_read.* += 4;
             return std.json.Value{ .integer = std.mem.readInt(u32, buf[0..4], .little) };
         },
         .int32 => {
-            const buf = try reader.readAlloc(self.arena_alloc, 4);
+            const buf = try reader.readAllocAll(self.arena_alloc, 4);
             bytes_read.* += 4;
             return std.json.Value{ .integer = std.mem.readInt(i32, buf[0..4], .little) };
         },
         .float32 => {
-            const buf = try reader.readAlloc(self.arena_alloc, 4);
+            const buf = try reader.readAllocAll(self.arena_alloc, 4);
             bytes_read.* += 4;
             return std.json.Value{ .float = @as(f32, @bitCast(std.mem.readInt(u32, buf[0..4], .little))) };
         },
         .uint64 => {
-            const buf = try reader.readAlloc(self.arena_alloc, 8);
+            const buf = try reader.readAllocAll(self.arena_alloc, 8);
             bytes_read.* += 8;
             return std.json.Value{ .integer = @intCast(std.mem.readInt(u64, buf[0..8], .little)) };
         },
         .int64 => {
-            const buf = try reader.readAlloc(self.arena_alloc, 8);
+            const buf = try reader.readAllocAll(self.arena_alloc, 8);
             bytes_read.* += 8;
             return std.json.Value{ .integer = std.mem.readInt(i64, buf[0..8], .little) };
         },
         .float64 => {
-            const buf = try reader.readAlloc(self.arena_alloc, 8);
+            const buf = try reader.readAllocAll(self.arena_alloc, 8);
             bytes_read.* += 8;
             return std.json.Value{ .float = @as(f64, @bitCast(std.mem.readInt(u64, buf[0..8], .little))) };
         },
         .string => {
-            const buf = try reader.readAlloc(self.arena_alloc, 8);
+            const buf = try reader.readAllocAll(self.arena_alloc, 8);
             bytes_read.* += 8;
             const str_len = std.mem.readInt(i64, buf[0..8], .little);
-            const str = try reader.readAlloc(self.arena_alloc, @intCast(str_len));
+            const str = try reader.readAllocAll(self.arena_alloc, @intCast(str_len));
             bytes_read.* += @intCast(str_len);
             return std.json.Value{ .string = str };
         },
         .array => {
-            const type_buf = try reader.readAlloc(self.arena_alloc, 4);
+            const type_buf = try reader.readAllocAll(self.arena_alloc, 4);
             bytes_read.* += 4;
-            const array_type = @as(GgufValueType, @enumFromInt(std.mem.readInt(u32, type_buf[0..4], .little)));
-            var len_buf = try reader.readAlloc(self.arena_alloc, 8);
+            const array_type = @as(GgufValueType, @fromBackingInt(std.mem.readInt(u32, type_buf[0..4], .little)));
+            var len_buf = try reader.readAllocAll(self.arena_alloc, 8);
             bytes_read.* += 8;
             const arr_len = std.mem.readInt(i64, len_buf[0..8], .little);
 
@@ -1112,56 +1112,56 @@ fn readGgufValueAsJson(self: Gguf, reader: *std.Io.Reader, value_type: GgufValue
 fn readGgufArrayValue(self: Gguf, reader: *std.Io.Reader, writer: *std.Io.Writer, value_type: GgufValueType, depth: usize) !void {
     switch (value_type) {
         .bool => {
-            const buf = try reader.readAlloc(self.allocator, 1);
+            const buf = try reader.readAllocAll(self.allocator, 1);
             try writer.print("{}", .{buf[0] != 0});
         },
         .uint8 => {
-            const buf = try reader.readAlloc(self.allocator, 1);
+            const buf = try reader.readAllocAll(self.allocator, 1);
             try writer.print("{}", .{buf[0]});
         },
         .int8 => {
-            const buf = try reader.readAlloc(self.allocator, 1);
+            const buf = try reader.readAllocAll(self.allocator, 1);
             try writer.print("{}", .{@as(i8, @bitCast(buf[0]))});
         },
         .uint16 => {
-            const buf = try reader.readAlloc(self.allocator, 2);
+            const buf = try reader.readAllocAll(self.allocator, 2);
             try writer.print("{}", .{std.mem.readInt(u16, buf[0..2], .little)});
         },
         .int16 => {
-            const buf = try reader.readAlloc(self.allocator, 2);
+            const buf = try reader.readAllocAll(self.allocator, 2);
             try writer.print("{}", .{std.mem.readInt(i16, buf[0..2], .little)});
         },
         .uint32 => {
-            const buf = try reader.readAlloc(self.allocator, 4);
+            const buf = try reader.readAllocAll(self.allocator, 4);
             try writer.print("{}", .{std.mem.readInt(u32, buf[0..4], .little)});
         },
         .int32 => {
-            const buf = try reader.readAlloc(self.allocator, 4);
+            const buf = try reader.readAllocAll(self.allocator, 4);
             try writer.print("{}", .{std.mem.readInt(i32, buf[0..4], .little)});
         },
         .float32 => {
-            const buf = try reader.readAlloc(self.allocator, 4);
+            const buf = try reader.readAllocAll(self.allocator, 4);
             try writer.print("{d}", .{@as(f32, @bitCast(std.mem.readInt(u32, buf[0..4], .little)))});
         },
         .uint64 => {
-            const buf = try reader.readAlloc(self.allocator, 8);
+            const buf = try reader.readAllocAll(self.allocator, 8);
             try writer.print("{}", .{std.mem.readInt(u64, buf[0..8], .little)});
         },
         .int64 => {
-            const buf = try reader.readAlloc(self.allocator, 8);
+            const buf = try reader.readAllocAll(self.allocator, 8);
             try writer.print("{}", .{std.mem.readInt(i64, buf[0..8], .little)});
         },
         .float64 => {
-            const buf = try reader.readAlloc(self.allocator, 8);
+            const buf = try reader.readAllocAll(self.allocator, 8);
             try writer.print("{d}", .{@as(f64, @bitCast(std.mem.readInt(u64, buf[0..8], .little)))});
         },
         .array => {
             // Read nested array type
-            const type_buf = try reader.readAlloc(self.allocator, 4);
-            const array_type = @as(GgufValueType, @enumFromInt(std.mem.readInt(u32, type_buf[0..4], .little)));
+            const type_buf = try reader.readAllocAll(self.allocator, 4);
+            const array_type = @as(GgufValueType, @fromBackingInt(std.mem.readInt(u32, type_buf[0..4], .little)));
 
             // Read array length
-            const len_buf = try reader.readAlloc(self.allocator, 8);
+            const len_buf = try reader.readAllocAll(self.allocator, 8);
             const arr_len = std.mem.readInt(i64, len_buf[0..8], .little);
 
             try writer.print("[\n", .{});
@@ -1179,9 +1179,9 @@ fn readGgufArrayValue(self: Gguf, reader: *std.Io.Reader, writer: *std.Io.Writer
             try writer.print("]", .{});
         },
         .string => {
-            const buf = try reader.readAlloc(self.allocator, 8);
+            const buf = try reader.readAllocAll(self.allocator, 8);
             const str_len = std.mem.readInt(i64, buf[0..8], .little);
-            const str = try reader.readAlloc(self.allocator, @intCast(str_len));
+            const str = try reader.readAllocAll(self.allocator, @intCast(str_len));
             try writer.print("\"{s}\"", .{str});
         },
     }

@@ -27,9 +27,9 @@ pub const FileType = enum {
     }
 
     pub fn parse_from_string(str: []const u8) !FileType {
-        inline for (std.meta.fields(FileType)) |field| {
-            if (std.mem.eql(u8, str, field.name)) {
-                return @field(FileType, field.name);
+        inline for (@typeInfo(FileType).@"enum".field_names) |name| {
+            if (std.mem.eql(u8, str, name)) {
+                return @field(FileType, name);
             }
         }
         return error.UnknownFormat;

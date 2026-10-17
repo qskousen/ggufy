@@ -105,7 +105,7 @@ pub fn load(
 
         // The counts live in their own tensor, so a file missing one is
         // truncated rather than merely sparse.
-        const counts_name = try std.fmt.allocPrint(scratch.allocator(), "{s}{s}", .{ base, counts_suffix });
+        const counts_name = try scratch.allocator().print("{s}{s}", .{ base, counts_suffix });
         const counts_t = findTensor(f.tensors.items, counts_name) orelse return error.ImatrixMissingCounts;
 
         const sums = try readF32(file, io, scratch.allocator(), f.current_data_begin, t);

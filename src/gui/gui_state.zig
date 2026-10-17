@@ -10,7 +10,7 @@ pub const State = struct {
     // File load
     load_state: std.atomic.Value(LoadState) = .init(.idle),
     dropping: bool = false,
-    file_selected_buf: [std.fs.max_path_bytes]u8 = undefined,
+    file_selected_buf: [std.Io.Dir.max_path_bytes]u8 = undefined,
     file_selected: ?[]u8 = null,
     file_selected_ready: std.atomic.Value(bool) = .init(false),
     file_dialog_open: bool = false,
@@ -30,7 +30,7 @@ pub const State = struct {
     target_filetype: ggufy.types.FileType = .gguf,
     target_dtype: ?ggufy.types.DataType = null,
     /// Output folder — null-terminated; dvui textEntry writes here directly.
-    target_folder_buf: [std.fs.max_path_bytes]u8 = std.mem.zeroes([std.fs.max_path_bytes]u8),
+    target_folder_buf: [std.Io.Dir.max_path_bytes]u8 = std.mem.zeroes([std.Io.Dir.max_path_bytes]u8),
     /// Output base filename without extension — null-terminated.
     target_filename_buf: [256]u8 = std.mem.zeroes([256]u8),
     /// Base file stem stored at init; used to regenerate filename when dtype changes.
@@ -59,12 +59,12 @@ pub const State = struct {
     hf_names: bool = false,
     /// -F: with hf_names, overwrite sidecars already in the output folder.
     force: bool = false,
-    imatrix_path_buf: [std.fs.max_path_bytes]u8 = std.mem.zeroes([std.fs.max_path_bytes]u8),
+    imatrix_path_buf: [std.Io.Dir.max_path_bytes]u8 = std.mem.zeroes([std.Io.Dir.max_path_bytes]u8),
     imatrix_path: ?[]u8 = null,
     imatrix_dialog_open: bool = false,
-    sensitivity_path_buf: [std.fs.max_path_bytes]u8 = std.mem.zeroes([std.fs.max_path_bytes]u8),
+    sensitivity_path_buf: [std.Io.Dir.max_path_bytes]u8 = std.mem.zeroes([std.Io.Dir.max_path_bytes]u8),
     sensitivity_path: ?[]u8 = null,
-    template_path_buf: [std.fs.max_path_bytes]u8 = std.mem.zeroes([std.fs.max_path_bytes]u8),
+    template_path_buf: [std.Io.Dir.max_path_bytes]u8 = std.mem.zeroes([std.Io.Dir.max_path_bytes]u8),
     template_path: ?[]u8 = null,
     /// The template is a llama.cpp type file, which works alongside -d and sensitivities.
     template_is_rules: bool = false,
@@ -78,9 +78,9 @@ pub const State = struct {
     gen_sensitivities_dialog_open: bool = false,
 
     // Export template / generate sensitivities
-    export_template_path_buf: [std.fs.max_path_bytes]u8 = std.mem.zeroes([std.fs.max_path_bytes]u8),
+    export_template_path_buf: [std.Io.Dir.max_path_bytes]u8 = std.mem.zeroes([std.Io.Dir.max_path_bytes]u8),
     export_template_path: ?[]u8 = null,
-    gen_sensitivities_path_buf: [std.fs.max_path_bytes]u8 = std.mem.zeroes([std.fs.max_path_bytes]u8),
+    gen_sensitivities_path_buf: [std.Io.Dir.max_path_bytes]u8 = std.mem.zeroes([std.Io.Dir.max_path_bytes]u8),
     gen_sensitivities_path: ?[]u8 = null,
     export_template_requested: bool = false,
     gen_sensitivities_requested: bool = false,
@@ -102,7 +102,7 @@ pub const State = struct {
     convert_requested: bool = false,
     convert_error: ?anyerror = null,
     convert_elapsed_ns: u64 = 0,
-    convert_output_path_buf: [std.fs.max_path_bytes]u8 = undefined,
+    convert_output_path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined,
     convert_output_path: ?[]u8 = null,
 
     // Current tensor info — written by the convert thread BEFORE the
@@ -132,7 +132,7 @@ pub const State = struct {
     predict_problem_len: usize = 0,
 
     // Overwrite confirmation
-    overwrite_pending_path_buf: [std.fs.max_path_bytes]u8 = undefined,
+    overwrite_pending_path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined,
     overwrite_pending_path: ?[]u8 = null,
 
     // Upscale confirmation

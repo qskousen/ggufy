@@ -27,7 +27,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       - name: Build for Linux x86-64
         if: matrix.os == 'ubuntu-24.04'
@@ -51,7 +51,7 @@ jobs:
       - name: Build for macOS x86-64
         if: matrix.os == 'macos-latest'
         run: |
-          zig build --release=small -Dtarget=x86_64-macos --sysroot "$(xcrun --sdk macosx --show-sdk-path)"
+          zig build --release=small -Dtarget=x86_64-macos --sysroot "$(xcrun --sdk macosx --show-sdk-path)" -Dmacos-sdk="$(xcrun --sdk macosx --show-sdk-path)"
           mkdir -p dist/macos-x86_64
           cp zig-out/bin/ggufy zig-out/bin/ggufy-gui dist/macos-x86_64/
           cd dist/macos-x86_64
@@ -61,7 +61,7 @@ jobs:
       - name: Build for macOS aarch64
         if: matrix.os == 'macos-latest'
         run: |
-          zig build --release=small -Dtarget=aarch64-macos --sysroot "$(xcrun --sdk macosx --show-sdk-path)"
+          zig build --release=small -Dtarget=aarch64-macos --sysroot "$(xcrun --sdk macosx --show-sdk-path)" -Dmacos-sdk="$(xcrun --sdk macosx --show-sdk-path)"
           mkdir -p dist/macos-aarch64
           cp zig-out/bin/ggufy zig-out/bin/ggufy-gui dist/macos-aarch64/
           cd dist/macos-aarch64

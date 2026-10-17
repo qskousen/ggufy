@@ -15,10 +15,10 @@ comptime {
 
 const window_icon_png = @embedFile("gg.png");
 
-var gpa_instance = std.heap.DebugAllocator(.{}){};
-const gpa = gpa_instance.allocator();
+// Both set first thing in main, from std's per-mode allocator.
+var gpa: std.mem.Allocator = undefined;
 
-var arena = std.heap.ArenaAllocator.init(gpa);
+var arena: std.heap.ArenaAllocator = undefined;
 const arena_alloc = arena.allocator();
 
 var state: guiState.State = .{};
@@ -105,13 +105,15 @@ fn coerceToTarget(model: ?conv.TargetModel) void {
 }
 
 pub fn main(init: std.process.Init) !void {
-    if (@import("builtin").os.tag == .windows) {
+    gpa = init.gpa;
+    arena = .init(gpa);
+
+    if (builtin.target.os.tag == .windows) {
         dvui.Backend.Common.windowsAttachConsole() catch {};
     }
     SDLBackend.enableSDLLogging();
     std.log.info("SDL version: {f}", .{SDLBackend.getSDLVersion()});
 
-    defer if (gpa_instance.deinit() != .ok) @panic("Memory leak on exit!");
     defer arena.deinit();
     defer if (state.loaded_file) |*lf| lf.deinit();
 
@@ -121,7 +123,6 @@ pub fn main(init: std.process.Init) !void {
     state.target_threads = state.cpu_count;
 
     var backend = try SDLBackend.initWindow(.{
-        .allocator = gpa,
         .io = init.io,
         .size = .{ .w = 800.0, .h = 600.0 },
         .min_size = .{ .w = 250.0, .h = 350.0 },
@@ -241,9 +242,6 @@ pub fn main(init: std.process.Init) !void {
         if (!keep_running) break :main_loop;
 
         const end_micros = try win.end(.{});
-        try backend.setCursor(win.cursorRequested());
-        try backend.textInputRect(win.textInputRequested());
-        try backend.renderPresent();
         const wait_event_micros = win.waitTime(end_micros);
         interrupted = try backend.waitEventTimeout(wait_event_micros);
     }
@@ -311,7 +309,7 @@ fn gui_frame() bool {
     const border: ?dvui.Rect = if (dropping) dvui.Rect.all(1) else null;
     const background_color: dvui.Color = .{ .r = if (dropping) 120 else 0, .g = if (dropping) 120 else 0, .b = if (dropping) 230 else 0, .a = 80 };
 
-    var box = dvui.box(@src(), .{}, .{ .expand = .both, .color_border = border_color, .border = border, .color_fill = background_color, .background = true });
+    var box = dvui.box(@src(), .{}, .{ .expand = .both, .color_border = .{ .color = border_color }, .border = border, .color_fill = .{ .color = background_color }, .background = true });
     defer box.deinit();
 
     switch (state.load_state.load(.acquire)) {
@@ -378,10 +376,10 @@ fn formatBytes(value: u64, buf: []u8) []u8 {
     var idx: usize = 0;
     var scaled = @as(f64, @floatFromInt(value));
     while (scaled >= 1024.0 and idx < units.len - 1) { scaled /= 1024.0; idx += 1; }
-    if (idx == 0) return std.fmt.bufPrint(buf, "{d}{s}", .{ value, units[idx] }) catch buf[0..0];
-    if (scaled >= 100.0) return std.fmt.bufPrint(buf, "{d:.0}{s}", .{ scaled, units[idx] }) catch buf[0..0];
-    if (scaled >= 10.0)  return std.fmt.bufPrint(buf, "{d:.1}{s}", .{ scaled, units[idx] }) catch buf[0..0];
-    return std.fmt.bufPrint(buf, "{d:.2}{s}", .{ scaled, units[idx] }) catch buf[0..0];
+    if (idx == 0) return std.mem.print(buf, "{d}{s}", .{ value, units[idx] }) catch buf[0..0];
+    if (scaled >= 100.0) return std.mem.print(buf, "{d:.0}{s}", .{ scaled, units[idx] }) catch buf[0..0];
+    if (scaled >= 10.0)  return std.mem.print(buf, "{d:.1}{s}", .{ scaled, units[idx] }) catch buf[0..0];
+    return std.mem.print(buf, "{d:.2}{s}", .{ scaled, units[idx] }) catch buf[0..0];
 }
 
 // Screen: intro
@@ -440,7 +438,7 @@ fn showInputFile() void {
     if (first_init) {
         state.convert_options_initialized = true;
         // Folder: directory of the source file
-        const dir = std.fs.path.dirname(state.file_selected.?) orelse ".";
+        const dir = std.Io.Dir.path.dirname(state.file_selected.?) orelse ".";
         const dir_len = @min(dir.len, state.target_folder_buf.len - 1);
         @memcpy(state.target_folder_buf[0..dir_len], dir[0..dir_len]);
         state.target_folder_buf[dir_len] = 0;
@@ -474,7 +472,7 @@ fn showInputFile() void {
         );
     }
 
-    const dim_color = dvui.themeGet().color(.control, .text).opacity(0.45);
+    const dim_color: dvui.ColorOrGradient = .{ .color = dvui.themeGet().color(.control, .text).opacity(0.45) };
 
     // Conversion options
     {
@@ -589,7 +587,7 @@ fn showInputFile() void {
             };
             const stem = state.filename_base_stem_buf[0..state.filename_base_stem_len];
             if (type_name.len > 0) {
-                const written = std.fmt.bufPrint(
+                const written = std.mem.print(
                     state.target_filename_buf[0..state.target_filename_buf.len - 1],
                     "{s}-{s}",
                     .{ stem, type_name },
@@ -647,7 +645,7 @@ fn showInputFile() void {
             const adv_branch = adv_tree.branch(@src(), .{ .expanded = false }, .{ .expand = .horizontal });
             defer adv_branch.deinit();
             const adv_caret: []const u8 = if (adv_branch.expanded) "v " else "> ";
-            const adv_header = std.fmt.allocPrint(fa, "{s}Advanced", .{adv_caret}) catch "> Advanced";
+            const adv_header = fa.print("{s}Advanced", .{adv_caret}) catch "> Advanced";
             dvui.labelNoFmt(@src(), adv_header, .{}, .{ .expand = .horizontal, .margin = .{ .x = 0, .y = 8, .w = 0, .h = 2 } });
             if (adv_branch.expander(@src(), .{ .indent = 10 }, .{ .expand = .horizontal })) {
                 const is_safetensors_out = state.target_filetype == .safetensors;
@@ -681,10 +679,10 @@ fn showInputFile() void {
                     else
                         "A GGUF cannot carry an attention preference; ComfyUI's Model Attention Backend node sets one at load time."}, .{});
                     const attention_names = [_][]const u8{ "Keep source's", "Int8 (comfy-kitchen)", "Default (none)" };
-                    var idx: usize = @intFromEnum(state.attention);
+                    var idx: usize = @backingInt(state.attention);
                     if (is_safetensors_out) {
                         if (dvui.dropdown(@src(), &attention_names, .{ .choice = &idx }, .{}, .{ .expand = .horizontal, .gravity_y = 0.5 })) {
-                            state.attention = @enumFromInt(idx);
+                            state.attention = @fromBackingInt(@intCast(idx));
                         }
                     } else {
                         var dummy = idx;
@@ -764,7 +762,7 @@ fn showInputFile() void {
 
                 // Imatrix file row, dimmed for safetensors output
                 {
-                    const row_color: ?dvui.Color = if (is_safetensors_out) dim_color else null;
+                    const row_color: ?dvui.ColorOrGradient = if (is_safetensors_out) dim_color else null;
                     var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .all(2) });
                     defer row.deinit();
                     var lwd: dvui.WidgetData = undefined;
@@ -824,7 +822,7 @@ fn showInputFile() void {
                 {
                     const blocked_by_template = state.template_path != null and !state.template_is_rules;
                     const blocked = is_safetensors_out or blocked_by_template;
-                    const row_color: ?dvui.Color = if (blocked) dim_color else null;
+                    const row_color: ?dvui.ColorOrGradient = if (blocked) dim_color else null;
 
                     var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .all(2) });
                     defer row.deinit();
@@ -901,7 +899,7 @@ fn showInputFile() void {
                 {
                     const sens_active = !is_safetensors_out and !state.skip_sensitivity and
                         (has_sensitivities or state.sensitivity_path != null);
-                    const agg_color: ?dvui.Color = if (!sens_active) dim_color else null;
+                    const agg_color: ?dvui.ColorOrGradient = if (!sens_active) dim_color else null;
 
                     var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .all(2) });
                     defer row.deinit();
@@ -920,7 +918,7 @@ fn showInputFile() void {
                     }
 
                     var agg_label_buf: [8]u8 = undefined;
-                    const agg_label = std.fmt.bufPrint(&agg_label_buf, "{d}", .{state.target_aggressiveness}) catch "?";
+                    const agg_label = std.mem.print(&agg_label_buf, "{d}", .{state.target_aggressiveness}) catch "?";
                     dvui.labelNoFmt(@src(), agg_label, .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 28 }, .color_text = agg_color });
 
                     var agg_frac: f32 = (@as(f32, @floatFromInt(state.target_aggressiveness)) - 1.0) / 99.0;
@@ -946,7 +944,7 @@ fn showInputFile() void {
                         "Number of CPU threads to use during quantization.", .{}, .{});
 
                     var thr_label_buf: [8]u8 = undefined;
-                    const thr_label = std.fmt.bufPrint(&thr_label_buf, "{d}", .{state.target_threads}) catch "?";
+                    const thr_label = std.mem.print(&thr_label_buf, "{d}", .{state.target_threads}) catch "?";
                     dvui.labelNoFmt(@src(), thr_label, .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 28 } });
 
                     var thr_frac: f32 = (@as(f32, @floatFromInt(state.target_threads)) - 1.0) / (cpu_f - 1.0);
@@ -979,11 +977,11 @@ fn showInputFile() void {
                 .border = dvui.Rect.all(1),
                 .margin = .{ .x = 0, .y = 6, .w = 0, .h = 2 },
                 .padding = .all(6),
-                .color_border = dvui.Color{ .r = 200, .g = 140, .b = 0, .a = 255 },
+                .color_border = .{ .color = .{ .r = 200, .g = 140, .b = 0, .a = 255 } },
             });
             defer warn_box.deinit();
             dvui.label(@src(), "Warning: Architecture not recognized. Results may be suboptimal due to the unrecognized architecture.", .{}, .{
-                .color_text = dvui.Color{ .r = 200, .g = 140, .b = 0, .a = 255 },
+                .color_text = .{ .color = .{ .r = 200, .g = 140, .b = 0, .a = 255 } },
                 .margin = .{ .x = 0, .y = 0, .w = 0, .h = 4 },
             });
             _ = dvui.checkbox(@src(), &state.allow_unknown_arch, "Convert anyway", .{});
@@ -997,11 +995,11 @@ fn showInputFile() void {
                 .border = dvui.Rect.all(1),
                 .margin = .{ .x = 0, .y = 6, .w = 0, .h = 2 },
                 .padding = .all(6),
-                .color_border = dvui.Color{ .r = 200, .g = 140, .b = 0, .a = 255 },
+                .color_border = .{ .color = .{ .r = 200, .g = 140, .b = 0, .a = 255 } },
             });
             defer warn_box.deinit();
             dvui.label(@src(), "Warning: This model's pre-tokenizer matches no llama.cpp tag. Converting anyway tags it \"default\", which llama.cpp tokenizes as gpt2 and warns about.", .{}, .{
-                .color_text = dvui.Color{ .r = 200, .g = 140, .b = 0, .a = 255 },
+                .color_text = .{ .color = .{ .r = 200, .g = 140, .b = 0, .a = 255 } },
                 .margin = .{ .x = 0, .y = 0, .w = 0, .h = 4 },
             });
             _ = dvui.checkbox(@src(), &state.allow_unknown_arch, "Convert anyway", .{});
@@ -1037,7 +1035,7 @@ fn showInputFile() void {
                 });
                 if (state.predictProblem().len > 0) {
                     var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal, .background = false, .margin = .{ .x = 0, .y = 2, .w = 0, .h = 2 } });
-                    tl.addText(state.predictProblem(), .{ .color_text = dvui.Color{ .r = 200, .g = 140, .b = 0, .a = 255 } });
+                    tl.addText(state.predictProblem(), .{ .color_text = .{ .color = .{ .r = 200, .g = 140, .b = 0, .a = 255 } } });
                     tl.deinit();
                 }
             }
@@ -1051,14 +1049,14 @@ fn showInputFile() void {
         const target_problem = state.targetProblem();
         if (target_problem.len > 0) {
             var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal, .background = false, .margin = .{ .x = 0, .y = 4, .w = 0, .h = 2 } });
-            tl.addText(target_problem, .{ .color_text = dvui.Color{ .r = 220, .g = 60, .b = 60, .a = 255 } });
+            tl.addText(target_problem, .{ .color_text = .{ .color = .{ .r = 220, .g = 60, .b = 60, .a = 255 } } });
             tl.deinit();
         }
 
         // Action buttons
         if (state.same_file_error) {
             dvui.label(@src(), "Output path cannot be the same as the input file.", .{}, .{
-                .color_text = dvui.Color{ .r = 220, .g = 60, .b = 60, .a = 255 },
+                .color_text = .{ .color = .{ .r = 220, .g = 60, .b = 60, .a = 255 } },
                 .margin = .{ .x = 0, .y = 4, .w = 0, .h = 2 },
             });
         }
@@ -1128,7 +1126,7 @@ fn showInputFile() void {
                     .{ .r = 220, .g = 60, .b = 60, .a = 255 }
                 else
                     .{ .r = 80, .g = 180, .b = 80, .a = 255 };
-                dvui.labelNoFmt(@src(), status, .{}, .{ .color_text = color, .margin = .{ .x = 0, .y = 2, .w = 0, .h = 2 } });
+                dvui.labelNoFmt(@src(), status, .{}, .{ .color_text = .{ .color = color }, .margin = .{ .x = 0, .y = 2, .w = 0, .h = 2 } });
             }
         }
     }
@@ -1472,7 +1470,7 @@ fn showModelInternals() void {
         const meta_branch = tree.branch(@src(), .{ .expanded = false }, .{ .expand = .horizontal });
         defer meta_branch.deinit();
         const meta_caret: []const u8 = if (meta_branch.expanded) "v " else "> ";
-        const header = std.fmt.allocPrint(fa, "{s}Metadata ({d})", .{ meta_caret, meta.count() }) catch "Metadata";
+        const header = fa.print("{s}Metadata ({d})", .{ meta_caret, meta.count() }) catch "Metadata";
         dvui.labelNoFmt(@src(), header, .{}, .{ .expand = .horizontal });
         if (meta_branch.expander(@src(), .{ .indent = 10 }, .{ .expand = .horizontal })) {
             var it = meta.iterator();
@@ -1482,7 +1480,7 @@ fn showModelInternals() void {
                 const entry_branch = tree.branch(@src(), .{ .expanded = false }, .{ .expand = .horizontal, .id_extra = i });
                 defer entry_branch.deinit();
                 const entry_caret: []const u8 = if (entry_branch.expanded) "v " else "> ";
-                const entry_label = std.fmt.allocPrint(fa, "{s}{s}  [{s}]", .{ entry_caret, entry.key_ptr.*, type_name }) catch entry.key_ptr.*;
+                const entry_label = fa.print("{s}{s}  [{s}]", .{ entry_caret, entry.key_ptr.*, type_name }) catch entry.key_ptr.*;
                 dvui.labelNoFmt(@src(), entry_label, .{}, .{ .expand = .horizontal });
                 if (entry_branch.expander(@src(), .{ .indent = 10 }, .{ .expand = .horizontal, .id_extra = i })) {
                     showJsonValue(entry.value_ptr.*);
@@ -1497,7 +1495,7 @@ fn showModelInternals() void {
         const tensors_branch = tree.branch(@src(), .{ .expanded = false }, .{ .expand = .horizontal });
         defer tensors_branch.deinit();
         const tensors_caret: []const u8 = if (tensors_branch.expanded) "v " else "> ";
-        const header = std.fmt.allocPrint(fa, "{s}Tensors ({d})", .{ tensors_caret, n }) catch "Tensors";
+        const header = fa.print("{s}Tensors ({d})", .{ tensors_caret, n }) catch "Tensors";
         dvui.labelNoFmt(@src(), header, .{}, .{ .expand = .horizontal });
         if (tensors_branch.expander(@src(), .{ .indent = 10 }, .{ .expand = .horizontal })) {
             showTensorsVirtual(file, tensors_branch.data().id, n);
@@ -1600,7 +1598,7 @@ fn showTensorBranch(tensor: ggufy.types.Tensor, idx: usize) void {
     var size_buf: [32]u8 = undefined;
     const size_str = formatBytes(tensor.size, &size_buf);
 
-    const line = std.fmt.allocPrint(fa, "{s}  [{s}]  Dimensions: {s}  ({d} total), Size: {s}  Offset: {d}", .{
+    const line = fa.print("{s}  [{s}]  Dimensions: {s}  ({d} total), Size: {s}  Offset: {d}", .{
         tensor.name, tensor.type, dims_writer.buffered(), n, size_str, tensor.offset,
     }) catch tensor.name;
 

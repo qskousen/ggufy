@@ -65,7 +65,7 @@ pub const TensorFile = struct {
         if (ret.type_counts.count() > 0) {
             var stats_it = ret.type_counts.iterator();
             while (stats_it.next()) |entry| {
-                ret.types_line = try std.fmt.allocPrint(arena_alloc, "{s} {s}: {}", .{ ret.types_line, @tagName(entry.key_ptr.*), entry.value_ptr.* });
+                ret.types_line = try arena_alloc.print("{s} {s}: {}", .{ ret.types_line, @tagName(entry.key_ptr.*), entry.value_ptr.* });
             }
         }
 

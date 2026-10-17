@@ -187,7 +187,7 @@ fn cancelCallback(ctx: ?*anyopaque) bool {
 // Export template / generate sensitivities
 
 fn setToolStatus(state: *guiState.State, is_error: bool, comptime fmt: []const u8, args: anytype) void {
-    const msg = std.fmt.bufPrint(&state.tool_status_buf, fmt, args) catch "(message too long)";
+    const msg = std.mem.print(&state.tool_status_buf, fmt, args) catch "(message too long)";
     state.tool_status_len = msg.len;
     state.tool_status_is_error = is_error;
 }
@@ -270,7 +270,7 @@ pub fn doExportTemplate(arena_alloc: std.mem.Allocator, state: *guiState.State) 
         },
     }
     writer.flush() catch {};
-    setToolStatus(state, false, "Template exported to {s}", .{std.fs.path.basename(path)});
+    setToolStatus(state, false, "Template exported to {s}", .{std.Io.Dir.path.basename(path)});
 }
 
 pub fn doGenSensitivities(arena_alloc: std.mem.Allocator, state: *guiState.State) void {
@@ -300,7 +300,7 @@ pub fn doGenSensitivities(arena_alloc: std.mem.Allocator, state: *guiState.State
         return;
     };
     writer.flush() catch {};
-    setToolStatus(state, false, "Sensitivities written to {s}", .{std.fs.path.basename(path)});
+    setToolStatus(state, false, "Sensitivities written to {s}", .{std.Io.Dir.path.basename(path)});
 }
 
 // Conversion

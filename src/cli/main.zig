@@ -27,7 +27,7 @@ fn formatBytes(bytes: u64, buf: []u8) []const u8 {
     var value: f64 = @floatFromInt(bytes);
     var unit: usize = 0;
     while (value >= 1024.0 and unit < units.len - 1) : (unit += 1) value /= 1024.0;
-    return std.fmt.bufPrint(buf, "{d:.2} {s}", .{ value, units[unit] }) catch buf[0..0];
+    return std.mem.print(buf, "{d:.2} {s}", .{ value, units[unit] }) catch buf[0..0];
 }
 
 /// Refusals convert() and predictOutputSize() have already explained on their
@@ -353,7 +353,7 @@ pub fn main(init: std.process.Init) !void {
                 },
                 .template => {
                     const out_path = if (output_name) |n|
-                        try std.fmt.allocPrint(arena_alloc, "{s}.json", .{n})
+                        try arena_alloc.print("{s}.json", .{n})
                     else
                         "template.json";
                     const out_file = try std.Io.Dir.cwd().createFile(io, out_path, .{ .truncate = true });
@@ -375,7 +375,7 @@ pub fn main(init: std.process.Init) !void {
                 },
                 .sensitivities => {
                     const out_path = if (output_name) |n|
-                        try std.fmt.allocPrint(arena_alloc, "{s}.json", .{n})
+                        try arena_alloc.print("{s}.json", .{n})
                     else
                         "sensitivities.json";
                     const out_file = try std.Io.Dir.cwd().createFile(io, out_path, .{ .truncate = true });
@@ -429,7 +429,7 @@ pub fn main(init: std.process.Init) !void {
                 .names => try dumpNames(f.tensors.items, res.args.shapes != 0, allocator, stdout),
                 .template => {
                     const out_path = if (output_name) |n|
-                        try std.fmt.allocPrint(arena_alloc, "{s}.json", .{n})
+                        try arena_alloc.print("{s}.json", .{n})
                     else
                         "template.json";
                     const out_file = try std.Io.Dir.cwd().createFile(io, out_path, .{ .truncate = true });
@@ -443,7 +443,7 @@ pub fn main(init: std.process.Init) !void {
                 },
                 .sensitivities => {
                     const out_path = if (output_name) |n|
-                        try std.fmt.allocPrint(arena_alloc, "{s}.json", .{n})
+                        try arena_alloc.print("{s}.json", .{n})
                     else
                         "sensitivities.json";
                     const out_file = try std.Io.Dir.cwd().createFile(io, out_path, .{ .truncate = true });

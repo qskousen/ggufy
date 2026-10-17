@@ -2,15 +2,18 @@
 A lightweight and efficient tool to convert tensor formats.
 
 ggufy:
-- is a single-file executable written in zig, for linux, windows, and macos (arm64 and x86_64)
+- is a single-file executable written in Zig, for linux, windows, and macos (arm64 and x86_64)
 - comes in CLI and GUI flavors
 - is fast and memory efficient
-- supports converting from safetensors to various gguf quantizations
-- supports converting safetensors datatypes (F32, BF16, F16, F8 E4M3/E5M2, Scaled F8 E4M3, MXFP8 E4M3, NVFP4, INT8, INT8 CONVROT, INT4 CONVROT, INT4 CONVROT SR)
+- supports converting safetensors and gguf quantizations
+- despite the name, is happy to convert safetensors to safetensors; BF16 to INT8_CONVROT for example
 - supports converting with "[quantization sensitivity](docs/CLI.md#sensitivity-aware-quantization)" files (some architectures built-in)
-- currently targets image and video diffusion models (SD1.5, SDXL, MiniMax H3, etc.)
+- currently targets image and video diffusion models (SD1.5, SDXL, MiniMax H3, etc.) as well as a limited subset of LLM's
 
 Download pre-built executables [on the releases page](https://github.com/qskousen/ggufy/releases)
+
+Join our [fluxer](https://chat.syf.me/invite/T2JOigIZ) to discuss ggufy, AI, and relevant topics.
+"Why not just use Discord like everyone else?" https://blog.qskousen.info/why-not-discord
 
 ### GUI screenshots
 
@@ -136,7 +139,7 @@ For the full command reference — all commands and options, quantization levels
 
 ## Building
 
-ggufy is built with zig 0.16.0. Clone the repository, with submodules:
+ggufy is built with zig 0.17.0. Clone the repository, with submodules:
 
 ```bash
 git clone --recurse-submodules https://github.com/qskousen/ggufy.git

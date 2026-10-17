@@ -180,7 +180,7 @@ test "qwen image 2.1 with a split MLP" {
         names.deinit(allocator);
     }
     for (parsed.value) |e| {
-        if (std.mem.indexOf(u8, e.name, "img_mlp.gate_up.") != null) {
+        if (std.mem.find(u8, e.name, "img_mlp.gate_up.") != null) {
             for ([_][]const u8{ "proj", "gate_layer" }) |half| {
                 const n = try std.mem.replaceOwned(u8, allocator, e.name, "gate_up", half);
                 errdefer allocator.free(n);

@@ -25,7 +25,7 @@
     .fingerprint = 0x3853cf8946957bc, // Changing this has security and trust implications.
     // Tracks the earliest Zig version that the package considers to be a
     // supported use case.
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     // This field is optional.
     // Each dependency must either provide a `url` and `hash`, or a `path`.
     // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.
@@ -33,12 +33,16 @@
     // internet connectivity.
     .dependencies = .{
         .clap = .{
-            .url = "https://github.com/Hejsil/zig-clap/archive/refs/tags/0.12.0.tar.gz",
-            .hash = "clap-0.12.0-oBajB7foAQDqlSwaSG5g0yq7xGbQARUsBk5T64gAOqP5",
+            .url = "git+https://github.com/Hejsil/zig-clap?ref=master#05faf3905e8548f5cc269a8836e154065e70128d",
+            .hash = "clap-0.12.0-oBajB4XpAQCF1WRKnD5KOKPsnwwT_NNdAJ7Ww3irYJac",
         },
         .dvui = .{
-            .url = "git+https://github.com/david-vanderson/dvui?ref=main#5577c507f746018b7ec29957e62a4b86b5047b9d",
-            .hash = "dvui-0.5.0-dev-AQFJmeTy9QDL3m_yewh656aqxib46ngC37A_goLmAENy",
+            .url = "git+https://github.com/david-vanderson/dvui?ref=main#2604404f31c0735c968c75facb6c5103af186456",
+            .hash = "dvui-0.6.0-dev-AQFJmRY1BAGDPS1dQpywCUUx1DaNfe829yDn1RLsyR3y",
+        },
+        .translate_c = .{
+            .url = "git+https://codeberg.org/ziglang/translate-c?ref=zig-0.17.x#cfac21f3199b2b02ce3fd7db652aa456421fe4ab",
+            .hash = "translate_c-2.0.2-Q_BUWvBNBwDnyehSiuAJmdFcMYHYGA-Jc3KiYdrV2Dqx",
         },
     },
     .paths = .{

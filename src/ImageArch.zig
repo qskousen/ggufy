@@ -62,7 +62,7 @@ fn modulePathLen(pattern: []const u8, key: []const u8) ?usize {
     var pi = std.mem.splitScalar(u8, pattern, '.');
     var pos: usize = 0;
     while (pi.next()) |want| {
-        const end = std.mem.indexOfScalarPos(u8, key, pos, '.') orelse return null;
+        const end = std.mem.findScalarPos(u8, key, pos, '.') orelse return null;
         const got = key[pos..end];
         const ok = if (std.mem.eql(u8, want, "N"))
             got.len > 0 and for (got) |ch| {
@@ -184,7 +184,7 @@ pub const Arch = struct {
     /// Check if a key should be kept in high precision
     pub fn isHighPrecision(self: Arch, key: []const u8) bool {
         for (self.keys_hiprec) |hiprec| {
-            if (std.mem.indexOf(u8, key, hiprec) != null) {
+            if (std.mem.find(u8, key, hiprec) != null) {
                 return true;
             }
         }
@@ -205,7 +205,7 @@ pub const Arch = struct {
         if (dims.len == 0) return false;
         const cols = dims[dims.len - 1];
         for (self.keys_hiprec_narrow) |rule| {
-            if (cols < rule.below_cols and std.mem.indexOf(u8, key, rule.key) != null) return true;
+            if (cols < rule.below_cols and std.mem.find(u8, key, rule.key) != null) return true;
         }
         return false;
     }
@@ -226,7 +226,7 @@ pub const Arch = struct {
     /// The `<module>.comfy_attention.config` tensor names for the attention modules
     /// `names` hold tensors under, keeping each name's own prefix, in first-seen order.
     pub fn attentionConfigNames(self: Arch, names: []const []const u8, with_skipped: bool, alloc: std.mem.Allocator) ![]const []const u8 {
-        var out: std.StringArrayHashMapUnmanaged(void) = .empty;
+        var out: std.array_hash_map.String(void) = .empty;
         for (names) |name| {
             const key = stripPrefix(name);
             const len = self.attentionModuleLen(key, with_skipped) orelse continue;
@@ -242,9 +242,9 @@ pub const Arch = struct {
     pub fn precisionFloor(self: Arch, key: []const u8) ?Precision {
         var strictest: ?Precision = null;
         for (self.precision_floor) |rule| {
-            const hit = if (rule.named) namedMatch(key, rule.key) else std.mem.indexOf(u8, key, rule.key) != null;
+            const hit = if (rule.named) namedMatch(key, rule.key) else std.mem.find(u8, key, rule.key) != null;
             if (!hit) continue;
-            if (strictest == null or @intFromEnum(rule.min) > @intFromEnum(strictest.?)) {
+            if (strictest == null or @backingInt(rule.min) > @backingInt(strictest.?)) {
                 strictest = rule.min;
             }
         }
@@ -254,7 +254,7 @@ pub const Arch = struct {
     /// Check if a key should be ignored
     pub fn shouldIgnore(self: Arch, key: []const u8) bool {
         for (self.keys_ignore) |ignore| {
-            if (std.mem.indexOf(u8, key, ignore) != null) {
+            if (std.mem.find(u8, key, ignore) != null) {
                 return true;
             }
         }
@@ -280,7 +280,7 @@ pub const Arch = struct {
     /// Check if a key must pass through unquantized in NVFP4 output for ComfyUI compat
     pub fn isNvfp4Passthrough(self: Arch, key: []const u8) bool {
         for (self.keys_nvfp4_passthrough) |pattern| {
-            if (std.mem.indexOf(u8, key, pattern) != null) return true;
+            if (std.mem.find(u8, key, pattern) != null) return true;
         }
         return false;
     }

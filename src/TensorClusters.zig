@@ -241,9 +241,9 @@ fn appendInt8ConvrotCluster(
     arena_alloc: std.mem.Allocator,
     allocator: std.mem.Allocator,
 ) !bool {
-    const wname = try std.fmt.allocPrint(allocator, "{s}.weight", .{base_name});
+    const wname = try allocator.print("{s}.weight", .{base_name});
     defer allocator.free(wname);
-    const wsname = try std.fmt.allocPrint(allocator, "{s}.weight_scale", .{base_name});
+    const wsname = try allocator.print("{s}.weight_scale", .{base_name});
     defer allocator.free(wsname);
 
     const wi = name_map.get(wname) orelse {
@@ -305,9 +305,9 @@ fn appendInt4Cluster(
     arena_alloc: std.mem.Allocator,
     allocator: std.mem.Allocator,
 ) !bool {
-    const wname = try std.fmt.allocPrint(allocator, "{s}.weight", .{base_name});
+    const wname = try allocator.print("{s}.weight", .{base_name});
     defer allocator.free(wname);
-    const wsname = try std.fmt.allocPrint(allocator, "{s}.weight_scale", .{base_name});
+    const wsname = try allocator.print("{s}.weight_scale", .{base_name});
     defer allocator.free(wsname);
 
     const wi = name_map.get(wname) orelse {
@@ -357,7 +357,7 @@ fn appendInt4Cluster(
 
 /// The tensor `base_name ++ suffix`, or null when the file has none.
 fn optionalSidecar(source: anytype, name_map: *std.StringHashMap(usize), base_name: []const u8, suffix: []const u8, allocator: std.mem.Allocator) !?types.Tensor {
-    const name = try std.fmt.allocPrint(allocator, "{s}{s}", .{ base_name, suffix });
+    const name = try allocator.print("{s}{s}", .{ base_name, suffix });
     defer allocator.free(name);
     const idx = name_map.get(name) orelse return null;
     return source.tensors.items[idx];
@@ -385,7 +385,7 @@ fn appendAsymW4a8Cluster(
         .{ .suffix = ".weight_codebook", .idx = 0 },
     };
     for (found[0..3]) |*f| {
-        const name = try std.fmt.allocPrint(allocator, "{s}{s}", .{ base_name, f.suffix });
+        const name = try allocator.print("{s}{s}", .{ base_name, f.suffix });
         defer allocator.free(name);
         f.idx = name_map.get(name) orelse {
             std.log.warn("TensorClusters: missing {s} for asym_w4a8 cluster {s}", .{ f.suffix, base_name });
@@ -488,11 +488,11 @@ fn appendNvfp4Cluster(
     arena_alloc: std.mem.Allocator,
     allocator: std.mem.Allocator,
 ) !bool {
-    const wname = try std.fmt.allocPrint(allocator, "{s}.weight", .{base_name});
+    const wname = try allocator.print("{s}.weight", .{base_name});
     defer allocator.free(wname);
-    const wsname = try std.fmt.allocPrint(allocator, "{s}.weight_scale", .{base_name});
+    const wsname = try allocator.print("{s}.weight_scale", .{base_name});
     defer allocator.free(wsname);
-    const ws2name = try std.fmt.allocPrint(allocator, "{s}.weight_scale_2", .{base_name});
+    const ws2name = try allocator.print("{s}.weight_scale_2", .{base_name});
     defer allocator.free(ws2name);
 
     const wi = name_map.get(wname) orelse {
@@ -511,7 +511,7 @@ fn appendNvfp4Cluster(
     const weight = source.tensors.items[wi];
     const weight_scale = source.tensors.items[wsi];
     const weight_scale_2 = source.tensors.items[ws2i];
-    const isname = try std.fmt.allocPrint(allocator, "{s}.input_scale", .{base_name});
+    const isname = try allocator.print("{s}.input_scale", .{base_name});
     defer allocator.free(isname);
 
     try list.append(arena_alloc, .{
@@ -544,11 +544,11 @@ fn appendFloat8Cluster(
     arena_alloc: std.mem.Allocator,
     allocator: std.mem.Allocator,
 ) !bool {
-    const wname = try std.fmt.allocPrint(allocator, "{s}.weight", .{base_name});
+    const wname = try allocator.print("{s}.weight", .{base_name});
     defer allocator.free(wname);
-    const wsname = try std.fmt.allocPrint(allocator, "{s}.weight_scale", .{base_name});
+    const wsname = try allocator.print("{s}.weight_scale", .{base_name});
     defer allocator.free(wsname);
-    const isname = try std.fmt.allocPrint(allocator, "{s}.input_scale", .{base_name});
+    const isname = try allocator.print("{s}.input_scale", .{base_name});
     defer allocator.free(isname);
 
     const wi = name_map.get(wname) orelse {
@@ -604,9 +604,9 @@ fn appendMxfp4Cluster(
     arena_alloc: std.mem.Allocator,
     allocator: std.mem.Allocator,
 ) !bool {
-    const wname = try std.fmt.allocPrint(allocator, "{s}.weight", .{base_name});
+    const wname = try allocator.print("{s}.weight", .{base_name});
     defer allocator.free(wname);
-    const wsname = try std.fmt.allocPrint(allocator, "{s}.weight_scale", .{base_name});
+    const wsname = try allocator.print("{s}.weight_scale", .{base_name});
     defer allocator.free(wsname);
 
     const wi = name_map.get(wname) orelse {
@@ -648,9 +648,9 @@ fn appendMxfp8Cluster(
     arena_alloc: std.mem.Allocator,
     allocator: std.mem.Allocator,
 ) !bool {
-    const wname = try std.fmt.allocPrint(allocator, "{s}.weight", .{base_name});
+    const wname = try allocator.print("{s}.weight", .{base_name});
     defer allocator.free(wname);
-    const wsname = try std.fmt.allocPrint(allocator, "{s}.weight_scale", .{base_name});
+    const wsname = try allocator.print("{s}.weight_scale", .{base_name});
     defer allocator.free(wsname);
 
     const wi = name_map.get(wname) orelse {
@@ -693,7 +693,7 @@ fn resolveClusterBase(
     layer_key: []const u8,
     allocator: std.mem.Allocator,
 ) !?[]const u8 {
-    const wsuffix = try std.fmt.allocPrint(allocator, "{s}.weight", .{layer_key});
+    const wsuffix = try allocator.print("{s}.weight", .{layer_key});
     defer allocator.free(wsuffix);
 
     // Fast path: fully-qualified keys are already exact tensor names. Return the
@@ -1542,8 +1542,8 @@ pub fn gatherExpertStack(
 
         var whole: ?[]f32 = null;
         defer if (whole) |w| allocator.free(w);
-        var part: ?[]u8 = null;
-        defer if (part) |b| allocator.free(b);
+        var part: ?[]f32 = null;
+        defer if (part) |p| allocator.free(p);
         const src: []const f32 = if (!dtype.isFloatType()) blk: {
             const w = (try dequantClusterWeight(seg.tensor, source, groups, allocator, pool)) orelse w: {
                 // A block-quantized GGUF tensor: its blocks dequantize on their own.
@@ -1553,8 +1553,7 @@ pub fn gatherExpertStack(
                 defer allocator.free(raw);
                 const file = try source.openFileForTensor(seg.tensor.name);
                 _ = try file.readPositionalAll(source.io, raw, seg.tensor.offset + source.current_data_begin);
-                const bytes = try DataTransform.Quantizer.convertTensorData(allocator, raw, dtype, .F32, n, pool);
-                break :w @as([]f32, @alignCast(std.mem.bytesAsSlice(f32, bytes)));
+                break :w try DataTransform.Quantizer.dequantizeToF32Alloc(allocator, raw, dtype, n, pool);
             };
             whole = w;
             if (seg.elem_offset + span > w.len) return error.ExpertStackOverflow;
@@ -1565,8 +1564,8 @@ pub fn gatherExpertStack(
             defer allocator.free(buf);
             const file = try source.openFileForTensor(seg.tensor.name);
             _ = try file.readPositionalAll(source.io, buf, seg.tensor.offset + source.current_data_begin + seg.elem_offset * elem_bytes);
-            part = try DataTransform.Quantizer.convertTensorData(allocator, buf, dtype, .F32, span, pool);
-            break :blk @as([]const f32, @alignCast(std.mem.bytesAsSlice(f32, part.?)));
+            part = try DataTransform.Quantizer.dequantizeToF32Alloc(allocator, buf, dtype, span, pool);
+            break :blk part.?;
         };
 
         for (0..runs) |r| {
@@ -1992,10 +1991,9 @@ pub fn loadMatchingSourceAsF32(
         const src_bytes = try readTensorBytesSized(source, source_tensor, allocator, source_size);
         defer allocator.free(src_bytes);
 
-        const f32_bytes = try DataTransform.Quantizer.convertTensorData(
-            allocator, src_bytes, source_dtype, .F32, n_elements, pool,
+        const f32_slice = try DataTransform.Quantizer.dequantizeToF32Alloc(
+            allocator, src_bytes, source_dtype, n_elements, pool,
         );
-        const f32_slice: []f32 = @alignCast(std.mem.bytesAsSlice(f32, f32_bytes));
         return .{ .data = f32_slice, .source_type = source_tensor.type };
     }
     return null;
@@ -2187,7 +2185,7 @@ fn readFixtureFile(allocator: std.mem.Allocator, path: []const u8, max_size: usi
 
 fn loadFixture(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
     var path_buf: [256]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ fixture_dir, name });
+    const path = try std.mem.print(&path_buf, "{s}/{s}", .{ fixture_dir, name });
     return readFixtureFile(allocator, path, 64 * 1024 * 1024) catch |err| {
         if (err == error.FileNotFound) return null;
         return err;
@@ -2972,7 +2970,7 @@ fn expectW4a8VariantDecodes(prefix: []const u8, with_correction: bool) !void {
     var name_buf: [64]u8 = undefined;
     const load = struct {
         fn f(a: std.mem.Allocator, buf: []u8, p: []const u8, suffix: []const u8) !?[]u8 {
-            return loadFixture(a, try std.fmt.bufPrint(buf, "{s}{s}", .{ p, suffix }));
+            return loadFixture(a, try std.mem.print(buf, "{s}{s}", .{ p, suffix }));
         }
     }.f;
     const ref_w = (try load(allocator, &name_buf, prefix, "weight.u8")) orelse return error.SkipZigTest;
@@ -3024,7 +3022,7 @@ fn expectW4a8ZpEncodeMatches(prefix: []const u8, cgs: usize) !void {
     var name_buf: [64]u8 = undefined;
     const load = struct {
         fn f(a: std.mem.Allocator, buf: []u8, p: []const u8, suffix: []const u8) !?[]u8 {
-            return loadFixture(a, try std.fmt.bufPrint(buf, "{s}{s}", .{ p, suffix }));
+            return loadFixture(a, try std.mem.print(buf, "{s}{s}", .{ p, suffix }));
         }
     }.f;
     const input_raw = (try loadFixture(allocator, "convrot_expected.f32")) orelse return error.SkipZigTest;
@@ -3140,7 +3138,7 @@ test "W4A8 nibbles are unsigned codebook indices, not two's complement" {
     const cols: usize = 256;
     // A large s_rel keeps the grid wide, so every level maps to a distinct value.
     const s_rel_byte = DataTransform.Quantizer.f32_to_fp8_e4m3(127.0);
-    const s_rel = [_]u8{s_rel_byte} ** (cols / 16);
+    const s_rel: [cols / 16]u8 = @splat(s_rel_byte);
     const s_channel = [_]f32{1.0};
 
     // One byte per pair of indices, walking all 16.
@@ -3461,11 +3459,11 @@ fn expectW6a8EncodeMatches(input_name: []const u8, prefix: []const u8, rows: usi
 
     const input_raw = (try loadFixture(allocator, input_name)) orelse return error.SkipZigTest;
     defer allocator.free(input_raw);
-    const ref_w = (try loadFixture(allocator, try std.fmt.bufPrint(&name_buf, "{s}weight.u8", .{prefix}))) orelse return error.SkipZigTest;
+    const ref_w = (try loadFixture(allocator, try std.mem.print(&name_buf, "{s}weight.u8", .{prefix}))) orelse return error.SkipZigTest;
     defer allocator.free(ref_w);
-    const ref_s_rel = (try loadFixture(allocator, try std.fmt.bufPrint(&name_buf, "{s}s_rel.u8", .{prefix}))) orelse return error.SkipZigTest;
+    const ref_s_rel = (try loadFixture(allocator, try std.mem.print(&name_buf, "{s}s_rel.u8", .{prefix}))) orelse return error.SkipZigTest;
     defer allocator.free(ref_s_rel);
-    const ref_sc_raw = (try loadFixture(allocator, try std.fmt.bufPrint(&name_buf, "{s}s_channel.f32", .{prefix}))) orelse return error.SkipZigTest;
+    const ref_sc_raw = (try loadFixture(allocator, try std.mem.print(&name_buf, "{s}s_channel.f32", .{prefix}))) orelse return error.SkipZigTest;
     defer allocator.free(ref_sc_raw);
 
     const input: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(input_raw)));
@@ -3573,13 +3571,13 @@ fn expectW6a8DecodeMatches(prefix: []const u8, rows: usize, cols: usize) !void {
     const allocator = std.testing.allocator;
     var name_buf: [64]u8 = undefined;
 
-    const ref_w = (try loadFixture(allocator, try std.fmt.bufPrint(&name_buf, "{s}weight.u8", .{prefix}))) orelse return error.SkipZigTest;
+    const ref_w = (try loadFixture(allocator, try std.mem.print(&name_buf, "{s}weight.u8", .{prefix}))) orelse return error.SkipZigTest;
     defer allocator.free(ref_w);
-    const ref_s_rel = (try loadFixture(allocator, try std.fmt.bufPrint(&name_buf, "{s}s_rel.u8", .{prefix}))) orelse return error.SkipZigTest;
+    const ref_s_rel = (try loadFixture(allocator, try std.mem.print(&name_buf, "{s}s_rel.u8", .{prefix}))) orelse return error.SkipZigTest;
     defer allocator.free(ref_s_rel);
-    const ref_sc_raw = (try loadFixture(allocator, try std.fmt.bufPrint(&name_buf, "{s}s_channel.f32", .{prefix}))) orelse return error.SkipZigTest;
+    const ref_sc_raw = (try loadFixture(allocator, try std.mem.print(&name_buf, "{s}s_channel.f32", .{prefix}))) orelse return error.SkipZigTest;
     defer allocator.free(ref_sc_raw);
-    const expected_raw = (try loadFixture(allocator, try std.fmt.bufPrint(&name_buf, "{s}expected.f32", .{prefix}))) orelse return error.SkipZigTest;
+    const expected_raw = (try loadFixture(allocator, try std.mem.print(&name_buf, "{s}expected.f32", .{prefix}))) orelse return error.SkipZigTest;
     defer allocator.free(expected_raw);
 
     const ref_sc: []const f32 = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(ref_sc_raw)));
@@ -3630,7 +3628,7 @@ test "W6A8 planes: code c of column k lands in nibble k and two-bit slot k" {
     const cols: usize = 32;
     var codes: [cols]u8 = undefined;
     for (&codes, 0..) |*c, k| c.* = @intCast((k * 37 + 5) % 64);
-    var row = [_]u8{0} ** (cols / 4 * 3);
+    var row: [cols / 4 * 3]u8 = @splat(0);
     for (codes, 0..) |c, k| {
         row[k / 2] |= (c & 0x0F) << @intCast(4 * (k % 2));
         row[cols / 2 + k / 4] |= (c >> 4) << @intCast(2 * (k % 4));

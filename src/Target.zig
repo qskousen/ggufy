@@ -203,7 +203,7 @@ pub const Output = struct {
     reshaped: usize = 0,
     /// The fused projection layout the file carries, if any.
     fused: ?Fusion = null,
-    dtypes: std.EnumSet(types.DataType) = .initEmpty(),
+    dtypes: std.EnumSet(types.DataType) = .empty,
 };
 
 pub const Level = enum { yes, partial, no };
@@ -231,7 +231,7 @@ fn assessComfy(out: Output, alloc: std.mem.Allocator) !Verdict {
     var need: []const u8 = "";
     var it = out.dtypes.iterator();
     while (it.next()) |t| {
-        if (comfyIssue(.safetensors, t)) |why| return .{ .consumer = .comfyui, .level = .no, .note = try std.fmt.allocPrint(alloc, "{s}: {s}", .{ @tagName(t), why }) };
+        if (comfyIssue(.safetensors, t)) |why| return .{ .consumer = .comfyui, .level = .no, .note = try alloc.print("{s}: {s}", .{ @tagName(t), why }) };
         const min = comfyMinVersion(t).?;
         if (versionLess(need, min)) need = min;
     }
@@ -241,8 +241,8 @@ fn assessComfy(out: Output, alloc: std.mem.Allocator) !Verdict {
         return .{ .consumer = .comfyui, .level = .partial, .note = "as a text encoder, for a model that uses this LLM" };
     }
     var note: []const u8 = "";
-    if (need.len > 0) note = try std.fmt.allocPrint(alloc, "{s} or newer", .{need});
-    if (out.dtypes.contains(.MXFP8_E4M3)) note = try std.fmt.allocPrint(alloc, "{s}, with a comfy_kitchen that has MXFP8", .{note});
+    if (need.len > 0) note = try alloc.print("{s} or newer", .{need});
+    if (out.dtypes.contains(.MXFP8_E4M3)) note = try alloc.print("{s}, with a comfy_kitchen that has MXFP8", .{note});
     return .{ .consumer = .comfyui, .level = .yes, .note = note };
 }
 
@@ -254,15 +254,15 @@ fn assessComfyGguf(out: Output, alloc: std.mem.Allocator) !Verdict {
     var warns: std.ArrayList([]const u8) = .empty;
     var it = out.dtypes.iterator();
     while (it.next()) |t| if (comfyIssue(.gguf, t)) |why| {
-        try warns.append(alloc, try std.fmt.allocPrint(alloc, "{s}: {s}", .{ @tagName(t), why }));
+        try warns.append(alloc, try alloc.print("{s}: {s}", .{ @tagName(t), why }));
     };
     if (!comfyGgufLoads(out.kind, out.arch_name))
-        try warns.append(alloc, try std.fmt.allocPrint(alloc, "ComfyUI-GGUF does not load {s}, so it needs a GGUF loader extension that does", .{out.arch_name}));
+        try warns.append(alloc, try alloc.print("ComfyUI-GGUF does not load {s}, so it needs a GGUF loader extension that does", .{out.arch_name}));
     if (out.kind == .llm and std.mem.eql(u8, out.arch_name, "llama")) {
         // Its llama branch un-permutes Q/K with hardcoded head counts.
         if (out.llama_heads) |h| {
             if (h.head_count != 32 or h.head_count_kv != 8)
-                try warns.append(alloc, try std.fmt.allocPrint(alloc, "ComfyUI-GGUF un-permutes llama Q/K assuming 32 heads and 8 KV heads; this model has {d} and {d}, so its attention would be scrambled", .{ h.head_count, h.head_count_kv }));
+                try warns.append(alloc, try alloc.print("ComfyUI-GGUF un-permutes llama Q/K assuming 32 heads and 8 KV heads; this model has {d} and {d}, so its attention would be scrambled", .{ h.head_count, h.head_count_kv }));
         } else try warns.append(alloc, "ComfyUI-GGUF un-permutes llama Q/K assuming 32 heads and 8 KV heads; this file does not say how many it has");
     }
     if (warns.items.len > 0) return .{ .consumer = .comfyui, .level = .partial, .warn = true, .note = try std.mem.join(alloc, "; ", warns.items) };
@@ -285,12 +285,12 @@ fn assessSdCpp(out: Output, alloc: std.mem.Allocator) !Verdict {
     if (out.kind != .diffusion) return .{ .consumer = .sdcpp, .level = .no, .note = "sd.cpp's target here is diffusion models" };
     var it = out.dtypes.iterator();
     while (it.next()) |t| if (sdcppIssue(t)) |why| {
-        return .{ .consumer = .sdcpp, .level = .no, .note = try std.fmt.allocPrint(alloc, "{s}: {s}", .{ @tagName(t), why }) };
+        return .{ .consumer = .sdcpp, .level = .no, .note = try alloc.print("{s}: {s}", .{ @tagName(t), why }) };
     };
-    if (out.reshaped > 0) return .{ .consumer = .sdcpp, .level = .no, .note = try std.fmt.allocPrint(alloc, "{d} tensors are stored reshaped for ComfyUI-GGUF, and sd.cpp reads the stored shape (--target sdcpp)", .{out.reshaped}) };
+    if (out.reshaped > 0) return .{ .consumer = .sdcpp, .level = .no, .note = try alloc.print("{d} tensors are stored reshaped for ComfyUI-GGUF, and sd.cpp reads the stored shape (--target sdcpp)", .{out.reshaped}) };
     if (out.fused) |fu| if (!sdcppReadsFused(out.arch_name, fu))
-        return .{ .consumer = .sdcpp, .level = .no, .note = try std.fmt.allocPrint(alloc, "sd.cpp reads {s} only as split projections, not fused into {s} (--target sdcpp)", .{ out.arch_name, std.mem.trim(u8, fu.fused, ".") }) };
-    if (!sdcppLoads(out.arch_name)) return .{ .consumer = .sdcpp, .level = .partial, .warn = true, .note = try std.fmt.allocPrint(alloc, "sd.cpp does not detect {s}", .{out.arch_name}) };
+        return .{ .consumer = .sdcpp, .level = .no, .note = try alloc.print("sd.cpp reads {s} only as split projections, not fused into {s} (--target sdcpp)", .{ out.arch_name, std.mem.trim(u8, fu.fused, ".") }) };
+    if (!sdcppLoads(out.arch_name)) return .{ .consumer = .sdcpp, .level = .partial, .warn = true, .note = try alloc.print("sd.cpp does not detect {s}", .{out.arch_name}) };
     return .{ .consumer = .sdcpp, .level = .yes };
 }
 
@@ -317,7 +317,7 @@ fn assessTransformers(out: Output, alloc: std.mem.Allocator) !Verdict {
     if (!out.hf_names) return .{ .consumer = .transformers, .level = .no, .note = "transformers needs HF tensor names (-H)" };
     var it = out.dtypes.iterator();
     while (it.next()) |t| if (dtypeIssue(.transformers, t)) |why| {
-        return .{ .consumer = .transformers, .level = .no, .note = try std.fmt.allocPrint(alloc, "{s}: {s}", .{ @tagName(t), why }) };
+        return .{ .consumer = .transformers, .level = .no, .note = try alloc.print("{s}: {s}", .{ @tagName(t), why }) };
     };
     if (!out.hf_sidecars) return .{ .consumer = .transformers, .level = .partial, .note = "with the source checkpoint's config.json and tokenizer copied beside it" };
     return .{ .consumer = .transformers, .level = .yes };
@@ -348,9 +348,9 @@ pub fn worksWith(verdicts: []const Verdict, alloc: std.mem.Allocator) ![]const u
         try parts.append(alloc, if (v.note.len == 0)
             v.consumer.label()
         else if (v.warn)
-            try std.fmt.allocPrint(alloc, "{s} (may not work, or work poorly: {s})", .{ v.consumer.label(), v.note })
+            try alloc.print("{s} (may not work, or work poorly: {s})", .{ v.consumer.label(), v.note })
         else
-            try std.fmt.allocPrint(alloc, "{s} ({s})", .{ v.consumer.label(), v.note }));
+            try alloc.print("{s} ({s})", .{ v.consumer.label(), v.note }));
     }
     if (parts.items.len == 0) return "nothing this tool knows of";
     return std.mem.join(alloc, "; ", parts.items);
@@ -451,18 +451,18 @@ pub fn plan(target: Target, kind: Kind, arch_name: []const u8, datatype: ?types.
             const hf = hfNames(t, kind, arch_name, ft, source_is_gguf);
             // HF names out of a GGUF take the HF layout, config.json and all.
             if (hf and ft == .safetensors and !hf_config_writable) {
-                why.* = try std.fmt.allocPrint(alloc, "ComfyUI takes a text encoder as safetensors under HF names, but ggufy writes that layout for {s} only, not {s}", .{ HfLlm.hf_config_archs_text, arch_name });
+                why.* = try alloc.print("ComfyUI takes a text encoder as safetensors under HF names, but ggufy writes that layout for {s} only, not {s}", .{ HfLlm.hf_config_archs_text, arch_name });
                 return error.TargetCannotLoad;
             }
             return .{ .target = t, .filetype = ft, .hf_names = hf };
         },
         .sdcpp => {
             if (kind != .diffusion) {
-                why.* = try std.fmt.allocPrint(alloc, "sd.cpp's target here is diffusion models; {s} is an LLM", .{arch_name});
+                why.* = try alloc.print("sd.cpp's target here is diffusion models; {s} is an LLM", .{arch_name});
                 return error.TargetCannotLoad;
             }
             if (datatype) |d| if (sdcppIssue(d)) |reason| {
-                why.* = try std.fmt.allocPrint(alloc, "{s}: {s}", .{ @tagName(d), reason });
+                why.* = try alloc.print("{s}: {s}", .{ @tagName(d), reason });
                 return error.TargetCannotLoad;
             };
             const ft = container orelse if (source_is_gguf) types.FileType.gguf else .safetensors;
@@ -470,12 +470,12 @@ pub fn plan(target: Target, kind: Kind, arch_name: []const u8, datatype: ?types.
         },
         .llamacpp => {
             if (kind != .llm) {
-                why.* = try std.fmt.allocPrint(alloc, "llama.cpp runs LLMs; {s} is a diffusion model", .{arch_name});
+                why.* = try alloc.print("llama.cpp runs LLMs; {s} is a diffusion model", .{arch_name});
                 return error.TargetCannotLoad;
             }
             if (container == .safetensors) {
                 why.* = if (datatype != null and datatype.?.formatType() == .safetensors)
-                    try std.fmt.allocPrint(alloc, "llama.cpp reads GGUF; {s} is a safetensors type. Choose a GGUF type (f16, q8_0, q4_k, ...)", .{@tagName(datatype.?)})
+                    try alloc.print("llama.cpp reads GGUF; {s} is a safetensors type. Choose a GGUF type (f16, q8_0, q4_k, ...)", .{@tagName(datatype.?)})
                 else
                     "llama.cpp reads GGUF, not safetensors";
                 return error.TargetCannotLoad;
@@ -484,11 +484,11 @@ pub fn plan(target: Target, kind: Kind, arch_name: []const u8, datatype: ?types.
         },
         .transformers => {
             if (kind != .llm) {
-                why.* = try std.fmt.allocPrint(alloc, "transformers output is for LLMs; {s} is a diffusion model", .{arch_name});
+                why.* = try alloc.print("transformers output is for LLMs; {s} is a diffusion model", .{arch_name});
                 return error.TargetCannotLoad;
             }
             if (datatype) |d| if (dtypeIssue(.transformers, d)) |reason| {
-                why.* = try std.fmt.allocPrint(alloc, "{s}: {s}", .{ @tagName(d), reason });
+                why.* = try alloc.print("{s}: {s}", .{ @tagName(d), reason });
                 return error.TargetCannotLoad;
             };
             if (container == .gguf) {
@@ -496,7 +496,7 @@ pub fn plan(target: Target, kind: Kind, arch_name: []const u8, datatype: ?types.
                 return error.TargetCannotLoad;
             }
             if (source_is_gguf and !hf_config_writable) {
-                why.* = try std.fmt.allocPrint(alloc, "this tool writes config.json for {s} only; {s} is not one", .{ HfLlm.hf_config_archs_text, arch_name });
+                why.* = try alloc.print("this tool writes config.json for {s} only; {s} is not one", .{ HfLlm.hf_config_archs_text, arch_name });
                 return error.TargetCannotLoad;
             }
             return .{ .target = t, .filetype = .safetensors, .hf_names = hfNames(t, kind, arch_name, .safetensors, source_is_gguf) };
@@ -522,20 +522,20 @@ pub fn problem(why: []const u8, verdicts: []const Verdict, t: Target, alloc: std
     if (why.len > 0) return why;
     const v = targetVerdict(verdicts, t) orelse return "";
     if (v.level != .no) return "";
-    return std.fmt.allocPrint(alloc, "{s} cannot load this output: {s}", .{ t.label(), v.note });
+    return alloc.print("{s} cannot load this output: {s}", .{ t.label(), v.note });
 }
 
 /// What to warn about when `t` may load an output only with help. Empty otherwise.
 pub fn warning(verdicts: []const Verdict, t: Target, alloc: std.mem.Allocator) ![]const u8 {
     const v = targetVerdict(verdicts, t) orelse return "";
     if (!v.warn or v.level == .no) return "";
-    return std.fmt.allocPrint(alloc, "{s} may not load this output, or may run it poorly: {s}", .{ t.label(), v.note });
+    return alloc.print("{s} may not load this output, or may run it poorly: {s}", .{ t.label(), v.note });
 }
 
 const testing = std.testing;
 
 fn set(ts: []const types.DataType) std.EnumSet(types.DataType) {
-    var s: std.EnumSet(types.DataType) = .initEmpty();
+    var s: std.EnumSet(types.DataType) = .empty;
     for (ts) |t| s.insert(t);
     return s;
 }
@@ -623,7 +623,7 @@ test "targetsFor offers exactly the targets that plan a model of that kind" {
     var why: []const u8 = "";
     for ([_]Kind{ .diffusion, .llm }) |k| {
         for ([_]Target{ .comfyui, .sdcpp, .llamacpp, .transformers }) |t| {
-            const offered = std.mem.indexOfScalar(Target, targetsFor(k), t) != null;
+            const offered = std.mem.findScalar(Target, targetsFor(k), t) != null;
             const plans = if (plan(t, k, "qwen3", null, null, false, true, a, &why)) |_| true else |_| false;
             try testing.expectEqual(plans, offered);
         }
@@ -682,13 +682,13 @@ test "ComfyUI GGUF verdicts warn, never refuse, outside what ComfyUI-GGUF loads 
     // No decoder, a slow CPU-only one, and both problems at once all warn.
     const mx = try assess(.{ .kind = .diffusion, .filetype = .gguf, .arch_name = "flux", .dtypes = set(&.{ .q4_k, .mxfp4 }) }, a);
     try testing.expectEqual(Level.partial, verdictFor(&mx, .comfyui).level);
-    try testing.expect(std.mem.indexOf(u8, try warning(&mx, .comfyui, a), "no decoder") != null);
+    try testing.expect(std.mem.find(u8, try warning(&mx, .comfyui, a), "no decoder") != null);
     const iq = try assess(.{ .kind = .diffusion, .filetype = .gguf, .arch_name = "flux", .dtypes = set(&.{ .q4_k, .iq2_xxs }) }, a);
     try testing.expectEqual(Level.partial, verdictFor(&iq, .comfyui).level);
-    try testing.expect(std.mem.indexOf(u8, try warning(&iq, .comfyui, a), "CPU fallback") != null);
+    try testing.expect(std.mem.find(u8, try warning(&iq, .comfyui, a), "CPU fallback") != null);
     const both = try assess(.{ .kind = .diffusion, .filetype = .gguf, .arch_name = "anima", .dtypes = set(&.{ .q4_k, .iq3_s }) }, a);
     const w = try warning(&both, .comfyui, a);
-    try testing.expect(std.mem.indexOf(u8, w, "iq3_s") != null and std.mem.indexOf(u8, w, "anima") != null);
+    try testing.expect(std.mem.find(u8, w, "iq3_s") != null and std.mem.find(u8, w, "anima") != null);
     try testing.expectEqualStrings("", try problem("", &both, .comfyui, a));
 }
 
@@ -713,7 +713,7 @@ test "LLM GGUF verdicts: naming, vision tower placement, llama head counts" {
     try testing.expectEqual(Level.yes, verdictFor(&l8b, .comfyui).level);
     const l1b = try assess(.{ .kind = .llm, .filetype = .gguf, .arch_name = "llama", .llama_heads = .{ .head_count = 32, .head_count_kv = 4 }, .dtypes = set(&.{.q4_k}) }, a);
     try testing.expectEqual(Level.partial, verdictFor(&l1b, .comfyui).level);
-    try testing.expect(std.mem.indexOf(u8, try warning(&l1b, .comfyui, a), "32 and 4") != null);
+    try testing.expect(std.mem.find(u8, try warning(&l1b, .comfyui, a), "32 and 4") != null);
     try testing.expectEqual(Level.yes, verdictFor(&l1b, .llamacpp).level);
 
     const qwen2 = try assess(.{ .kind = .llm, .filetype = .gguf, .arch_name = "qwen2", .dtypes = set(&.{.q4_k}) }, a);
@@ -753,7 +753,7 @@ test "ComfyUI as safetensors from a GGUF refuses an LLM this tool has no HF layo
     const a = arena.allocator();
     var why: []const u8 = "";
     try testing.expectError(error.TargetCannotLoad, plan(.comfyui, .llm, "gemma3", .BF16, null, true, false, a, &why));
-    try testing.expect(std.mem.indexOf(u8, why, "gemma3") != null);
+    try testing.expect(std.mem.find(u8, why, "gemma3") != null);
     // Its GGUF loads as it is, and a safetensors source already carries HF names.
     try testing.expectEqual(types.FileType.gguf, (try plan(.comfyui, .llm, "gemma3", null, null, true, false, a, &why)).filetype);
     try testing.expect(!(try plan(.comfyui, .llm, "gemma3", .BF16, null, false, false, a, &why)).hf_names);
@@ -811,7 +811,7 @@ test "sd.cpp verdicts refuse reshaped tensors and fusions it has no slot for" {
     const reshaped = try assess(.{ .kind = .diffusion, .filetype = .gguf, .arch_name = "flux", .reshaped = 2, .dtypes = set(&.{.q4_k}) }, a);
     try testing.expectEqual(Level.no, verdictFor(&reshaped, .sdcpp).level);
     try testing.expectEqual(Level.yes, verdictFor(&reshaped, .comfyui).level);
-    try testing.expect(std.mem.indexOf(u8, try problem("", &reshaped, .sdcpp, a), "reshaped") != null);
+    try testing.expect(std.mem.find(u8, try problem("", &reshaped, .sdcpp, a), "reshaped") != null);
 
     const qkv = try assess(.{ .kind = .diffusion, .filetype = .gguf, .arch_name = "flux3", .fused = archFusion("flux3"), .dtypes = set(&.{.q4_k}) }, a);
     try testing.expectEqual(Level.no, verdictFor(&qkv, .sdcpp).level);

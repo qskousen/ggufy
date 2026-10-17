@@ -419,7 +419,7 @@ fn nearestTypeByBpw(bpw: f64) types.DataType {
 
 /// Drop a trailing `-<dtype>` from a file stem
 pub fn stripDtypeSuffix(stem: []const u8) []const u8 {
-    const dash = std.mem.lastIndexOfScalar(u8, stem, '-') orelse return stem;
+    const dash = std.mem.findScalarLast(u8, stem, '-') orelse return stem;
     if (dash == 0 or dash + 1 >= stem.len) return stem;
     const suffix = stem[dash + 1 ..];
     return if (looksLikeDtype(suffix)) stem[0..dash] else stem;
@@ -433,7 +433,7 @@ fn looksLikeDtype(suffix: []const u8) bool {
     const lower = std.ascii.lowerString(buf[0..suffix.len], suffix);
     if (types.DataType.fromString(lower) != error.InvalidDataType) return true;
 
-    const underscore = std.mem.lastIndexOfScalar(u8, lower, '_') orelse return false;
+    const underscore = std.mem.findScalarLast(u8, lower, '_') orelse return false;
     if (underscore == 0) return false;
     const tail = lower[underscore + 1 ..];
     if (tail.len == 0 or tail.len > 2) return false;
@@ -443,14 +443,14 @@ fn looksLikeDtype(suffix: []const u8) bool {
 
 /// A checkpoint directory's whole name, since `Qwen3.5-9B` has no extension to drop.
 pub fn sourceStem(io: std.Io, path: []const u8) []const u8 {
-    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return std.fs.path.stem(path);
-    return if (stat.kind == .directory) std.fs.path.basename(path) else std.fs.path.stem(path);
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return std.Io.Dir.path.stem(path);
+    return if (stat.kind == .directory) std.Io.Dir.path.basename(path) else std.Io.Dir.path.stem(path);
 }
 
 /// Compute the output file path that `convert` would write to, without
 /// performing any actual conversion.  Useful for overwrite checks in the GUI.
 pub fn computeOutputPath(opts: ConvertOptions, hf_layout: bool, arena_alloc: std.mem.Allocator) ![]const u8 {
-    const dir_path = if (opts.output_dir) |od| od else std.fs.path.dirname(opts.path) orelse ".";
+    const dir_path = if (opts.output_dir) |od| od else std.Io.Dir.path.dirname(opts.path) orelse ".";
     const ext: []const u8 = switch (opts.filetype) {
         .gguf => "gguf",
         .safetensors => "safetensors",
@@ -462,11 +462,11 @@ pub fn computeOutputPath(opts: ConvertOptions, hf_layout: bool, arena_alloc: std
             .gguf => @tagName(resolved orelse types.DataType.f16),
             .safetensors => @tagName(resolved orelse types.DataType.F16),
         };
-        break :blk try std.fmt.allocPrint(arena_alloc, "{s}-{s}", .{ stem, dtype_str });
+        break :blk try arena_alloc.print("{s}-{s}", .{ stem, dtype_str });
     };
-    return std.fs.path.join(
+    return std.Io.Dir.path.join(
         arena_alloc,
-        &[_][]const u8{ dir_path, try std.fmt.allocPrint(arena_alloc, "{s}.{s}", .{ base_name, ext }) },
+        &[_][]const u8{ dir_path, try arena_alloc.print("{s}.{s}", .{ base_name, ext }) },
     );
 }
 
@@ -682,7 +682,7 @@ pub fn prepareConversion(
             var prefixed: usize = 0;
             for (f.tensors.items) |*t| {
                 if (std.mem.startsWith(u8, t.name, "language_model.") or std.mem.startsWith(u8, t.name, "visual.")) {
-                    t.name = try std.fmt.allocPrint(arena_alloc, "model.{s}", .{t.name});
+                    t.name = try arena_alloc.print("model.{s}", .{t.name});
                     prefixed += 1;
                 }
             }
@@ -994,7 +994,7 @@ fn outputFacts(f: anytype, prep: *const PreparedConversion, opts: ConvertOptions
     const fusion = Target.archFusion(prep.arch.name);
     var native = false;
     for (prep.model_tensors.items) |t| {
-        if (fusion) |fu| if (std.mem.indexOf(u8, t.name, fu.fused) != null) {
+        if (fusion) |fu| if (std.mem.find(u8, t.name, fu.fused) != null) {
             out.fused = fu;
         };
         // A passthrough tensor can still carry its source's spelling of the type.
@@ -1061,7 +1061,7 @@ fn predictedSize(
             if (prep.vision_plan) |plan| {
                 var mm = try mmprojOutput(plan, prep.hf.?, opts, arena_alloc);
                 const mm_size = try gguf.calculateFileSize(mm.tensors.items, &mm.metadata, 32);
-                std.log.info("text GGUF {d} bytes, vision tower {s} {d} bytes", .{ size, std.fs.path.basename(mm.path), mm_size });
+                std.log.info("text GGUF {d} bytes, vision tower {s} {d} bytes", .{ size, std.Io.Dir.path.basename(mm.path), mm_size });
                 size += mm_size;
             }
             return size;
@@ -1104,7 +1104,7 @@ pub const QuantizationLevel = enum(u8) {
     f64 = 13,
 
     pub fn fromString(s: []const u8) !QuantizationLevel {
-        var lower: [12]u8 = [_]u8{0} ** 12;
+        var lower: [12]u8 = @splat(0);
         if (s.len > lower.len) return error.UnknownQuantizationType;
         return std.meta.stringToEnum(QuantizationLevel, std.ascii.lowerString(lower[0..s.len], s)) orelse error.UnknownQuantizationType;
     }
@@ -1124,7 +1124,7 @@ fn cheapestKQuantAtLeast(want: u8) ?types.DataType {
 /// caller then leaves the tensor at its source precision.
 
 pub fn liftToFloor(target: types.DataType, min: imagearch.Precision) ?types.DataType {
-    const want = @intFromEnum(min);
+    const want = @backingInt(min);
     if (target.nominalBits() >= want) return target;
 
     return switch (target) {
@@ -1152,9 +1152,9 @@ pub fn liftToFloor(target: types.DataType, min: imagearch.Precision) ?types.Data
                 // that comes off the k-quant line.
                 break :blk cheapestKQuantAtLeast(want);
             };
-            var i: u8 = @intFromEnum(start) + 1;
-            while (i <= @intFromEnum(QuantizationLevel.f64)) : (i += 1) {
-                const cand: QuantizationLevel = @enumFromInt(i);
+            var i: u8 = @backingInt(start) + 1;
+            while (i <= @backingInt(QuantizationLevel.f64)) : (i += 1) {
+                const cand: QuantizationLevel = @fromBackingInt(i);
                 if (!families.allows(cand)) continue;
                 const dt = types.DataType.fromString(@tagName(cand)) catch continue;
                 if (dt.nominalBits() >= want) break :blk dt;
@@ -1192,18 +1192,18 @@ pub fn calculateQuantizationLevel(
     var allowed_len: usize = 0;
 
     const source_level = try QuantizationLevel.fromString(source_type);
-    const source_idx: u8 = @intFromEnum(source_level);
+    const source_idx: u8 = @backingInt(source_level);
 
     // When source precision is strictly above f16 (i.e. bf16/f32/f64), selecting
     // f16 as a "lossless" fallback wastes no space but silently loses precision
     // compared to bf16.  Exclude it from the candidate set in that case so the
     // sensitivity scaling skips straight to bf16.
-    const skip_f16 = source_idx > @intFromEnum(QuantizationLevel.f16);
+    const skip_f16 = source_idx > @backingInt(QuantizationLevel.f16);
 
-    var i: u8 = @intFromEnum(target_level);
+    var i: u8 = @backingInt(target_level);
     while (i <= source_idx) : (i += 1) {
-        if (skip_f16 and i == @intFromEnum(QuantizationLevel.f16)) continue;
-        const candidate: QuantizationLevel = @enumFromInt(i);
+        if (skip_f16 and i == @backingInt(QuantizationLevel.f16)) continue;
+        const candidate: QuantizationLevel = @fromBackingInt(i);
         if (families.allows(candidate)) {
             allowed_buf[allowed_len] = candidate;
             allowed_len += 1;
@@ -1252,9 +1252,9 @@ fn warnVocabless(m: HfLlm.Model, path: []const u8) void {
 fn hfDirCandidates(io: std.Io, path: []const u8) ?[]const u8 {
     var dir = path;
     while (dir.len > 0 and dir[dir.len - 1] == '/') dir = dir[0 .. dir.len - 1];
-    const base = std.fs.path.basename(dir);
+    const base = std.Io.Dir.path.basename(dir);
     if (std.mem.endsWith(u8, base, ".safetensors") or std.mem.endsWith(u8, base, ".json")) {
-        dir = std.fs.path.dirname(dir) orelse ".";
+        dir = std.Io.Dir.path.dirname(dir) orelse ".";
     } else {
         const stat = std.Io.Dir.cwd().statFile(io, dir, .{}) catch return null;
         if (stat.kind != .directory) return null;
@@ -1278,7 +1278,7 @@ fn fuseSplit(
     var kept: std.ArrayList(types.Tensor) = .empty;
 
     next: for (model_tensors.items) |t| {
-        const at = std.mem.indexOf(u8, t.name, fu.parts[0]) orelse {
+        const at = std.mem.find(u8, t.name, fu.parts[0]) orelse {
             try kept.append(arena_alloc, t);
             continue;
         };
@@ -1577,13 +1577,13 @@ fn parseTensorTypeRules(path: []const u8, content: []const u8, filetype: types.F
 
 fn tensorTypeRuleMessage(alloc: std.mem.Allocator, name: []const u8, err: TensorTypeRules.ParseError, bad: []const u8, filetype: types.FileType) ![]const u8 {
     return switch (err) {
-        error.NoTensorTypeRules => std.fmt.allocPrint(alloc, "{s} holds no type rules, and is not a JSON template", .{name}),
-        error.MalformedTensorTypeRule => std.fmt.allocPrint(alloc, "{s}: \"{s}\" is not a pattern=type entry", .{ name, bad }),
-        error.InvalidTensorTypeRulePattern => std.fmt.allocPrint(alloc, "{s}: the pattern in \"{s}\" is not a valid regular expression", .{ name, bad }),
-        error.UnsupportedTensorTypeRulePattern => std.fmt.allocPrint(alloc, "{s}: the pattern in \"{s}\" uses lookaround, a backreference or another feature ggufy does not support", .{ name, bad }),
-        error.TensorTypeRulePatternTooLarge => std.fmt.allocPrint(alloc, "{s}: the pattern in \"{s}\" is too large to compile; use smaller repetition counts", .{ name, bad }),
-        error.UnknownTensorTypeRuleType => std.fmt.allocPrint(alloc, "{s}: \"{s}\" is an unknown type", .{ name, bad }),
-        error.TensorTypeRuleTypeNotInFormat => std.fmt.allocPrint(alloc, "{s}: the type in \"{s}\" cannot be stored in a {s} file", .{ name, bad, @tagName(filetype) }),
+        error.NoTensorTypeRules => alloc.print("{s} holds no type rules, and is not a JSON template", .{name}),
+        error.MalformedTensorTypeRule => alloc.print("{s}: \"{s}\" is not a pattern=type entry", .{ name, bad }),
+        error.InvalidTensorTypeRulePattern => alloc.print("{s}: the pattern in \"{s}\" is not a valid regular expression", .{ name, bad }),
+        error.UnsupportedTensorTypeRulePattern => alloc.print("{s}: the pattern in \"{s}\" uses lookaround, a backreference or another feature ggufy does not support", .{ name, bad }),
+        error.TensorTypeRulePatternTooLarge => alloc.print("{s}: the pattern in \"{s}\" is too large to compile; use smaller repetition counts", .{ name, bad }),
+        error.UnknownTensorTypeRuleType => alloc.print("{s}: \"{s}\" is an unknown type", .{ name, bad }),
+        error.TensorTypeRuleTypeNotInFormat => alloc.print("{s}: the type in \"{s}\" cannot be stored in a {s} file", .{ name, bad, @tagName(filetype) }),
         error.OutOfMemory => error.OutOfMemory,
     };
 }
@@ -1591,11 +1591,11 @@ fn tensorTypeRuleMessage(alloc: std.mem.Allocator, name: []const u8, err: Tensor
 /// Why the llama.cpp type file at `path` cannot be used for a `filetype`
 /// output, as convert logs it; null when it parses or is a JSON template.
 pub fn templateRuleProblem(io: std.Io, path: []const u8, filetype: types.FileType, arena_alloc: std.mem.Allocator) ?[]const u8 {
-    const content = readTemplate(io, path, arena_alloc) catch |e| return std.fmt.allocPrint(arena_alloc, "{s}: cannot be read ({t})", .{ std.fs.path.basename(path), e }) catch null;
+    const content = readTemplate(io, path, arena_alloc) catch |e| return arena_alloc.print("{s}: cannot be read ({t})", .{ std.Io.Dir.path.basename(path), e }) catch null;
     if (!TensorTypeRules.isRuleFile(content)) return null;
     var bad: []const u8 = "";
     _ = TensorTypeRules.parse(arena_alloc, content, filetype, &bad) catch |e|
-        return tensorTypeRuleMessage(arena_alloc, std.fs.path.basename(path), e, bad, filetype) catch null;
+        return tensorTypeRuleMessage(arena_alloc, std.Io.Dir.path.basename(path), e, bad, filetype) catch null;
     return null;
 }
 
@@ -2192,7 +2192,7 @@ fn restoreOrigShapes(
 ) !void {
     const meta = src_meta orelse return;
     for (model_tensors.items) |*t| {
-        const key = try std.fmt.allocPrint(arena_alloc, "comfy.gguf.orig_shape.{s}", .{t.name});
+        const key = try arena_alloc.print("comfy.gguf.orig_shape.{s}", .{t.name});
         const value = meta.get(key) orelse continue;
         const arr = switch (value) {
             .array => |a| a,
@@ -2242,7 +2242,7 @@ fn applyShapeFix(
         // Record original shape.
         var orig_shape_arr = std.json.Array.init(arena_alloc);
         for (t.dims) |d| try orig_shape_arr.append(.{ .integer = @intCast(d) });
-        const key = try std.fmt.allocPrint(arena_alloc, "comfy.gguf.orig_shape.{s}", .{t.name});
+        const key = try arena_alloc.print("comfy.gguf.orig_shape.{s}", .{t.name});
         try extra_metadata.put(arena_alloc, key, .{ .array = orig_shape_arr });
 
         // Reshape to (N/256, 256).
@@ -2443,9 +2443,9 @@ fn buildGgufMetadata(
 // keys and must come from the source's own general.architecture, not detection.
 fn ropeHeadsFromSource(f: anytype, arch_name: []const u8, arena_alloc: std.mem.Allocator) !HfLlm.RopeHeads {
     const md = f.getSourceMetadata() orelse return error.HfNamesUnsupported;
-    const hc = md.get(try std.fmt.allocPrint(arena_alloc, "{s}.attention.head_count", .{arch_name})) orelse
+    const hc = md.get(try arena_alloc.print("{s}.attention.head_count", .{arch_name})) orelse
         return error.HfNamesUnsupported;
-    const hkv = md.get(try std.fmt.allocPrint(arena_alloc, "{s}.attention.head_count_kv", .{arch_name})) orelse
+    const hkv = md.get(try arena_alloc.print("{s}.attention.head_count_kv", .{arch_name})) orelse
         return error.HfNamesUnsupported;
     const hc_i = switch (hc) {
         .integer => |v| v,
@@ -2465,8 +2465,8 @@ fn ropeHeadsFromSource(f: anytype, arch_name: []const u8, arena_alloc: std.mem.A
 /// head rather than an error.
 fn mtpBaseFromSource(f: anytype, arch_name: []const u8, arena_alloc: std.mem.Allocator) ?u32 {
     const md = f.getSourceMetadata() orelse return null;
-    const bc = md.get(std.fmt.allocPrint(arena_alloc, "{s}.block_count", .{arch_name}) catch return null) orelse return null;
-    const nx = md.get(std.fmt.allocPrint(arena_alloc, "{s}.nextn_predict_layers", .{arch_name}) catch return null) orelse return null;
+    const bc = md.get(arena_alloc.print("{s}.block_count", .{arch_name}) catch return null) orelse return null;
+    const nx = md.get(arena_alloc.print("{s}.nextn_predict_layers", .{arch_name}) catch return null) orelse return null;
     const bc_i = switch (bc) {
         .integer => |v| v,
         else => return null,
@@ -2485,7 +2485,7 @@ fn qwen35CtxFromSource(f: anytype, arch_name: []const u8, arena_alloc: std.mem.A
     const md = f.getSourceMetadata() orelse return null;
     const num = struct {
         fn get(m: anytype, a: std.mem.Allocator, arch: []const u8, key: []const u8) ?usize {
-            const full = std.fmt.allocPrint(a, "{s}.ssm.{s}", .{ arch, key }) catch return null;
+            const full = a.print("{s}.ssm.{s}", .{ arch, key }) catch return null;
             const v = m.get(full) orelse return null;
             return switch (v) {
                 .integer => |i| if (i > 0) @intCast(i) else null,
@@ -2729,7 +2729,7 @@ fn checkImatrixCoverage(
     for (tensors) |t| {
         const dt = types.DataType.fromString(t.type) catch continue;
         const gt = gguf.GgmlType.fromString(@tagName(dt)) catch continue;
-        if (!ggml.ggml_quantize_requires_imatrix(@intCast(@intFromEnum(gt)))) continue;
+        if (!ggml.ggml_quantize_requires_imatrix(@intCast(@backingInt(gt)))) continue;
         const covered = if (imatrix) |im| im.forTensor(t.name) != null else false;
         if (!covered) {
             try missing.append(arena_alloc, t.name);
@@ -2792,7 +2792,7 @@ fn writeGguf(
     imatrix: ?*const ImatrixMod.Imatrix,
 ) !void {
     // --- Resolve output path -------------------------------------------------
-    const dir_path = if (opts.output_dir) |od| od else std.fs.path.dirname(opts.path) orelse ".";
+    const dir_path = if (opts.output_dir) |od| od else std.Io.Dir.path.dirname(opts.path) orelse ".";
 
     const dir_result = try std.Io.Dir.cwd().createDirPathStatus(opts.io, dir_path, .default_dir);
     if (dir_result == .created) std.log.info("Created directory {s}", .{dir_path});
@@ -2854,9 +2854,9 @@ fn writeGguf(
 /// Where the mmproj for the text GGUF at `text_path` goes: beside it, under
 /// llama.cpp's converter prefix. ComfyUI-GGUF finds it by the text file's stem.
 pub fn mmprojPath(text_path: []const u8, alloc: std.mem.Allocator) ![]const u8 {
-    const dir = std.fs.path.dirname(text_path) orelse ".";
-    const name = try std.fmt.allocPrint(alloc, "mmproj-{s}", .{std.fs.path.basename(text_path)});
-    return std.fs.path.join(alloc, &.{ dir, name });
+    const dir = std.Io.Dir.path.dirname(text_path) orelse ".";
+    const name = try alloc.print("mmproj-{s}", .{std.Io.Dir.path.basename(text_path)});
+    return std.Io.Dir.path.join(alloc, &.{ dir, name });
 }
 
 /// The mmproj -H reads beside the text GGUF at `text_path`: mmprojPath's name
@@ -2866,13 +2866,13 @@ pub fn mmprojPath(text_path: []const u8, alloc: std.mem.Allocator) ![]const u8 {
 fn findMmproj(io: std.Io, text_path: []const u8, alloc: std.mem.Allocator) !?[]const u8 {
     const exact = try mmprojPath(text_path, alloc);
     if (std.Io.Dir.cwd().access(io, exact, .{})) |_| return exact else |_| {}
-    const dir_path = std.fs.path.dirname(text_path) orelse ".";
+    const dir_path = std.Io.Dir.path.dirname(text_path) orelse ".";
     var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return null;
     defer dir.close(io);
-    const lower_stem = try std.ascii.allocLowerString(alloc, std.fs.path.stem(text_path));
+    const lower_stem = try std.ascii.allocLowerString(alloc, std.Io.Dir.path.stem(text_path));
     const quantless = stripQuantSuffixComfy(lower_stem);
     const stem = if (quantless.len < lower_stem.len) quantless else stripDtypeSuffix(lower_stem);
-    const self_name = std.fs.path.basename(text_path);
+    const self_name = std.Io.Dir.path.basename(text_path);
     var found: std.ArrayList([]const u8) = .empty;
     var it = dir.iterate();
     while (try it.next(io)) |e| {
@@ -2880,10 +2880,10 @@ fn findMmproj(io: std.Io, text_path: []const u8, alloc: std.mem.Allocator) !?[]c
         if (std.mem.eql(u8, e.name, self_name)) continue;
         const lower = try std.ascii.allocLowerString(alloc, e.name);
         if (!std.mem.endsWith(u8, lower, ".gguf")) continue;
-        if (std.mem.indexOf(u8, lower, "mmproj") == null or std.mem.indexOf(u8, lower, stem) == null) continue;
+        if (std.mem.find(u8, lower, "mmproj") == null or std.mem.find(u8, lower, stem) == null) continue;
         try found.append(alloc, try alloc.dupe(u8, e.name));
     }
-    if (found.items.len == 1) return try std.fs.path.join(alloc, &.{ dir_path, found.items[0] });
+    if (found.items.len == 1) return try std.Io.Dir.path.join(alloc, &.{ dir_path, found.items[0] });
     if (found.items.len > 1) {
         std.log.warn("more than one mmproj beside {s} could be its vision tower: {s}", .{ text_path, try std.mem.join(alloc, ", ", found.items) });
         std.log.warn("rename the right one to {s}", .{exact});
@@ -3090,11 +3090,11 @@ fn buildSafetensorsMetadata(
 /// arrive as different strings for the same file; the output does not exist
 /// yet, so the directories are canonicalized and the basenames compared.
 pub fn pathsCollide(io: std.Io, a: []const u8, b: []const u8) bool {
-    if (!std.mem.eql(u8, std.fs.path.basename(a), std.fs.path.basename(b))) return false;
-    const dir_a = std.fs.path.dirname(a) orelse ".";
-    const dir_b = std.fs.path.dirname(b) orelse ".";
-    var buf_a: [std.fs.max_path_bytes]u8 = undefined;
-    var buf_b: [std.fs.max_path_bytes]u8 = undefined;
+    if (!std.mem.eql(u8, std.Io.Dir.path.basename(a), std.Io.Dir.path.basename(b))) return false;
+    const dir_a = std.Io.Dir.path.dirname(a) orelse ".";
+    const dir_b = std.Io.Dir.path.dirname(b) orelse ".";
+    var buf_a: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var buf_b: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const len_a = std.Io.Dir.cwd().realPathFile(io, dir_a, &buf_a) catch
         return std.mem.eql(u8, dir_a, dir_b);
     const len_b = std.Io.Dir.cwd().realPathFile(io, dir_b, &buf_b) catch
@@ -3116,7 +3116,7 @@ fn writeSafetensors(
     hf_vision: ?HfLlm.Vision,
 ) !void {
     // --- Resolve output path -------------------------------------------------
-    const dir_path = if (opts.output_dir) |od| od else std.fs.path.dirname(opts.path) orelse ".";
+    const dir_path = if (opts.output_dir) |od| od else std.Io.Dir.path.dirname(opts.path) orelse ".";
 
     const dir_result2 = try std.Io.Dir.cwd().createDirPathStatus(opts.io, dir_path, .default_dir);
     if (dir_result2 == .created) std.log.info("Created directory {s}", .{dir_path});
@@ -3188,7 +3188,7 @@ fn writeSafetensors(
         // in the directory, and the writer truncates before reading a tensor.
         var clashes: std.ArrayList([]const u8) = .empty;
         if (!opts.force) {
-            try clashes.appendSlice(arena_alloc, try HfLlm.existingSidecars(opts.io, d, md, std.fs.path.basename(out_filename), arena_alloc));
+            try clashes.appendSlice(arena_alloc, try HfLlm.existingSidecars(opts.io, d, md, std.Io.Dir.path.basename(out_filename), arena_alloc));
             if (hf_vision != null) for ([_][]const u8{ "preprocessor_config.json", "chat_template.jinja" }) |n| {
                 if (d.access(opts.io, n, .{})) |_| try clashes.append(arena_alloc, n) else |_| {}
             };
@@ -3264,7 +3264,7 @@ fn writeSafetensors(
             return e;
         };
         // -n moved the weights off the one name transformers opens by itself.
-        const weights_name = std.fs.path.basename(out_filename);
+        const weights_name = std.Io.Dir.path.basename(out_filename);
         if (!std.mem.eql(u8, weights_name, HfLlm.default_weights_name)) {
             // from_pretrained opens model.safetensors or an index naming the
             // file; without the index this directory is as unloadable as one
@@ -3384,7 +3384,7 @@ pub fn writeTemplateFromTensors(
 }
 
 fn safetensorTypePrecision(type_str: []const u8) u8 {
-    var buf: [12]u8 = [_]u8{0} ** 12;
+    var buf: [12]u8 = @splat(0);
     const l = std.ascii.lowerString(&buf, type_str[0..@min(type_str.len, buf.len)]);
     if (std.mem.eql(u8, l, "f8_e4m3") or std.mem.eql(u8, l, "f8_e5m2")) return 0;
     if (std.mem.eql(u8, l, "f16") or std.mem.eql(u8, l, "fp16")) return 1;
@@ -3395,7 +3395,7 @@ fn safetensorTypePrecision(type_str: []const u8) u8 {
 }
 
 fn safetensorDisplayType(type_str: []const u8) []const u8 {
-    var buf: [12]u8 = [_]u8{0} ** 12;
+    var buf: [12]u8 = @splat(0);
     const l = std.ascii.lowerString(&buf, type_str[0..@min(type_str.len, buf.len)]);
     if (std.mem.eql(u8, l, "f8_e4m3") or std.mem.eql(u8, l, "f8_e5m2")) return "FP8";
     return type_str;
@@ -3424,7 +3424,7 @@ pub fn templateTypeSuffix(
             while (it.next()) |entry| {
                 const type_val = entry.value_ptr.object.get("type") orelse continue;
                 const level = QuantizationLevel.fromString(type_val.string) catch continue;
-                const lv: u8 = @intFromEnum(level);
+                const lv: u8 = @backingInt(level);
                 if (min_level == null or lv < min_level.?) {
                     min_level = lv;
                     min_str = type_val.string;
@@ -3457,7 +3457,7 @@ pub fn templateTypeSuffix(
                     min_display = display;
                 }
             }
-            if (seen_count > 1) return try std.fmt.allocPrint(arena_alloc, "{s}-MIXED", .{min_display});
+            if (seen_count > 1) return try arena_alloc.print("{s}-MIXED", .{min_display});
             return min_display;
         },
     }
@@ -3733,11 +3733,11 @@ test "predictOutputSize matches the actual written file size" {
     // which include this test, so a shared path would race (one deletes it mid-use).
     const ts_ns: i96 = std.Io.Timestamp.now(io, .awake).nanoseconds;
     const token: u64 = @as(u64, @bitCast(@as(i64, @truncate(ts_ns)))) ^ @as(u64, @intFromPtr(&arena));
-    const dir = try std.fmt.allocPrint(a, "/tmp/ggufy_predict_size_test_{x}", .{token});
+    const dir = try a.print("/tmp/ggufy_predict_size_test_{x}", .{token});
     _ = try std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir);
     defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
 
-    const src_path = try std.fmt.allocPrint(a, "{s}/src.safetensors", .{dir});
+    const src_path = try a.print("{s}/src.safetensors", .{dir});
     try writeTestSafetensors(io, src_path, a);
 
     const Case = struct { ft: types.FileType, dt: types.DataType, ext: []const u8 };
@@ -3772,7 +3772,7 @@ test "predictOutputSize matches the actual written file size" {
         const predicted = try predictOutputSize(&f, opts, gpa, a);
         try convert(&f, opts, gpa, a);
 
-        const out_path = try std.fmt.allocPrint(a, "{s}/out.{s}", .{ dir, c.ext });
+        const out_path = try a.print("{s}/out.{s}", .{ dir, c.ext });
         const actual = (try std.Io.Dir.cwd().statFile(io, out_path, .{})).size;
         testing.expectEqual(predicted, actual) catch |err| {
             std.log.err("size mismatch for {s} {s}: predicted={} actual={}", .{ @tagName(c.ft), @tagName(c.dt), predicted, actual });
@@ -4478,7 +4478,7 @@ test "applyShapeFix reshapes only a block quant its real row cannot hold" {
 
     var n_reshaped: usize = 0;
     for (cases, tensors.items) |c, t| {
-        const key = try std.fmt.allocPrint(a, "comfy.gguf.orig_shape.{s}", .{c.name});
+        const key = try a.print("comfy.gguf.orig_shape.{s}", .{c.name});
         try testing.expectEqual(c.reshaped, meta.contains(key));
         if (c.reshaped) {
             n_reshaped += 1;
@@ -4575,11 +4575,11 @@ test "a type file names, plans and guards the output by the types its rules assi
 
     const ts_ns: i96 = std.Io.Timestamp.now(io, .awake).nanoseconds;
     const token: u64 = @as(u64, @bitCast(@as(i64, @truncate(ts_ns)))) ^ @as(u64, @intFromPtr(&arena));
-    const dir = try std.fmt.allocPrint(a, "/tmp/ggufy_rules_test_{x}", .{token});
+    const dir = try a.print("/tmp/ggufy_rules_test_{x}", .{token});
     _ = try std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir);
     defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
 
-    const path = try std.fmt.allocPrint(a, "{s}/rules.txt", .{dir});
+    const path = try a.print("{s}/rules.txt", .{dir});
     {
         const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
         defer file.close(io);
@@ -4606,7 +4606,7 @@ test "a type file names, plans and guards the output by the types its rules assi
     try testing.expect(detectUpscaling(&fp8, .q4_k, opts.tensor_type_rules));
 
     // A SafeTensors output is named in that container's spelling.
-    const st_path = try std.fmt.allocPrint(a, "{s}/st.txt", .{dir});
+    const st_path = try a.print("{s}/st.txt", .{dir});
     {
         const file = try std.Io.Dir.cwd().createFile(io, st_path, .{ .truncate = true });
         defer file.close(io);
@@ -4631,7 +4631,7 @@ test "a type file names, plans and guards the output by the types its rules assi
     );
 
     // -d picks the container, so a rule type only the other one holds cannot move it.
-    const mixed_path = try std.fmt.allocPrint(a, "{s}/mixed.txt", .{dir});
+    const mixed_path = try a.print("{s}/mixed.txt", .{dir});
     {
         const file = try std.Io.Dir.cwd().createFile(io, mixed_path, .{ .truncate = true });
         defer file.close(io);
@@ -4824,7 +4824,7 @@ test "HF llama Q/K RoPE survives dequantizing a block-quantized GGUF" {
     // Unique dir per run (parallel binaries would race on a shared path).
     const ts_ns: i96 = std.Io.Timestamp.now(io, .awake).nanoseconds;
     const token: u64 = @as(u64, @bitCast(@as(i64, @truncate(ts_ns)))) ^ @as(u64, @intFromPtr(&arena));
-    const dir = try std.fmt.allocPrint(a, "/tmp/ggufy_rope_test_{x}", .{token});
+    const dir = try a.print("/tmp/ggufy_rope_test_{x}", .{token});
     _ = try std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir);
     defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
 
@@ -4856,13 +4856,13 @@ test "HF llama Q/K RoPE survives dequantizing a block-quantized GGUF" {
     }.f;
 
     try writeFile(
-        try std.fmt.allocPrint(a, "{s}/config.json", .{dir}),
+        try a.print("{s}/config.json", .{dir}),
         \\{"model_type":"llama","num_hidden_layers":1,"hidden_size":512,"intermediate_size":512,"num_attention_heads":4,"num_key_value_heads":2,"rms_norm_eps":1e-5,"vocab_size":100,"max_position_embeddings":128}
         ++ "\n",
     );
     // load() refuses a model with no tokenizer.
     try writeFile(
-        try std.fmt.allocPrint(a, "{s}/tokenizer.json", .{dir}),
+        try a.print("{s}/tokenizer.json", .{dir}),
         test_bpe_tokenizer,
     );
 
@@ -4908,7 +4908,7 @@ test "HF llama Q/K RoPE survives dequantizing a block-quantized GGUF" {
     try st_file.appendSlice(a, &len_buf);
     try st_file.appendSlice(a, header.items);
     try st_file.appendSlice(a, data);
-    const src_path = try std.fmt.allocPrint(a, "{s}/m.safetensors", .{dir});
+    const src_path = try a.print("{s}/m.safetensors", .{dir});
     try writeFile(src_path, st_file.items);
 
     const findT = struct {
@@ -4935,7 +4935,7 @@ test "HF llama Q/K RoPE survives dequantizing a block-quantized GGUF" {
         .quantization_aggressiveness = 0,
     }, gpa, a);
 
-    const q4k_path = try std.fmt.allocPrint(a, "{s}/q4k.gguf", .{dir});
+    const q4k_path = try a.print("{s}/q4k.gguf", .{dir});
     var fg = try gguf.init(q4k_path, io, gpa, a, false);
     defer fg.deinit();
 
@@ -4993,7 +4993,7 @@ test "HF llama Q/K RoPE survives dequantizing a block-quantized GGUF" {
         .force = true, // dir still holds the config.json/tokenizer.json this test wrote
     }, gpa, a);
 
-    var fo = try st.init(try std.fmt.allocPrint(a, "{s}/deq.safetensors", .{dir}), io, gpa, a, false, false);
+    var fo = try st.init(try a.print("{s}/deq.safetensors", .{dir}), io, gpa, a, false, false);
     defer fo.deinit();
 
     const readS = struct {
@@ -5038,7 +5038,7 @@ test "HF llama Q/K RoPE survives dequantizing a block-quantized GGUF" {
     // -n put the weights somewhere transformers does not look by itself, so
     // the sidecars are only loadable alongside an index naming the real file.
     {
-        const idx_path = try std.fmt.allocPrint(a, "{s}/{s}", .{ dir, HfLlm.weights_index_name });
+        const idx_path = try a.print("{s}/{s}", .{ dir, HfLlm.weights_index_name });
         const bytes = try std.Io.Dir.cwd().readFileAlloc(io, idx_path, a, .limited(1 << 20));
         const idx = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
         defer idx.deinit();
@@ -5072,9 +5072,9 @@ test "HF llama Q/K RoPE survives dequantizing a block-quantized GGUF" {
             .force = true,
         }, gpa, a);
 
-        const idx_path = try std.fmt.allocPrint(a, "{s}/{s}", .{ dir, HfLlm.weights_index_name });
+        const idx_path = try a.print("{s}/{s}", .{ dir, HfLlm.weights_index_name });
         try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, idx_path, .{}));
-        const model_path = try std.fmt.allocPrint(a, "{s}/{s}", .{ dir, HfLlm.default_weights_name });
+        const model_path = try a.print("{s}/{s}", .{ dir, HfLlm.default_weights_name });
         try std.Io.Dir.cwd().access(io, model_path, .{});
     }
 
@@ -5136,7 +5136,7 @@ test "a tensor with no llama.cpp name stops the conversion" {
     // Unique dir per run (parallel binaries would race on a shared path).
     const ts_ns: i96 = std.Io.Timestamp.now(io, .awake).nanoseconds;
     const token: u64 = @as(u64, @bitCast(@as(i64, @truncate(ts_ns)))) ^ @as(u64, @intFromPtr(&arena));
-    const dir = try std.fmt.allocPrint(a, "/tmp/ggufy_unmapped_test_{x}", .{token});
+    const dir = try a.print("/tmp/ggufy_unmapped_test_{x}", .{token});
     _ = try std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir);
     defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
 
@@ -5148,12 +5148,12 @@ test "a tensor with no llama.cpp name stops the conversion" {
         }
     }.f;
 
-    try writeFile(io, try std.fmt.allocPrint(a, "{s}/config.json", .{dir}),
+    try writeFile(io, try a.print("{s}/config.json", .{dir}),
         \\{"model_type":"llama","num_hidden_layers":1,"hidden_size":8,"intermediate_size":8,
         \\ "num_attention_heads":2,"num_key_value_heads":1,"rms_norm_eps":1e-5,"vocab_size":4,
         \\ "max_position_embeddings":128}
     );
-    try writeFile(io, try std.fmt.allocPrint(a, "{s}/tokenizer.json", .{dir}), test_bpe_tokenizer);
+    try writeFile(io, try a.print("{s}/tokenizer.json", .{dir}), test_bpe_tokenizer);
 
     // One weight llama.cpp models, one it has never heard of, and one rotary
     // cache its own converter throws away.
@@ -5168,7 +5168,7 @@ test "a tensor with no llama.cpp name stops the conversion" {
     try file_bytes.appendSlice(a, &len_buf);
     try file_bytes.appendSlice(a, header);
     try file_bytes.appendNTimes(a, 0, 48);
-    const src_path = try std.fmt.allocPrint(a, "{s}/m.safetensors", .{dir});
+    const src_path = try a.print("{s}/m.safetensors", .{dir});
     try writeFile(io, src_path, file_bytes.items);
 
     const opts = ConvertOptions{
@@ -5211,7 +5211,7 @@ test "a mergeless BPE checkpoint and a blank -A both stop before the write" {
 
     const ts_ns: i96 = std.Io.Timestamp.now(io, .awake).nanoseconds;
     const token: u64 = @as(u64, @bitCast(@as(i64, @truncate(ts_ns)))) ^ @as(u64, @intFromPtr(&arena));
-    const dir = try std.fmt.allocPrint(a, "/tmp/ggufy_merges_test_{x}", .{token});
+    const dir = try a.print("/tmp/ggufy_merges_test_{x}", .{token});
     _ = try std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir);
     defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
 
@@ -5223,14 +5223,14 @@ test "a mergeless BPE checkpoint and a blank -A both stop before the write" {
         }
     }.f;
 
-    try writeFile(io, try std.fmt.allocPrint(a, "{s}/config.json", .{dir}),
+    try writeFile(io, try a.print("{s}/config.json", .{dir}),
         \\{"model_type":"llama","num_hidden_layers":1,"hidden_size":8,"intermediate_size":8,
         \\ "num_attention_heads":2,"num_key_value_heads":1,"rms_norm_eps":1e-5,"vocab_size":4,
         \\ "max_position_embeddings":128}
     );
     // Llama-3's splitting, so the pre-tokenizer tag is found and the merge table
     // is the only thing missing. No merges.txt beside it either.
-    try writeFile(io, try std.fmt.allocPrint(a, "{s}/tokenizer.json", .{dir}),
+    try writeFile(io, try a.print("{s}/tokenizer.json", .{dir}),
         \\{"pre_tokenizer":{"type":"Sequence","pretokenizers":[
         \\ {"type":"Split","behavior":"Isolated","pattern":{"Regex":"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"}},
         \\ {"type":"ByteLevel","add_prefix_space":false,"use_regex":false}]},
@@ -5246,7 +5246,7 @@ test "a mergeless BPE checkpoint and a blank -A both stop before the write" {
     try file_bytes.appendSlice(a, &len_buf);
     try file_bytes.appendSlice(a, header);
     try file_bytes.appendNTimes(a, 0, 16);
-    const src_path = try std.fmt.allocPrint(a, "{s}/m.safetensors", .{dir});
+    const src_path = try a.print("{s}/m.safetensors", .{dir});
     try writeFile(io, src_path, file_bytes.items);
 
     const opts = ConvertOptions{
@@ -5273,11 +5273,11 @@ test "a mergeless BPE checkpoint and a blank -A both stop before the write" {
     var permissive = opts;
     permissive.allow_unknown_arch = true;
     try testing.expectError(error.MissingMerges, convert(&f2, permissive, gpa, a));
-    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, try std.fmt.allocPrint(a, "{s}/out.gguf", .{dir}), .{}));
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, try a.print("{s}/out.gguf", .{dir}), .{}));
 
     // -A names general.architecture and prefixes the <arch>.* dimension keys, so
     // a blank one writes a file with neither under a name any loader knows.
-    try writeFile(io, try std.fmt.allocPrint(a, "{s}/tokenizer.json", .{dir}), test_bpe_tokenizer);
+    try writeFile(io, try a.print("{s}/tokenizer.json", .{dir}), test_bpe_tokenizer);
     for ([_][]const u8{ "", " " }) |blank| {
         var f3 = try st.init(src_path, io, gpa, a, false, false);
         defer f3.deinit();
@@ -5285,7 +5285,7 @@ test "a mergeless BPE checkpoint and a blank -A both stop before the write" {
         named.arch_override = blank;
         try testing.expectError(error.InvalidArchOverride, convert(&f3, named, gpa, a));
     }
-    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, try std.fmt.allocPrint(a, "{s}/out.gguf", .{dir}), .{}));
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, try a.print("{s}/out.gguf", .{dir}), .{}));
 
     // The same fixture with a merge table and a real name converts, so neither
     // refusal above is standing in for some other complaint.
@@ -5294,7 +5294,7 @@ test "a mergeless BPE checkpoint and a blank -A both stop before the write" {
     var ok = opts;
     ok.arch_override = "llama";
     try convert(&f4, ok, gpa, a);
-    try std.Io.Dir.cwd().access(io, try std.fmt.allocPrint(a, "{s}/out.gguf", .{dir}), .{});
+    try std.Io.Dir.cwd().access(io, try a.print("{s}/out.gguf", .{dir}), .{});
 }
 
 test "a GGUF tensor with no HF name stops -H" {
@@ -5311,7 +5311,7 @@ test "a GGUF tensor with no HF name stops -H" {
     // Unique dir per run (parallel binaries would race on a shared path).
     const ts_ns: i96 = std.Io.Timestamp.now(io, .awake).nanoseconds;
     const token: u64 = @as(u64, @bitCast(@as(i64, @truncate(ts_ns)))) ^ @as(u64, @intFromPtr(&arena));
-    const dir = try std.fmt.allocPrint(a, "/tmp/ggufy_hf_unmapped_test_{x}", .{token});
+    const dir = try a.print("/tmp/ggufy_hf_unmapped_test_{x}", .{token});
     _ = try std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir);
     defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
 
@@ -5356,7 +5356,7 @@ test "a GGUF tensor with no HF name stops -H" {
     try st_file.appendSlice(a, &len_buf);
     try st_file.appendSlice(a, header.items);
     try st_file.appendNTimes(a, 0, off);
-    const src_path = try std.fmt.allocPrint(a, "{s}/m.safetensors", .{dir});
+    const src_path = try a.print("{s}/m.safetensors", .{dir});
     {
         const file = try std.Io.Dir.cwd().createFile(io, src_path, .{ .truncate = true });
         defer file.close(io);
@@ -5378,7 +5378,7 @@ test "a GGUF tensor with no HF name stops -H" {
         .quantization_aggressiveness = 0,
     }, gpa, a);
 
-    const gguf_path = try std.fmt.allocPrint(a, "{s}/native.gguf", .{dir});
+    const gguf_path = try a.print("{s}/native.gguf", .{dir});
     const hf_opts = ConvertOptions{
         .io = io,
         .path = gguf_path,
@@ -5438,7 +5438,7 @@ test "a pre-tokenizer no tag names stops the conversion until -u" {
     // Unique dir per run (parallel binaries would race on a shared path).
     const ts_ns: i96 = std.Io.Timestamp.now(io, .awake).nanoseconds;
     const token: u64 = @as(u64, @bitCast(@as(i64, @truncate(ts_ns)))) ^ @as(u64, @intFromPtr(&arena));
-    const dir = try std.fmt.allocPrint(a, "/tmp/ggufy_hf_pretok_test_{x}", .{token});
+    const dir = try a.print("/tmp/ggufy_hf_pretok_test_{x}", .{token});
     _ = try std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir);
     defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
 
@@ -5453,12 +5453,12 @@ test "a pre-tokenizer no tag names stops the conversion until -u" {
         }
     }.f;
 
-    try writeFile(try std.fmt.allocPrint(a, "{s}/config.json", .{dir}),
+    try writeFile(try a.print("{s}/config.json", .{dir}),
         \\{"model_type":"llama","num_hidden_layers":1,"hidden_size":64,"intermediate_size":64,
         \\ "num_attention_heads":2,"num_key_value_heads":1,"rms_norm_eps":1e-5,"vocab_size":4,
         \\ "max_position_embeddings":128}
     );
-    try writeFile(try std.fmt.allocPrint(a, "{s}/tokenizer.json", .{dir}), test_bpe_tokenizer);
+    try writeFile(try a.print("{s}/tokenizer.json", .{dir}), test_bpe_tokenizer);
 
     const Spec = struct { name: []const u8, shape: []const usize };
     const specs = [_]Spec{
@@ -5499,7 +5499,7 @@ test "a pre-tokenizer no tag names stops the conversion until -u" {
     try st_file.appendSlice(a, &len_buf);
     try st_file.appendSlice(a, header.items);
     try st_file.appendNTimes(a, 0, off);
-    const src_path = try std.fmt.allocPrint(a, "{s}/m.safetensors", .{dir});
+    const src_path = try a.print("{s}/m.safetensors", .{dir});
     try writeFile(src_path, st_file.items);
 
     var f_st = try st.init(src_path, io, gpa, a, false, false);
@@ -5519,7 +5519,7 @@ test "a pre-tokenizer no tag names stops the conversion until -u" {
 
     // The tag is read off tokenizer.json rather than guessed from model_type,
     // so it is one -H can turn back into a tokenizer.json.
-    const gguf_path = try std.fmt.allocPrint(a, "{s}/native.gguf", .{dir});
+    const gguf_path = try a.print("{s}/native.gguf", .{dir});
     var fg = try gguf.init(gguf_path, io, gpa, a, false);
     defer fg.deinit();
     try testing.expectEqualStrings("llama-bpe", fg.metadata.get("tokenizer.ggml.pre").?.string);
@@ -5527,7 +5527,7 @@ test "a pre-tokenizer no tag names stops the conversion until -u" {
     // What llama.cpp's own files carry, most of the time: a tag whose splitting
     // is several regexes, or none this tool maps. Faking a tokenizer.json for
     // one of those ships a vocabulary that segments text differently.
-    const out_dir = try std.fmt.allocPrint(a, "{s}/out", .{dir});
+    const out_dir = try a.print("{s}/out", .{dir});
     const hf_opts = ConvertOptions{
         .io = io,
         .path = gguf_path,
@@ -5567,7 +5567,7 @@ test "a pre-tokenizer no tag names stops the conversion until -u" {
 
     // The other direction, same rule: splitting no tag names stops the GGUF
     // rather than guessing a family, and -u takes llama.cpp's own fallback tag.
-    try writeFile(try std.fmt.allocPrint(a, "{s}/tokenizer.json", .{dir}),
+    try writeFile(try a.print("{s}/tokenizer.json", .{dir}),
         \\{ "pre_tokenizer": { "type": "Split", "behavior": "Isolated", "pattern": { "Regex": "\\w+" } },
         \\  "model": { "type": "BPE", "vocab": { "a": 0, "b": 1, "c": 2, "d": 3 }, "merges": ["a b"] } }
     );
@@ -5591,7 +5591,7 @@ test "a pre-tokenizer no tag names stops the conversion until -u" {
     var f_ok = try st.init(src_path, io, gpa, a, false, false);
     defer f_ok.deinit();
     try convert(&f_ok, gguf_opts, gpa, a);
-    var fu = try gguf.init(try std.fmt.allocPrint(a, "{s}/untagged.gguf", .{dir}), io, gpa, a, false);
+    var fu = try gguf.init(try a.print("{s}/untagged.gguf", .{dir}), io, gpa, a, false);
     defer fu.deinit();
     try testing.expectEqualStrings("default", fu.metadata.get("tokenizer.ggml.pre").?.string);
 }
@@ -5640,7 +5640,7 @@ test "-H keeps an HF-named qwen3 file's architecture, which ComfyUI-GGUF lists" 
 
     const ts_ns: i96 = std.Io.Timestamp.now(io, .awake).nanoseconds;
     const token: u64 = @as(u64, @bitCast(@as(i64, @truncate(ts_ns)))) ^ @as(u64, @intFromPtr(&arena));
-    const dir = try std.fmt.allocPrint(a, "/tmp/ggufy_hfnames_arch_test_{x}", .{token});
+    const dir = try a.print("/tmp/ggufy_hfnames_arch_test_{x}", .{token});
     _ = try std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir);
     defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
 
@@ -5654,7 +5654,7 @@ test "-H keeps an HF-named qwen3 file's architecture, which ComfyUI-GGUF lists" 
         .{ .name = "model.layers.0.self_attn.k_norm.weight", .shape = &.{16} },
         .{ .name = "model.layers.0.mlp.down_proj.weight", .shape = &.{ 64, 64 } },
     };
-    const src_path = try std.fmt.allocPrint(a, "{s}/m.safetensors", .{dir});
+    const src_path = try a.print("{s}/m.safetensors", .{dir});
     try writeZeroSafetensors(io, a, src_path, &specs);
 
     var opts = ConvertOptions{
@@ -5680,7 +5680,7 @@ test "-H keeps an HF-named qwen3 file's architecture, which ComfyUI-GGUF lists" 
     var f1 = try st.init(src_path, io, gpa, a, false, false);
     defer f1.deinit();
     try convert(&f1, opts, gpa, a);
-    var out = try gguf.init(try std.fmt.allocPrint(a, "{s}/out.gguf", .{dir}), io, gpa, a, false);
+    var out = try gguf.init(try a.print("{s}/out.gguf", .{dir}), io, gpa, a, false);
     defer out.deinit();
     try testing.expectEqualStrings("qwen3", out.metadata.get("general.architecture").?.string);
     try testing.expectEqual(specs.len, out.tensors.items.len);
@@ -5702,7 +5702,7 @@ test "-H prefixes a bare Qwen3VLModel checkpoint into the layout ComfyUI detects
 
     const ts_ns: i96 = std.Io.Timestamp.now(io, .awake).nanoseconds;
     const token: u64 = @as(u64, @bitCast(@as(i64, @truncate(ts_ns)))) ^ @as(u64, @intFromPtr(&arena));
-    const dir = try std.fmt.allocPrint(a, "/tmp/ggufy_hfnames_prefix_test_{x}", .{token});
+    const dir = try a.print("/tmp/ggufy_hfnames_prefix_test_{x}", .{token});
     _ = try std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir);
     defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
 
@@ -5717,7 +5717,7 @@ test "-H prefixes a bare Qwen3VLModel checkpoint into the layout ComfyUI detects
         .{ .name = "visual.deepstack_merger_list.0.norm.weight", .shape = &.{16} },
         .{ .name = "lm_head.weight", .shape = &.{ 32, 64 } },
     };
-    const src_path = try std.fmt.allocPrint(a, "{s}/m.safetensors", .{dir});
+    const src_path = try a.print("{s}/m.safetensors", .{dir});
     try writeZeroSafetensors(io, a, src_path, &specs);
 
     var f = try st.init(src_path, io, gpa, a, false, false);
@@ -5735,7 +5735,7 @@ test "-H prefixes a bare Qwen3VLModel checkpoint into the layout ComfyUI detects
         .quantization_aggressiveness = 0,
         .hf_names = true,
     }, gpa, a);
-    var out = try gguf.init(try std.fmt.allocPrint(a, "{s}/out.gguf", .{dir}), io, gpa, a, false);
+    var out = try gguf.init(try a.print("{s}/out.gguf", .{dir}), io, gpa, a, false);
     defer out.deinit();
     try testing.expectEqualStrings("qwen3vl", out.metadata.get("general.architecture").?.string);
     try testing.expectEqual(specs.len, out.tensors.items.len);
@@ -5743,7 +5743,7 @@ test "-H prefixes a bare Qwen3VLModel checkpoint into the layout ComfyUI detects
         const expected = if (std.mem.startsWith(u8, want.name, "lm_head."))
             want.name
         else
-            try std.fmt.allocPrint(a, "model.{s}", .{want.name});
+            try a.print("model.{s}", .{want.name});
         const found = for (out.tensors.items) |t| {
             if (std.mem.eql(u8, t.name, expected)) break true;
         } else false;
@@ -5756,7 +5756,7 @@ test "-H prefixes a bare Qwen3VLModel checkpoint into the layout ComfyUI detects
 fn targetTestDir(io: std.Io, a: std.mem.Allocator, tag: []const u8) ![]const u8 {
     const ts_ns: i96 = std.Io.Timestamp.now(io, .awake).nanoseconds;
     const token: u64 = @as(u64, @bitCast(@as(i64, @truncate(ts_ns)))) ^ @as(u64, @intFromPtr(a.ptr));
-    const dir = try std.fmt.allocPrint(a, "/tmp/ggufy_target_{s}_test_{x}", .{ tag, token });
+    const dir = try a.print("/tmp/ggufy_target_{s}_test_{x}", .{ tag, token });
     _ = try std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir);
     return dir;
 }
@@ -5847,7 +5847,7 @@ test "an image model's small float tensors still read as ComfyUI-GGUF types" {
         .{ .name = "double_blocks.0.img_attn.proj.weight", .shape = &.{ 512, 512 } },
         .{ .name = "img_in.weight", .shape = &.{ 64, 64 } },
     };
-    const src_path = try std.fmt.allocPrint(a, "{s}/m.safetensors", .{dir});
+    const src_path = try a.print("{s}/m.safetensors", .{dir});
     try writeZeroSafetensors(io, a, src_path, &specs);
 
     var f = try st.init(src_path, io, gpa, a, false, false);
@@ -5891,7 +5891,7 @@ test "the ComfyUI target fuses Qwen-Image 2.1's split MLP gate first, and custom
     };
     const gate_k = 5;
     const up_k = 6;
-    const src_path = try std.fmt.allocPrint(a, "{s}/m.safetensors", .{dir});
+    const src_path = try a.print("{s}/m.safetensors", .{dir});
     try writeF32Safetensors(io, a, src_path, &specs, 0, 1);
 
     const find = struct {
@@ -5925,7 +5925,7 @@ test "the ComfyUI target fuses Qwen-Image 2.1's split MLP gate first, and custom
     try testing.expectEqual(types.FileType.safetensors, st_opts.filetype);
     try convert(&f, st_opts, gpa, a);
     {
-        var out = try st.init(try std.fmt.allocPrint(a, "{s}/out.safetensors", .{dir}), io, gpa, a, false, false);
+        var out = try st.init(try a.print("{s}/out.safetensors", .{dir}), io, gpa, a, false, false);
         defer out.deinit();
         const gu = find(out.tensors.items, B ++ "img_mlp.gate_up.weight") orelse return error.TestExpectedTensor;
         try testing.expectEqualSlices(usize, &.{ 8, 8 }, gu.dims);
@@ -5938,7 +5938,7 @@ test "the ComfyUI target fuses Qwen-Image 2.1's split MLP gate first, and custom
     const g_opts = try applyTarget(&f, targetTestOpts(io, src_path, dir, .comfyui, .f32), gpa, a);
     try convert(&f, g_opts, gpa, a);
     {
-        var out = try gguf.init(try std.fmt.allocPrint(a, "{s}/out.gguf", .{dir}), io, gpa, a, false);
+        var out = try gguf.init(try a.print("{s}/out.gguf", .{dir}), io, gpa, a, false);
         defer out.deinit();
         const gu = find(out.tensors.items, B ++ "img_mlp.gate_up.weight") orelse return error.TestExpectedTensor;
         try expectFused(try read(&out, gu, a));
@@ -5949,7 +5949,7 @@ test "the ComfyUI target fuses Qwen-Image 2.1's split MLP gate first, and custom
     custom.output_name = "split";
     try convert(&f, try applyTarget(&f, custom, gpa, a), gpa, a);
     {
-        var out = try gguf.init(try std.fmt.allocPrint(a, "{s}/split.gguf", .{dir}), io, gpa, a, false);
+        var out = try gguf.init(try a.print("{s}/split.gguf", .{dir}), io, gpa, a, false);
         defer out.deinit();
         try testing.expect(find(out.tensors.items, B ++ "img_mlp.gate_up.weight") == null);
         try testing.expect(find(out.tensors.items, B ++ "img_mlp.gate_layer.weight") != null);
@@ -5979,7 +5979,7 @@ test "the ComfyUI target fuses FLUX.3's q, k and v in that order, and custom kee
         .{ .name = B ++ "norm.query_norm.scale", .dims = &.{8} },
     };
     const first_part = 2;
-    const src_path = try std.fmt.allocPrint(a, "{s}/m.safetensors", .{dir});
+    const src_path = try a.print("{s}/m.safetensors", .{dir});
     try writeF32Safetensors(io, a, src_path, &specs, 0, 1);
 
     const find = struct {
@@ -6007,7 +6007,7 @@ test "the ComfyUI target fuses FLUX.3's q, k and v in that order, and custom kee
     const st_opts = try applyTarget(&f, targetTestOpts(io, src_path, dir, .comfyui, .F32), gpa, a);
     try convert(&f, st_opts, gpa, a);
     {
-        var out = try st.init(try std.fmt.allocPrint(a, "{s}/out.safetensors", .{dir}), io, gpa, a, false, false);
+        var out = try st.init(try a.print("{s}/out.safetensors", .{dir}), io, gpa, a, false, false);
         defer out.deinit();
         const qkv = find(out.tensors.items, B ++ "qkv.weight") orelse return error.TestExpectedTensor;
         try testing.expectEqualSlices(usize, &.{ 12, 8 }, qkv.dims);
@@ -6020,7 +6020,7 @@ test "the ComfyUI target fuses FLUX.3's q, k and v in that order, and custom kee
     const g_opts = try applyTarget(&f, targetTestOpts(io, src_path, dir, .comfyui, .f32), gpa, a);
     try convert(&f, g_opts, gpa, a);
     {
-        var out = try gguf.init(try std.fmt.allocPrint(a, "{s}/out.gguf", .{dir}), io, gpa, a, false);
+        var out = try gguf.init(try a.print("{s}/out.gguf", .{dir}), io, gpa, a, false);
         defer out.deinit();
         try testing.expectEqualStrings("flux3", out.metadata.get("general.architecture").?.string);
         try expectFused(&out, find(out.tensors.items, B ++ "qkv.weight") orelse return error.TestExpectedTensor, a);
@@ -6030,7 +6030,7 @@ test "the ComfyUI target fuses FLUX.3's q, k and v in that order, and custom kee
     custom.output_name = "split";
     try convert(&f, try applyTarget(&f, custom, gpa, a), gpa, a);
     {
-        var out = try gguf.init(try std.fmt.allocPrint(a, "{s}/split.gguf", .{dir}), io, gpa, a, false);
+        var out = try gguf.init(try a.print("{s}/split.gguf", .{dir}), io, gpa, a, false);
         defer out.deinit();
         try testing.expect(find(out.tensors.items, B ++ "qkv.weight") == null);
         try testing.expect(find(out.tensors.items, B ++ "k_proj.weight") != null);
@@ -6057,7 +6057,7 @@ test "--attention writes, keeps or drops ComfyUI's attention preferences, and GG
         .{ .name = "single_blocks.1.qkv.weight", .dims = &.{ 24, 8 } },
         .{ .name = "txt_mode_blocks.0.qkv.weight", .dims = &.{ 24, 8 } },
     };
-    const src_path = try std.fmt.allocPrint(a, "{s}/m.safetensors", .{dir});
+    const src_path = try a.print("{s}/m.safetensors", .{dir});
     try writeF32Safetensors(io, a, src_path, &specs, 0, 1);
 
     const configsIn = struct {
@@ -6089,7 +6089,7 @@ test "--attention writes, keeps or drops ComfyUI's attention preferences, and GG
     on.attention = .int8;
     on.output_name = "on";
     try convert(&f, on, gpa, a);
-    const on_path = try std.fmt.allocPrint(a, "{s}/on.safetensors", .{dir});
+    const on_path = try a.print("{s}/on.safetensors", .{dir});
     const want = [_][]const u8{
         "content_mode_blocks.image.0.comfy_attention.config",
         "single_blocks.0.comfy_attention.config",
@@ -6105,12 +6105,12 @@ test "--attention writes, keeps or drops ComfyUI's attention preferences, and GG
     var keep = try applyTarget(&on_src, targetTestOpts(io, on_path, dir, .comfyui, .F32), gpa, a);
     keep.output_name = "keep";
     try convert(&on_src, keep, gpa, a);
-    try testing.expectEqual(want.len, (try configsIn(try std.fmt.allocPrint(a, "{s}/keep.safetensors", .{dir}), io, a, gpa)).len);
+    try testing.expectEqual(want.len, (try configsIn(try a.print("{s}/keep.safetensors", .{dir}), io, a, gpa)).len);
     var dflt = keep;
     dflt.attention = .default;
     dflt.output_name = "default";
     try convert(&on_src, dflt, gpa, a);
-    try testing.expectEqual(@as(usize, 0), (try configsIn(try std.fmt.allocPrint(a, "{s}/default.safetensors", .{dir}), io, a, gpa)).len);
+    try testing.expectEqual(@as(usize, 0), (try configsIn(try a.print("{s}/default.safetensors", .{dir}), io, a, gpa)).len);
 
     var g = try applyTarget(&f, targetTestOpts(io, src_path, dir, .comfyui, .f32), gpa, a);
     g.attention = .int8;
@@ -6184,7 +6184,7 @@ test "the ComfyUI target warns about a GGUF of an architecture ComfyUI-GGUF does
         .{ .name = "blocks.0.attn.qknorm.qnorm.scale", .shape = &.{64} },
         .{ .name = "txtfusion.projector.weight", .shape = &.{ 64, 64 } },
     };
-    const src_path = try std.fmt.allocPrint(a, "{s}/m.safetensors", .{dir});
+    const src_path = try a.print("{s}/m.safetensors", .{dir});
     try writeZeroSafetensors(io, a, src_path, &specs);
 
     var f = try st.init(src_path, io, gpa, a, false, false);
@@ -6194,7 +6194,7 @@ test "the ComfyUI target warns about a GGUF of an architecture ComfyUI-GGUF does
     try testing.expectEqual(Target.Target.comfyui, gguf_opts.target);
     const pred = try predictOutput(&f, gguf_opts, gpa, a);
     try testing.expectEqualStrings("", try Target.problem("", &pred.verdicts, .comfyui, a));
-    try testing.expect(std.mem.indexOf(u8, try Target.warning(&pred.verdicts, .comfyui, a), "krea2") != null);
+    try testing.expect(std.mem.find(u8, try Target.warning(&pred.verdicts, .comfyui, a), "krea2") != null);
     // With no type asked for, it is safetensors, which loads with no extension.
     const st_opts = try applyTarget(&f, targetTestOpts(io, src_path, dir, .comfyui, null), gpa, a);
     try testing.expectEqual(types.FileType.safetensors, st_opts.filetype);
@@ -6221,7 +6221,7 @@ test "a Qwen3-VL checkpoint takes the layout its target's loader reads" {
         .{ .name = "visual.patch_embed.proj.weight", .shape = &.{ 16, 48 } },
         .{ .name = "visual.deepstack_merger_list.0.norm.weight", .shape = &.{16} },
     };
-    const src_path = try std.fmt.allocPrint(a, "{s}/m.safetensors", .{dir});
+    const src_path = try a.print("{s}/m.safetensors", .{dir});
     try writeZeroSafetensors(io, a, src_path, &specs);
 
     var f = try st.init(src_path, io, gpa, a, false, false);
@@ -6261,7 +6261,7 @@ test "a target plans for the architecture config.json names, not the tensor fami
         .{ .name = "model.layers.0.mlp.down_proj.weight", .shape = &.{ 64, 64 } },
         .{ .name = "model.norm.weight", .shape = &.{64} },
     };
-    const src_path = try std.fmt.allocPrint(a, "{s}/model.safetensors", .{dir});
+    const src_path = try a.print("{s}/model.safetensors", .{dir});
     try writeZeroSafetensors(io, a, src_path, &specs);
 
     var f = try st.init(src_path, io, gpa, a, false, false);
@@ -6270,7 +6270,7 @@ test "a target plans for the architecture config.json names, not the tensor fami
     try testing.expectEqualStrings("llama", bare.arch_name);
 
     {
-        const file = try std.Io.Dir.cwd().createFile(io, try std.fmt.allocPrint(a, "{s}/config.json", .{dir}), .{ .truncate = true });
+        const file = try std.Io.Dir.cwd().createFile(io, try a.print("{s}/config.json", .{dir}), .{ .truncate = true });
         defer file.close(io);
         try file.writeStreamingAll(io, "{\"model_type\":\"qwen2\"}");
     }
@@ -6300,13 +6300,13 @@ test "convert refuses before writing an output its target cannot load, unless al
     const specs = [_]NameShape{
         .{ .name = "double_blocks.0.img_attn.proj.weight", .shape = &.{ 512, 512 } },
     };
-    const src_path = try std.fmt.allocPrint(a, "{s}/m.safetensors", .{dir});
+    const src_path = try a.print("{s}/m.safetensors", .{dir});
     try writeZeroSafetensors(io, a, src_path, &specs);
 
     var f = try st.init(src_path, io, gpa, a, false, false);
     defer f.deinit();
     const opts = try applyTarget(&f, targetTestOpts(io, src_path, dir, .comfyui, .ASYM_W4A8_INT8_ZP), gpa, a);
-    const out_path = try std.fmt.allocPrint(a, "{s}/out.safetensors", .{dir});
+    const out_path = try a.print("{s}/out.safetensors", .{dir});
     try testing.expectError(error.TargetCannotLoad, convert(&f, opts, gpa, a));
     try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, out_path, .{}));
 
@@ -6330,7 +6330,7 @@ test "a llama-shaped checkpoint with no usable config.json is refused unless -H 
     // Unique dir per run (parallel binaries would race on a shared path).
     const ts_ns: i96 = std.Io.Timestamp.now(io, .awake).nanoseconds;
     const token: u64 = @as(u64, @bitCast(@as(i64, @truncate(ts_ns)))) ^ @as(u64, @intFromPtr(&arena));
-    const dir = try std.fmt.allocPrint(a, "/tmp/ggufy_noconfig_test_{x}", .{token});
+    const dir = try a.print("/tmp/ggufy_noconfig_test_{x}", .{token});
     _ = try std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir);
     defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
 
@@ -6342,15 +6342,15 @@ test "a llama-shaped checkpoint with no usable config.json is refused unless -H 
         }
     }.f;
 
-    const config_path = try std.fmt.allocPrint(a, "{s}/config.json", .{dir});
+    const config_path = try a.print("{s}/config.json", .{dir});
     const body =
         \\"num_hidden_layers":1,"hidden_size":8,"intermediate_size":8,
         \\ "num_attention_heads":2,"num_key_value_heads":1,"rms_norm_eps":1e-5,"vocab_size":4,
         \\ "max_position_embeddings":128}
     ;
     // A llama-shaped model type with no rename table here.
-    try writeFile(io, config_path, try std.fmt.allocPrint(a, "{{\"model_type\":\"olmo\",{s}", .{body}));
-    try writeFile(io, try std.fmt.allocPrint(a, "{s}/tokenizer.json", .{dir}), test_bpe_tokenizer);
+    try writeFile(io, config_path, try a.print("{{\"model_type\":\"olmo\",{s}", .{body}));
+    try writeFile(io, try a.print("{s}/tokenizer.json", .{dir}), test_bpe_tokenizer);
 
     // Exactly llama's HF detection set - the shape Mistral, Gemma and SmolLM
     // all share.
@@ -6367,7 +6367,7 @@ test "a llama-shaped checkpoint with no usable config.json is refused unless -H 
     try file_bytes.appendSlice(a, &len_buf);
     try file_bytes.appendSlice(a, header);
     try file_bytes.appendNTimes(a, 0, 576);
-    const src_path = try std.fmt.allocPrint(a, "{s}/m.safetensors", .{dir});
+    const src_path = try a.print("{s}/m.safetensors", .{dir});
     try writeFile(io, src_path, file_bytes.items);
 
     const opts = ConvertOptions{
@@ -6409,7 +6409,7 @@ test "a llama-shaped checkpoint with no usable config.json is refused unless -H 
     }
 
     // A config.json naming a type we map takes the same tensors through.
-    try writeFile(io, config_path, try std.fmt.allocPrint(a, "{{\"model_type\":\"llama\",{s}", .{body}));
+    try writeFile(io, config_path, try a.print("{{\"model_type\":\"llama\",{s}", .{body}));
     var f3 = try st.init(src_path, io, gpa, a, false, false);
     defer f3.deinit();
     const prep = try prepareConversion(&f3, opts, gpa, a);
@@ -6420,7 +6420,7 @@ test "a llama-shaped checkpoint with no usable config.json is refused unless -H 
     try testing.expect(found);
 
     // Mistral is llama to llama.cpp: same names, same Q/K permute, same arch.
-    try writeFile(io, config_path, try std.fmt.allocPrint(a, "{{\"model_type\":\"mistral\",{s}", .{body}));
+    try writeFile(io, config_path, try a.print("{{\"model_type\":\"mistral\",{s}", .{body}));
     var fm = try st.init(src_path, io, gpa, a, false, false);
     defer fm.deinit();
     const prep_m = try prepareConversion(&fm, opts, gpa, a);
@@ -6440,7 +6440,7 @@ test "a llama-shaped checkpoint with no usable config.json is refused unless -H 
     var keep_named = keep;
     keep_named.output_name = "keep";
     try convert(&f3h, keep_named, gpa, a);
-    var out = try gguf.init(try std.fmt.allocPrint(a, "{s}/keep.gguf", .{dir}), io, gpa, a, false);
+    var out = try gguf.init(try a.print("{s}/keep.gguf", .{dir}), io, gpa, a, false);
     defer out.deinit();
     try testing.expectEqual(@as(usize, 5), out.tensors.items.len);
     for (out.tensors.items) |t| {
@@ -6452,7 +6452,7 @@ test "a llama-shaped checkpoint with no usable config.json is refused unless -H 
 
     // An unreadable tokenizer beside a config.json we do understand is a
     // different thing to fix, and says so rather than blaming the config.
-    try writeFile(io, try std.fmt.allocPrint(a, "{s}/tokenizer.json", .{dir}), "{\"model\":{\"type\":\"WordPiece\"}}");
+    try writeFile(io, try a.print("{s}/tokenizer.json", .{dir}), "{\"model\":{\"type\":\"WordPiece\"}}");
     var f4 = try st.init(src_path, io, gpa, a, false, false);
     defer f4.deinit();
     try testing.expectError(error.HfTokenizerUnreadable, prepareConversion(&f4, opts, gpa, a));
@@ -6471,7 +6471,7 @@ test "a config.json with no tokenizer anywhere writes a native text encoder" {
 
     const ts_ns: i96 = std.Io.Timestamp.now(io, .awake).nanoseconds;
     const token: u64 = @as(u64, @bitCast(@as(i64, @truncate(ts_ns)))) ^ @as(u64, @intFromPtr(&arena));
-    const dir = try std.fmt.allocPrint(a, "/tmp/ggufy_vocabless_test_{x}", .{token});
+    const dir = try a.print("/tmp/ggufy_vocabless_test_{x}", .{token});
     _ = try std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir);
     defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
 
@@ -6483,7 +6483,7 @@ test "a config.json with no tokenizer anywhere writes a native text encoder" {
         }
     }.f;
 
-    try writeFile(io, try std.fmt.allocPrint(a, "{s}/config.json", .{dir}),
+    try writeFile(io, try a.print("{s}/config.json", .{dir}),
         \\{"model_type":"qwen3","num_hidden_layers":1,"hidden_size":8,"intermediate_size":8,
         \\ "num_attention_heads":2,"num_key_value_heads":1,"head_dim":4,"rms_norm_eps":1e-6,
         \\ "vocab_size":4,"max_position_embeddings":128,"rope_theta":1000000}
@@ -6503,7 +6503,7 @@ test "a config.json with no tokenizer anywhere writes a native text encoder" {
     try file_bytes.appendSlice(a, &len_buf);
     try file_bytes.appendSlice(a, header);
     try file_bytes.appendNTimes(a, 0, 416);
-    const src_path = try std.fmt.allocPrint(a, "{s}/model.safetensors", .{dir});
+    const src_path = try a.print("{s}/model.safetensors", .{dir});
     try writeFile(io, src_path, file_bytes.items);
 
     const opts = ConvertOptions{
@@ -6522,7 +6522,7 @@ test "a config.json with no tokenizer anywhere writes a native text encoder" {
     defer f.deinit();
     try convert(&f, opts, gpa, a);
 
-    var out = try gguf.init(try std.fmt.allocPrint(a, "{s}/te.gguf", .{dir}), io, gpa, a, false);
+    var out = try gguf.init(try a.print("{s}/te.gguf", .{dir}), io, gpa, a, false);
     defer out.deinit();
     try testing.expectEqual(@as(usize, 7), out.tensors.items.len);
     var found_q = false;
@@ -6583,7 +6583,7 @@ test "HF MoE experts stack into one tensor per projection, across shards and fro
 
     const ts_ns: i96 = std.Io.Timestamp.now(io, .awake).nanoseconds;
     const token: u64 = @as(u64, @bitCast(@as(i64, @truncate(ts_ns)))) ^ @as(u64, @intFromPtr(&arena));
-    const dir = try std.fmt.allocPrint(a, "/tmp/ggufy_moe_test_{x}", .{token});
+    const dir = try a.print("/tmp/ggufy_moe_test_{x}", .{token});
     _ = try std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir);
     defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
 
@@ -6594,13 +6594,13 @@ test "HF MoE experts stack into one tensor per projection, across shards and fro
             try file.writeStreamingAll(io2, bytes);
         }
     }.f;
-    try writeFile(io, try std.fmt.allocPrint(a, "{s}/config.json", .{dir}),
+    try writeFile(io, try a.print("{s}/config.json", .{dir}),
         \\{"model_type":"qwen3_moe","num_hidden_layers":1,"hidden_size":4,"intermediate_size":6,
         \\ "num_attention_heads":2,"num_key_value_heads":1,"head_dim":2,"rms_norm_eps":1e-6,
         \\ "vocab_size":4,"max_position_embeddings":64,"num_experts":2,"num_experts_per_tok":1,
         \\ "moe_intermediate_size":3}
     );
-    try writeFile(io, try std.fmt.allocPrint(a, "{s}/tokenizer.json", .{dir}), test_bpe_tokenizer);
+    try writeFile(io, try a.print("{s}/tokenizer.json", .{dir}), test_bpe_tokenizer);
 
     const L = "model.layers.0.";
     const dense = [_]StSpec{
@@ -6629,23 +6629,23 @@ test "HF MoE experts stack into one tensor per projection, across shards and fro
         .{ .name = L ++ "mlp.experts.1.up_proj.weight", .dims = &.{ 3, 4 } },
     };
     // Spec indices: dense 0..10, e0 11..13 (shard 1 continues the count), e1 20..22.
-    try writeF32Safetensors(io, a, try std.fmt.allocPrint(a, "{s}/model-00001-of-00002.safetensors", .{dir}), &(dense ++ e0), 0, 1);
-    try writeF32Safetensors(io, a, try std.fmt.allocPrint(a, "{s}/model-00002-of-00002.safetensors", .{dir}), &e1, 20, 1);
+    try writeF32Safetensors(io, a, try a.print("{s}/model-00001-of-00002.safetensors", .{dir}), &(dense ++ e0), 0, 1);
+    try writeF32Safetensors(io, a, try a.print("{s}/model-00002-of-00002.safetensors", .{dir}), &e1, 20, 1);
     var idx: std.ArrayList(u8) = .empty;
     try idx.appendSlice(a, "{\"weight_map\":{");
     for (dense ++ e0, 0..) |sp, i| try idx.print(a, "{s}\"{s}\":\"model-00001-of-00002.safetensors\"", .{ if (i > 0) "," else "", sp.name });
     for (e1) |sp| try idx.print(a, ",\"{s}\":\"model-00002-of-00002.safetensors\"", .{sp.name});
     try idx.appendSlice(a, "}}");
-    const idx_path = try std.fmt.allocPrint(a, "{s}/model.safetensors.index.json", .{dir});
+    const idx_path = try a.print("{s}/model.safetensors.index.json", .{dir});
     try writeFile(io, idx_path, idx.items);
 
     const readG = struct {
         fn f(g: anytype, name: []const u8, alloc: std.mem.Allocator) !struct { t: types.Tensor, v: []const f32 } {
             for (g.tensors.items) |t| if (std.mem.eql(u8, t.name, name)) {
-                const buf = try alloc.alloc(u8, @intCast(t.size));
+                const buf = try alloc.alloc(f32, @intCast(t.size / 4));
                 const file = try g.openFileForTensor(t.name);
-                _ = try file.readPositionalAll(g.io, buf, t.offset + g.current_data_begin);
-                return .{ .t = t, .v = @alignCast(std.mem.bytesAsSlice(f32, buf)) };
+                _ = try file.readPositionalAll(g.io, std.mem.sliceAsBytes(buf), t.offset + g.current_data_begin);
+                return .{ .t = t, .v = buf };
             };
             return error.TestExpectedTensor;
         }
@@ -6667,7 +6667,7 @@ test "HF MoE experts stack into one tensor per projection, across shards and fro
         var f = try st.init(idx_path, io, gpa, a, false, false);
         defer f.deinit();
         try convert(&f, opts, gpa, a);
-        var g = try gguf.init(try std.fmt.allocPrint(a, "{s}/moe.gguf", .{dir}), io, gpa, a, false);
+        var g = try gguf.init(try a.print("{s}/moe.gguf", .{dir}), io, gpa, a, false);
         defer g.deinit();
 
         // 11 dense tensors, and 6 expert weights become 3.
@@ -6698,11 +6698,11 @@ test "HF MoE experts stack into one tensor per projection, across shards and fro
         .{ .name = L ++ "mlp.experts.gate_up_proj", .dims = &.{ 2, 6, 4 } },
         .{ .name = L ++ "mlp.experts.down_proj", .dims = &.{ 2, 4, 3 } },
     };
-    const fdir = try std.fmt.allocPrint(a, "{s}/fused", .{dir});
+    const fdir = try a.print("{s}/fused", .{dir});
     _ = try std.Io.Dir.cwd().createDirPathStatus(io, fdir, .default_dir);
-    try std.Io.Dir.cwd().copyFile(try std.fmt.allocPrint(a, "{s}/config.json", .{dir}), std.Io.Dir.cwd(), try std.fmt.allocPrint(a, "{s}/config.json", .{fdir}), io, .{});
-    try writeFile(io, try std.fmt.allocPrint(a, "{s}/tokenizer.json", .{fdir}), test_bpe_tokenizer);
-    const fpath = try std.fmt.allocPrint(a, "{s}/model.safetensors", .{fdir});
+    try std.Io.Dir.cwd().copyFile(try a.print("{s}/config.json", .{dir}), std.Io.Dir.cwd(), try a.print("{s}/config.json", .{fdir}), io, .{});
+    try writeFile(io, try a.print("{s}/tokenizer.json", .{fdir}), test_bpe_tokenizer);
+    const fpath = try a.print("{s}/model.safetensors", .{fdir});
     try writeF32Safetensors(io, a, fpath, &(dense ++ fused), 0, 1);
     opts.path = fpath;
     opts.output_dir = fdir;
@@ -6710,7 +6710,7 @@ test "HF MoE experts stack into one tensor per projection, across shards and fro
         var f = try st.init(fpath, io, gpa, a, false, false);
         defer f.deinit();
         try convert(&f, opts, gpa, a);
-        var g = try gguf.init(try std.fmt.allocPrint(a, "{s}/moe.gguf", .{fdir}), io, gpa, a, false);
+        var g = try gguf.init(try a.print("{s}/moe.gguf", .{fdir}), io, gpa, a, false);
         defer g.deinit();
         try testing.expectEqual(@as(usize, 14), g.tensors.items.len);
         const gate = try readG(&g, "blk.0.ffn_gate_exps.weight", a);
@@ -6741,7 +6741,7 @@ test "an HF qwen3_5_moe checkpoint converts: hybrid rewrites with equal head cou
 
     const ts_ns: i96 = std.Io.Timestamp.now(io, .awake).nanoseconds;
     const token: u64 = @as(u64, @bitCast(@as(i64, @truncate(ts_ns)))) ^ @as(u64, @intFromPtr(&arena));
-    const dir = try std.fmt.allocPrint(a, "/tmp/ggufy_q35moe_test_{x}", .{token});
+    const dir = try a.print("/tmp/ggufy_q35moe_test_{x}", .{token});
     _ = try std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir);
     defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
 
@@ -6755,7 +6755,7 @@ test "an HF qwen3_5_moe checkpoint converts: hybrid rewrites with equal head cou
     // Two K heads and two V heads, so the V reorder has nothing to move and
     // only the decay and norm rewrites are left to show. No intermediate_size:
     // MoE configs may leave it out.
-    try writeFile(io, try std.fmt.allocPrint(a, "{s}/config.json", .{dir}),
+    try writeFile(io, try a.print("{s}/config.json", .{dir}),
         \\{"model_type":"qwen3_5_moe","text_config":{"model_type":"qwen3_5_moe_text",
         \\ "num_hidden_layers":1,"hidden_size":4,"num_attention_heads":2,"num_key_value_heads":1,
         \\ "head_dim":2,"rms_norm_eps":1e-6,"vocab_size":4,"max_position_embeddings":64,
@@ -6765,7 +6765,7 @@ test "an HF qwen3_5_moe checkpoint converts: hybrid rewrites with equal head cou
         \\ "shared_expert_intermediate_size":5,
         \\ "rope_parameters":{"rope_theta":10000000,"partial_rotary_factor":0.5,"mrope_section":[1,0,0]}}}
     );
-    try writeFile(io, try std.fmt.allocPrint(a, "{s}/tokenizer.json", .{dir}), test_bpe_tokenizer);
+    try writeFile(io, try a.print("{s}/tokenizer.json", .{dir}), test_bpe_tokenizer);
 
     const L = "model.language_model.layers.0.";
     const specs = [_]StSpec{
@@ -6792,7 +6792,7 @@ test "an HF qwen3_5_moe checkpoint converts: hybrid rewrites with equal head cou
     };
     // Small values so -exp(A_log) stays finite.
     const scale: f32 = 1.0 / 16384.0;
-    const src_path = try std.fmt.allocPrint(a, "{s}/model.safetensors", .{dir});
+    const src_path = try a.print("{s}/model.safetensors", .{dir});
     try writeF32Safetensors(io, a, src_path, &specs, 0, scale);
 
     var src_f = try st.init(src_path, io, gpa, a, false, false);
@@ -6810,7 +6810,7 @@ test "an HF qwen3_5_moe checkpoint converts: hybrid rewrites with equal head cou
         .quantization_aggressiveness = 0,
     }, gpa, a);
 
-    var g = try gguf.init(try std.fmt.allocPrint(a, "{s}/q35moe.gguf", .{dir}), io, gpa, a, false);
+    var g = try gguf.init(try a.print("{s}/q35moe.gguf", .{dir}), io, gpa, a, false);
     defer g.deinit();
     const md = g.metadata;
     try testing.expectEqualStrings("qwen35moe", md.get("general.architecture").?.string);
@@ -6825,10 +6825,10 @@ test "an HF qwen3_5_moe checkpoint converts: hybrid rewrites with equal head cou
     const readG = struct {
         fn f(gg: anytype, name: []const u8, alloc: std.mem.Allocator) !struct { t: types.Tensor, v: []const f32 } {
             for (gg.tensors.items) |t| if (std.mem.eql(u8, t.name, name)) {
-                const buf = try alloc.alloc(u8, @intCast(t.size));
+                const buf = try alloc.alloc(f32, @intCast(t.size / 4));
                 const file = try gg.openFileForTensor(t.name);
-                _ = try file.readPositionalAll(gg.io, buf, t.offset + gg.current_data_begin);
-                return .{ .t = t, .v = @alignCast(std.mem.bytesAsSlice(f32, buf)) };
+                _ = try file.readPositionalAll(gg.io, std.mem.sliceAsBytes(buf), t.offset + gg.current_data_begin);
+                return .{ .t = t, .v = buf };
             };
             return error.TestExpectedTensor;
         }
@@ -6867,7 +6867,7 @@ test "a GGUF carrying HF names of its own is written through, not un-permuted" {
     // Unique dir per run (parallel binaries would race on a shared path).
     const ts_ns: i96 = std.Io.Timestamp.now(io, .awake).nanoseconds;
     const token: u64 = @as(u64, @bitCast(@as(i64, @truncate(ts_ns)))) ^ @as(u64, @intFromPtr(&arena));
-    const dir = try std.fmt.allocPrint(a, "/tmp/ggufy_hfsource_test_{x}", .{token});
+    const dir = try a.print("/tmp/ggufy_hfsource_test_{x}", .{token});
     _ = try std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir);
     defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
 
@@ -6918,7 +6918,7 @@ test "a GGUF carrying HF names of its own is written through, not un-permuted" {
     try st_file.appendSlice(a, &len_buf);
     try st_file.appendSlice(a, header.items);
     try st_file.appendSlice(a, data);
-    const src_path = try std.fmt.allocPrint(a, "{s}/m.safetensors", .{dir});
+    const src_path = try a.print("{s}/m.safetensors", .{dir});
     {
         const file = try std.Io.Dir.cwd().createFile(io, src_path, .{ .truncate = true });
         defer file.close(io);
@@ -6946,7 +6946,7 @@ test "a GGUF carrying HF names of its own is written through, not un-permuted" {
     // Those HF names are the source's own, not a rename this tool performed, so
     // -H has nothing to do: no rename, and above all no RoPE un-permute of rows
     // that were never permuted.
-    const gguf_path = try std.fmt.allocPrint(a, "{s}/hfnamed.gguf", .{dir});
+    const gguf_path = try a.print("{s}/hfnamed.gguf", .{dir});
     var fg = try gguf.init(gguf_path, io, gpa, a, false);
     defer fg.deinit();
     try convert(&fg, .{
@@ -6963,7 +6963,7 @@ test "a GGUF carrying HF names of its own is written through, not un-permuted" {
         .hf_names = true,
     }, gpa, a);
 
-    var fo = try st.init(try std.fmt.allocPrint(a, "{s}/back.safetensors", .{dir}), io, gpa, a, false, false);
+    var fo = try st.init(try a.print("{s}/back.safetensors", .{dir}), io, gpa, a, false, false);
     defer fo.deinit();
     var q: ?types.Tensor = null;
     for (fo.tensors.items) |t| {
@@ -6990,7 +6990,7 @@ test "a safetensors carrying native names of its own is not permuted again" {
     // Unique dir per run (parallel binaries would race on a shared path).
     const ts_ns: i96 = std.Io.Timestamp.now(io, .awake).nanoseconds;
     const token: u64 = @as(u64, @bitCast(@as(i64, @truncate(ts_ns)))) ^ @as(u64, @intFromPtr(&arena));
-    const dir = try std.fmt.allocPrint(a, "/tmp/ggufy_nativesource_test_{x}", .{token});
+    const dir = try a.print("/tmp/ggufy_nativesource_test_{x}", .{token});
     _ = try std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir);
     defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
 
@@ -7004,10 +7004,10 @@ test "a safetensors carrying native names of its own is not permuted again" {
 
     // 16 wide over 2 heads is a head_dim of 8, so the permute swaps halves of 4.
     // A half of 2 would make it its own inverse and hide a second application.
-    try writeFile(io, try std.fmt.allocPrint(a, "{s}/config.json", .{dir}),
+    try writeFile(io, try a.print("{s}/config.json", .{dir}),
         \\{"model_type":"llama","num_hidden_layers":1,"hidden_size":16,"intermediate_size":16,"num_attention_heads":2,"num_key_value_heads":1,"rms_norm_eps":1e-5,"vocab_size":100,"max_position_embeddings":128}
         ++ "\n");
-    try writeFile(io, try std.fmt.allocPrint(a, "{s}/tokenizer.json", .{dir}), test_bpe_tokenizer);
+    try writeFile(io, try a.print("{s}/tokenizer.json", .{dir}), test_bpe_tokenizer);
 
     const Spec = struct { name: []const u8, shape: []const usize };
     const specs = [_]Spec{
@@ -7064,7 +7064,7 @@ test "a safetensors carrying native names of its own is not permuted again" {
     try st_file.appendSlice(a, &len_buf);
     try st_file.appendSlice(a, header.items);
     try st_file.appendSlice(a, data);
-    const src_path = try std.fmt.allocPrint(a, "{s}/m.safetensors", .{dir});
+    const src_path = try a.print("{s}/m.safetensors", .{dir});
     try writeFile(io, src_path, st_file.items);
 
     const readT = struct {
@@ -7101,7 +7101,7 @@ test "a safetensors carrying native names of its own is not permuted again" {
 
     // The HF checkpoint -> GGUF: the Q rows are permuted on the way in.
     try convertTo(src_path, .gguf, .f16, "first", dir, io, gpa, a);
-    const first_path = try std.fmt.allocPrint(a, "{s}/first.gguf", .{dir});
+    const first_path = try a.print("{s}/first.gguf", .{dir});
     var f_first = try gguf.init(first_path, io, gpa, a, false);
     defer f_first.deinit();
     const first_q = try readT(&f_first, "blk.0.attn_q.weight", a);
@@ -7128,9 +7128,9 @@ test "a safetensors carrying native names of its own is not permuted again" {
 
     // Its rows are already half-split, so converting it back must permute
     // nothing: same bytes as the first GGUF, not the permute applied twice.
-    const native_path = try std.fmt.allocPrint(a, "{s}/native.safetensors", .{dir});
+    const native_path = try a.print("{s}/native.safetensors", .{dir});
     try convertTo(native_path, .gguf, .f16, "second", dir, io, gpa, a);
-    var f_second = try gguf.init(try std.fmt.allocPrint(a, "{s}/second.gguf", .{dir}), io, gpa, a, false);
+    var f_second = try gguf.init(try a.print("{s}/second.gguf", .{dir}), io, gpa, a, false);
     defer f_second.deinit();
     try testing.expectEqualSlices(u8, first_q, try readT(&f_second, "blk.0.attn_q.weight", a));
 }
@@ -7149,7 +7149,7 @@ test "a file that is not the model its neighbouring config.json describes conver
     // Unique dir per run (parallel binaries would race on a shared path).
     const ts_ns: i96 = std.Io.Timestamp.now(io, .awake).nanoseconds;
     const token: u64 = @as(u64, @bitCast(@as(i64, @truncate(ts_ns)))) ^ @as(u64, @intFromPtr(&arena));
-    const dir = try std.fmt.allocPrint(a, "/tmp/ggufy_sibling_test_{x}", .{token});
+    const dir = try a.print("/tmp/ggufy_sibling_test_{x}", .{token});
     _ = try std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir);
     defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
 
@@ -7161,12 +7161,12 @@ test "a file that is not the model its neighbouring config.json describes conver
         }
     }.f;
 
-    try writeFile(io, try std.fmt.allocPrint(a, "{s}/config.json", .{dir}),
+    try writeFile(io, try a.print("{s}/config.json", .{dir}),
         \\{"model_type":"llama","num_hidden_layers":1,"hidden_size":8,"intermediate_size":8,
         \\ "num_attention_heads":2,"num_key_value_heads":1,"rms_norm_eps":1e-5,"vocab_size":4,
         \\ "max_position_embeddings":128}
     );
-    try writeFile(io, try std.fmt.allocPrint(a, "{s}/tokenizer.json", .{dir}), test_bpe_tokenizer);
+    try writeFile(io, try a.print("{s}/tokenizer.json", .{dir}), test_bpe_tokenizer);
 
     // A LoRA adapter in the model's own repo: nothing here maps in either
     // direction, so the rename must leave the file alone rather than drop
@@ -7181,7 +7181,7 @@ test "a file that is not the model its neighbouring config.json describes conver
     try file_bytes.appendSlice(a, &len_buf);
     try file_bytes.appendSlice(a, header);
     try file_bytes.appendNTimes(a, 0, 128);
-    const src_path = try std.fmt.allocPrint(a, "{s}/adapter_model.safetensors", .{dir});
+    const src_path = try a.print("{s}/adapter_model.safetensors", .{dir});
     try writeFile(io, src_path, file_bytes.items);
 
     const opts = ConvertOptions{
@@ -7207,7 +7207,7 @@ test "a file that is not the model its neighbouring config.json describes conver
     // The same adapter beside a tokenizer that would stop the model it belongs
     // to: an empty merge table is the refusal with no -u to go on from, and it
     // is about that model's vocabulary, which this file does not carry.
-    try writeFile(io, try std.fmt.allocPrint(a, "{s}/tokenizer.json", .{dir}),
+    try writeFile(io, try a.print("{s}/tokenizer.json", .{dir}),
         \\{"pre_tokenizer":{"type":"Split","behavior":"Isolated","pattern":{"Regex":"\\w+"}},
         \\ "model":{"type":"BPE","vocab":{"a":0,"b":1,"c":2,"d":3},"merges":[]}}
     );
@@ -7228,11 +7228,11 @@ test "computeOutputPath names a template's output after its average bit rate" {
 
     const ts_ns: i96 = std.Io.Timestamp.now(io, .awake).nanoseconds;
     const token: u64 = @as(u64, @bitCast(@as(i64, @truncate(ts_ns)))) ^ @as(u64, @intFromPtr(&arena));
-    const dir = try std.fmt.allocPrint(a, "/tmp/ggufy_tplname_test_{x}", .{token});
+    const dir = try a.print("/tmp/ggufy_tplname_test_{x}", .{token});
     _ = try std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir);
     defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
 
-    const tpl_path = try std.fmt.allocPrint(a, "{s}/t.json", .{dir});
+    const tpl_path = try a.print("{s}/t.json", .{dir});
     {
         const file = try std.Io.Dir.cwd().createFile(io, tpl_path, .{ .truncate = true });
         defer file.close(io);
@@ -7289,21 +7289,21 @@ test "a checkpoint directory with a dot in its name keeps the whole name" {
 
     const ts_ns: i96 = std.Io.Timestamp.now(io, .awake).nanoseconds;
     const token: u64 = @as(u64, @bitCast(@as(i64, @truncate(ts_ns)))) ^ @as(u64, @intFromPtr(&arena));
-    const root = try std.fmt.allocPrint(a, "/tmp/ggufy_stem_test_{x}", .{token});
+    const root = try a.print("/tmp/ggufy_stem_test_{x}", .{token});
     defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
-    const model_dir = try std.fmt.allocPrint(a, "{s}/Qwen3.5-9B", .{root});
+    const model_dir = try a.print("{s}/Qwen3.5-9B", .{root});
     _ = try std.Io.Dir.cwd().createDirPathStatus(io, model_dir, .default_dir);
 
     var opts = testOpts(.q4_k);
     opts.io = io;
     opts.path = model_dir;
     const out = try computeOutputPath(opts, false, a);
-    try testing.expectEqualStrings("Qwen3.5-9B-q4_k.gguf", std.fs.path.basename(out));
-    try testing.expectEqualStrings("mmproj-Qwen3.5-9B-q4_k.gguf", std.fs.path.basename(try mmprojPath(out, a)));
+    try testing.expectEqualStrings("Qwen3.5-9B-q4_k.gguf", std.Io.Dir.path.basename(out));
+    try testing.expectEqualStrings("mmproj-Qwen3.5-9B-q4_k.gguf", std.Io.Dir.path.basename(try mmprojPath(out, a)));
 
     // A file still loses its extension, and only that.
     opts.path = "/models/Qwen2.5-0.5B-Instruct.safetensors";
-    try testing.expectEqualStrings("Qwen2.5-0.5B-Instruct-q4_k.gguf", std.fs.path.basename(try computeOutputPath(opts, false, a)));
+    try testing.expectEqualStrings("Qwen2.5-0.5B-Instruct-q4_k.gguf", std.Io.Dir.path.basename(try computeOutputPath(opts, false, a)));
 }
 
 test "stripDtypeSuffix removes a trailing dtype and nothing else" {
@@ -7399,7 +7399,7 @@ test "the ComfyUI embedding rule applies to safetensors output only" {
 fn writeVisionFixture(io: std.Io, a: std.mem.Allocator, comptime name: []const u8, tag: []const u8) ![]const u8 {
     const ts_ns: i96 = std.Io.Timestamp.now(io, .awake).nanoseconds;
     const token: u64 = @as(u64, @bitCast(@as(i64, @truncate(ts_ns)))) ^ @as(u64, @intFromPtr(tag.ptr));
-    const dir = try std.fmt.allocPrint(a, "/tmp/ggufy_vision_{s}_{s}_{x}", .{ name, tag, token });
+    const dir = try a.print("/tmp/ggufy_vision_{s}_{s}_{x}", .{ name, tag, token });
     _ = try std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir);
     const files = .{
         .{ "model.safetensors", @embedFile("test_fixtures/vision/" ++ name ++ "/model.safetensors") },
@@ -7408,7 +7408,7 @@ fn writeVisionFixture(io: std.Io, a: std.mem.Allocator, comptime name: []const u
         .{ "tokenizer.json", test_bpe_tokenizer },
     };
     inline for (files) |entry| {
-        const file = try std.Io.Dir.cwd().createFile(io, try std.fmt.allocPrint(a, "{s}/{s}", .{ dir, entry[0] }), .{ .truncate = true });
+        const file = try std.Io.Dir.cwd().createFile(io, try a.print("{s}/{s}", .{ dir, entry[0] }), .{ .truncate = true });
         defer file.close(io);
         try file.writeStreamingAll(io, entry[1]);
     }
@@ -7449,7 +7449,7 @@ fn expectMmprojMatchesLlamaCpp(comptime name: []const u8) !void {
 
     const dir = try writeVisionFixture(io, a, name, "mmproj");
     defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
-    const src_path = try std.fmt.allocPrint(a, "{s}/model.safetensors", .{dir});
+    const src_path = try a.print("{s}/model.safetensors", .{dir});
     // A k-quant text target still gets an f16 mmproj, the type the fixture has.
     const opts = ConvertOptions{
         .io = io,
@@ -7474,11 +7474,11 @@ fn expectMmprojMatchesLlamaCpp(comptime name: []const u8) !void {
         try convert(&f, opts, gpa, a);
     }
     // The estimate covers both files the conversion writes.
-    const text_size = (try std.Io.Dir.cwd().statFile(io, try std.fmt.allocPrint(a, "{s}/vl.gguf", .{dir}), .{})).size;
-    const mm_size = (try std.Io.Dir.cwd().statFile(io, try std.fmt.allocPrint(a, "{s}/mmproj-vl.gguf", .{dir}), .{})).size;
+    const text_size = (try std.Io.Dir.cwd().statFile(io, try a.print("{s}/vl.gguf", .{dir}), .{})).size;
+    const mm_size = (try std.Io.Dir.cwd().statFile(io, try a.print("{s}/mmproj-vl.gguf", .{dir}), .{})).size;
     try testing.expectEqual(text_size + mm_size, predicted);
 
-    const ref_path = try std.fmt.allocPrint(a, "{s}/ref.gguf", .{dir});
+    const ref_path = try a.print("{s}/ref.gguf", .{dir});
     {
         const file = try std.Io.Dir.cwd().createFile(io, ref_path, .{ .truncate = true });
         defer file.close(io);
@@ -7486,7 +7486,7 @@ fn expectMmprojMatchesLlamaCpp(comptime name: []const u8) !void {
     }
     var ref = try gguf.init(ref_path, io, gpa, a, false);
     defer ref.deinit();
-    var got = try gguf.init(try std.fmt.allocPrint(a, "{s}/mmproj-vl.gguf", .{dir}), io, gpa, a, false);
+    var got = try gguf.init(try a.print("{s}/mmproj-vl.gguf", .{dir}), io, gpa, a, false);
     defer got.deinit();
 
     // The name parts come from the directory, and provenance is this tool's.
@@ -7569,7 +7569,7 @@ fn expectVisionRoundTrip(comptime name: []const u8) !void {
 
     const dir = try writeVisionFixture(io, a, name, "roundtrip");
     defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
-    const src_path = try std.fmt.allocPrint(a, "{s}/model.safetensors", .{dir});
+    const src_path = try a.print("{s}/model.safetensors", .{dir});
     const base = ConvertOptions{
         .io = io,
         .path = src_path,
@@ -7591,17 +7591,17 @@ fn expectVisionRoundTrip(comptime name: []const u8) !void {
 
     var src = try st.init(src_path, io, gpa, a, false, false);
     defer src.deinit();
-    const text_path = try std.fmt.allocPrint(a, "{s}/vl.gguf", .{dir});
+    const text_path = try a.print("{s}/vl.gguf", .{dir});
 
     // Lossless through f32, then again with llama.cpp's own f16 mmproj in
     // place of this tool's, whose tower comes back f16-rounded.
     for ([_]bool{ false, true }, [_][]const u8{ "hf", "hf_llamacpp" }) |llamacpp, out_name| {
         if (llamacpp) {
-            const file = try std.Io.Dir.cwd().createFile(io, try std.fmt.allocPrint(a, "{s}/mmproj-vl.gguf", .{dir}), .{ .truncate = true });
+            const file = try std.Io.Dir.cwd().createFile(io, try a.print("{s}/mmproj-vl.gguf", .{dir}), .{ .truncate = true });
             defer file.close(io);
             try file.writeStreamingAll(io, @embedFile("test_fixtures/vision/" ++ name ++ "/mmproj-f16.gguf"));
         }
-        const out_dir = try std.fmt.allocPrint(a, "{s}/{s}", .{ dir, out_name });
+        const out_dir = try a.print("{s}/{s}", .{ dir, out_name });
         {
             var g = try gguf.init(text_path, io, gpa, a, false);
             defer g.deinit();
@@ -7614,7 +7614,7 @@ fn expectVisionRoundTrip(comptime name: []const u8) !void {
             opts.output_name = null;
             try convert(&g, opts, gpa, a);
         }
-        const hf_path = try std.fmt.allocPrint(a, "{s}/model.safetensors", .{out_dir});
+        const hf_path = try a.print("{s}/model.safetensors", .{out_dir});
         var got = try st.init(hf_path, io, gpa, a, false, false);
         defer got.deinit();
         try testing.expectEqual(src.tensors.items.len, got.tensors.items.len);
@@ -7642,7 +7642,7 @@ fn expectVisionRoundTrip(comptime name: []const u8) !void {
         }
 
         // The vision_config transformers builds the tower from.
-        const cfg_bytes = try std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.allocPrint(a, "{s}/config.json", .{out_dir}), a, .limited(1 << 20));
+        const cfg_bytes = try std.Io.Dir.cwd().readFileAlloc(io, try a.print("{s}/config.json", .{out_dir}), a, .limited(1 << 20));
         const cfg = try std.json.parseFromSliceLeaky(std.json.Value, a, cfg_bytes, .{});
         const ref = try std.json.parseFromSliceLeaky(std.json.Value, a, @embedFile("test_fixtures/vision/" ++ name ++ "/config.json"), .{});
         const vc = cfg.object.get("vision_config").?.object;
@@ -7682,7 +7682,7 @@ test "a Qwen3-VL text GGUF with no mmproj beside it is refused for -H" {
 
     const dir = try writeVisionFixture(io, a, "qwen3vl", "lone");
     defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
-    const src_path = try std.fmt.allocPrint(a, "{s}/model.safetensors", .{dir});
+    const src_path = try a.print("{s}/model.safetensors", .{dir});
     var opts = ConvertOptions{
         .io = io,
         .path = src_path,
@@ -7700,14 +7700,14 @@ test "a Qwen3-VL text GGUF with no mmproj beside it is refused for -H" {
         defer f.deinit();
         try convert(&f, opts, gpa, a);
     }
-    try std.Io.Dir.cwd().deleteFile(io, try std.fmt.allocPrint(a, "{s}/mmproj-vl.gguf", .{dir}));
-    const text_path = try std.fmt.allocPrint(a, "{s}/vl.gguf", .{dir});
+    try std.Io.Dir.cwd().deleteFile(io, try a.print("{s}/mmproj-vl.gguf", .{dir}));
+    const text_path = try a.print("{s}/vl.gguf", .{dir});
     var g = try gguf.init(text_path, io, gpa, a, false);
     defer g.deinit();
     opts.path = text_path;
     opts.filetype = .safetensors;
     opts.datatype = .F16;
     opts.hf_names = true;
-    opts.output_dir = try std.fmt.allocPrint(a, "{s}/hf", .{dir});
+    opts.output_dir = try a.print("{s}/hf", .{dir});
     try testing.expectError(error.MmprojMissing, convert(&g, opts, gpa, a));
 }

@@ -84,13 +84,13 @@ pub fn init(path: []const u8, io: std.Io, allocator: std.mem.Allocator, arena_al
         // that builds it, and the tensors below keep their own arena copies of it.
         // Look for index.json
         const paths_index = [_][]const u8{ path, "model.safetensors.index.json" };
-        const index_path = try std.fs.path.join(arena_alloc, &paths_index);
+        const index_path = try std.Io.Dir.path.join(arena_alloc, &paths_index);
         if (std.Io.Dir.cwd().access(io, index_path, .{})) {
             entry_path = index_path;
         } else |_| {
             // Look for model.safetensors
             const paths_single = [_][]const u8{ path, "model.safetensors" };
-            const single_path = try std.fs.path.join(arena_alloc, &paths_single);
+            const single_path = try std.Io.Dir.path.join(arena_alloc, &paths_single);
             if (std.Io.Dir.cwd().access(io, single_path, .{})) {
                 entry_path = single_path;
             } else |_| {
@@ -125,12 +125,12 @@ fn loadSingle(self: *Safetensors, path: []const u8) !void {
     var read_buffer: [1024]u8 = undefined;
     var reader = file.reader(self.io, &read_buffer);
 
-    const len = try reader.interface.readAlloc(self.allocator, 8);
+    const len = try reader.interface.readAllocAll(self.allocator, 8);
     defer self.allocator.free(len);
     const header_len = std.mem.readInt(u64, len[0..8], .little);
     self.current_data_begin = header_len + 8;
 
-    const header_bytes = try reader.interface.readAlloc(self.allocator, header_len);
+    const header_bytes = try reader.interface.readAllocAll(self.allocator, header_len);
 
     self.json_data = try std.json.parseFromSlice(std.json.Value, self.allocator, header_bytes, .{});
     self.allocator.free(header_bytes); // Safe because parseFromSlice copies strings by default
@@ -144,7 +144,7 @@ fn loadSingle(self: *Safetensors, path: []const u8) !void {
 }
 
 fn loadSharded(self: *Safetensors, index_path: []const u8) !void {
-    const dir = std.fs.path.dirname(index_path) orelse ".";
+    const dir = std.Io.Dir.path.dirname(index_path) orelse ".";
 
     // Read index file
     const file = try std.Io.Dir.cwd().openFile(self.io, index_path, .{});
@@ -187,7 +187,7 @@ fn loadSharded(self: *Safetensors, index_path: []const u8) !void {
     var first = true;
     for (filenames.items) |fname| {
         const paths = [_][]const u8{ dir, fname };
-        const full_path = try std.fs.path.join(self.allocator, &paths);
+        const full_path = try std.Io.Dir.path.join(self.allocator, &paths);
         defer self.allocator.free(full_path);
 
         const shard_file = try std.Io.Dir.cwd().openFile(self.io, full_path, .{});
@@ -195,11 +195,11 @@ fn loadSharded(self: *Safetensors, index_path: []const u8) !void {
         var read_buffer: [1024]u8 = undefined;
         var reader = shard_file.reader(self.io, &read_buffer);
 
-        const len = try reader.interface.readAlloc(self.allocator, 8);
+        const len = try reader.interface.readAllocAll(self.allocator, 8);
         defer self.allocator.free(len);
         const header_len = std.mem.readInt(u64, len[0..8], .little);
         self.current_data_begin = header_len + 8;
-        const header_bytes = try reader.interface.readAlloc(self.allocator, header_len);
+        const header_bytes = try reader.interface.readAllocAll(self.allocator, header_len);
 
         const shard_json = try std.json.parseFromSlice(std.json.Value, self.allocator, header_bytes, .{});
         self.allocator.free(header_bytes);
@@ -420,9 +420,9 @@ pub const DType = enum {
         if (str.len > buf.len) return error.UnknownDType;
         const upper = std.ascii.upperString(&buf, str);
 
-        inline for (std.meta.fields(DType)) |field| {
-            if (std.mem.eql(u8, upper, field.name)) {
-                return @field(DType, field.name);
+        inline for (@typeInfo(DType).@"enum".field_names) |name| {
+            if (std.mem.eql(u8, upper, name)) {
+                return @field(DType, name);
             }
         }
         std.log.debug("Unknown dtype: {s}", .{str});
@@ -734,11 +734,11 @@ pub fn parseHeader(self: Safetensors) !std.json.Parsed(std.json.Value) {
     var read_buf: [1024]u8 = undefined;
     var reader = file.reader(self.io, &read_buf);
 
-    const len = try reader.interface.readAlloc(self.arena_alloc, 8);
+    const len = try reader.interface.readAllocAll(self.arena_alloc, 8);
     defer self.arena_alloc.free(len);
     const header_len = std.mem.readInt(u64, len[0..8], .little);
 
-    const data = try reader.interface.readAlloc(self.arena_alloc, header_len);
+    const data = try reader.interface.readAllocAll(self.arena_alloc, header_len);
 
     return std.json.parseFromSlice(std.json.Value, self.arena_alloc, data, .{});
 }
@@ -827,8 +827,8 @@ fn stringifyMetadataValues(arena: std.mem.Allocator, meta: std.json.ObjectMap) !
             .string, .number_string => |s| s,
             .bool => |b| if (b) "true" else "false",
             .null => "null",
-            .integer => |i| try std.fmt.allocPrint(arena, "{d}", .{i}),
-            .float => |f| try std.fmt.allocPrint(arena, "{d}", .{f}),
+            .integer => |i| try arena.print("{d}", .{i}),
+            .float => |f| try arena.print("{d}", .{f}),
             // Nested containers keep their JSON form, which is how ComfyUI stores
             // structured values (e.g. the `modelspec.*` and cluster `comfy_quant` blobs).
             .array, .object => try std.json.Stringify.valueAlloc(arena, value, .{}),
@@ -868,7 +868,7 @@ fn buildHeaderObject(
                     t.name;
                 var off = t.offset;
                 for (specs) |s| {
-                    const name = try std.fmt.allocPrint(arena, "{s}{s}", .{ base, s.suffix });
+                    const name = try arena.print("{s}{s}", .{ base, s.suffix });
                     try putClusterHeaderEntry(arena, &header_obj, name, s.dtype, s.dims, off, off + s.bytes);
                     off += s.bytes;
                 }

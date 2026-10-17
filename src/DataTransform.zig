@@ -17,6 +17,21 @@ pub const Quantizer = struct {
         return convertTensorDataWeighted(allocator, src_data, src_type, dst_type, element_count, pool, null);
     }
 
+    /// Dequantizes into a new `[]f32`. Use this rather than casting convertTensorData's
+    /// `[]u8` to f32: that buffer is allocated with byte alignment and must be freed as bytes.
+    pub fn dequantizeToF32Alloc(
+        allocator: std.mem.Allocator,
+        src_data: []const u8,
+        src_type: types.DataType,
+        element_count: u64,
+        pool: *thread_pool_mod.ThreadPool,
+    ) ![]f32 {
+        const out = try allocator.alloc(f32, @intCast(element_count));
+        errdefer allocator.free(out);
+        try dequantizeToF32(src_data, out, src_type, pool);
+        return out;
+    }
+
     /// The same, with per-column importance weights for the destination type's
     /// scale search. `imatrix` is one weight per column of a row, so its length
     /// is the row width and the k-quant encoders are handed whole rows.
@@ -109,7 +124,7 @@ pub const Quantizer = struct {
                 const expected_size: usize = @intCast(src_type.calcSizeInBytes(@intCast(output_f32.len)));
                 if (input_bytes.len != expected_size) return error.InputSizeMismatch;
                 const traits = ggml.ggml_get_type_traits(
-                    @as(ggml.enum_ggml_type, @intCast(@intFromEnum(gguf_type))),
+                    @as(ggml.enum_ggml_type, @intCast(@backingInt(gguf_type))),
                 );
                 const to_float_fn = traits.*.to_float orelse return error.UnsupportedSourceType;
                 to_float_fn(input_bytes.ptr, output_f32.ptr, @intCast(output_f32.len));
@@ -206,7 +221,7 @@ pub const Quantizer = struct {
         // A few encoders abort outright without weights rather than falling back,
         // so refuse here with a name the caller can report. Reaching ggml with
         // this combination kills the process mid-file.
-        if (imatrix == null and ggml.ggml_quantize_requires_imatrix(@intCast(@intFromEnum(q_type)))) {
+        if (imatrix == null and ggml.ggml_quantize_requires_imatrix(@intCast(@backingInt(q_type)))) {
             return error.TypeRequiresImatrix;
         }
         const unit_elems: u64 = if (imatrix) |im| @intCast(im.len) else block_elements;
@@ -259,7 +274,7 @@ pub const Quantizer = struct {
         // Every unit in this call is the same width, so one weight vector serves
         // all of them - which is ggml's own contract for quant_weights.
         _ = ggml.ggml_quantize_chunk(
-            @as(ggml.enum_ggml_type, @intCast(@intFromEnum(q_type))),
+            @as(ggml.enum_ggml_type, @intCast(@backingInt(q_type))),
             src_block.ptr,
             dst_block.ptr,
             0,
@@ -2243,7 +2258,7 @@ const fixture_dir = "src/test_fixtures";
 
 fn loadFixture(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
     var path_buf: [256]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ fixture_dir, name });
+    const path = try std.mem.print(&path_buf, "{s}/{s}", .{ fixture_dir, name });
     return readFileToOwnedSlice(allocator, path, 64 * 1024 * 1024) catch |err| {
         if (err == error.FileNotFound) return null;
         return err;
@@ -2582,8 +2597,8 @@ test "MXFP8 toBlockedMxfp8: matches Python to_blocked reference" {
     inline for (cases) |c| {
         var inp_name: [32]u8 = undefined;
         var exp_name: [32]u8 = undefined;
-        const inp_path = try std.fmt.bufPrint(&inp_name, "mxfp8_blocking_input_{d}.u8",    .{c.fixture_num});
-        const exp_path = try std.fmt.bufPrint(&exp_name, "mxfp8_blocking_expected_{d}.u8", .{c.fixture_num});
+        const inp_path = try std.mem.print(&inp_name, "mxfp8_blocking_input_{d}.u8",    .{c.fixture_num});
+        const exp_path = try std.mem.print(&exp_name, "mxfp8_blocking_expected_{d}.u8", .{c.fixture_num});
 
         const input_bytes    = (try loadFixture(allocator, inp_path)) orelse return error.SkipZigTest;
         defer allocator.free(input_bytes);
@@ -2653,10 +2668,7 @@ fn roundtripWeighted(
         imatrix,
     );
     defer allocator.free(q);
-    const back = try Quantizer.convertTensorData(allocator, q, dst_type, .F32, w.len, pool);
-    defer allocator.free(back);
-    const as_f32: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, back));
-    return allocator.dupe(f32, as_f32);
+    return Quantizer.dequantizeToF32Alloc(allocator, q, dst_type, w.len, pool);
 }
 
 /// Σ_j w_j · (a_j − b_j)² over every row, weights cycling with the row width.
@@ -2732,7 +2744,7 @@ test "the GGUF block tables agree with ggml's own for every type we emit" {
     };
     for (emitted) |dt| {
         const t = try gguf.GgmlType.fromString(@tagName(dt));
-        const gt: ggml.enum_ggml_type = @intCast(@intFromEnum(t));
+        const gt: ggml.enum_ggml_type = @intCast(@backingInt(t));
         const want_block: u64 = @intCast(ggml.ggml_blck_size(gt));
         const want_bytes: u64 = @intCast(ggml.ggml_type_size(gt));
         if (t.getBlockSize() != want_block or t.getBytesPerBlock() != want_bytes) {

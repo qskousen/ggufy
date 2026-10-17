@@ -5,10 +5,9 @@ const Quantizer = DataTransform.Quantizer;
 const N = 1 << 20; // 1M elements
 const RUNS = 5;
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
     // Generate random-ish f32 data in a range that exercises all code paths
     const input = try allocator.alloc(f32, N);
@@ -35,9 +34,9 @@ pub fn main() !void {
     {
         var best_ns: u64 = std.math.maxInt(u64);
         for (0..RUNS) |_| {
-            var timer = try std.time.Timer.start();
+            const t0 = nowNs(io);
             for (input, output) |v, *o| o.* = Quantizer.f32_to_fp8_e4m3(v);
-            const ns = timer.read();
+            const ns: u64 = @intCast(nowNs(io) - t0);
             std.mem.doNotOptimizeAway(output.ptr);
             best_ns = @min(best_ns, ns);
         }
@@ -48,7 +47,7 @@ pub fn main() !void {
     {
         var best_ns: u64 = std.math.maxInt(u64);
         for (0..RUNS) |_| {
-            var timer = try std.time.Timer.start();
+            const t0 = nowNs(io);
             const W = 8;
             var i: usize = 0;
             while (i + W <= N) : (i += W) {
@@ -57,7 +56,7 @@ pub fn main() !void {
                 output[i..][0..W].* = result;
             }
             while (i < N) : (i += 1) output[i] = Quantizer.f32_to_fp8_e4m3(input[i]);
-            const ns = timer.read();
+            const ns: u64 = @intCast(nowNs(io) - t0);
             std.mem.doNotOptimizeAway(output.ptr);
             best_ns = @min(best_ns, ns);
         }
@@ -73,9 +72,9 @@ pub fn main() !void {
     {
         var best_ns: u64 = std.math.maxInt(u64);
         for (0..RUNS) |_| {
-            var timer = try std.time.Timer.start();
+            const t0 = nowNs(io);
             for (input, output) |v, *o| o.* = Quantizer.f32_to_fp8_e5m2(v);
-            const ns = timer.read();
+            const ns: u64 = @intCast(nowNs(io) - t0);
             std.mem.doNotOptimizeAway(output.ptr);
             best_ns = @min(best_ns, ns);
         }
@@ -86,7 +85,7 @@ pub fn main() !void {
     {
         var best_ns: u64 = std.math.maxInt(u64);
         for (0..RUNS) |_| {
-            var timer = try std.time.Timer.start();
+            const t0 = nowNs(io);
             const W = 8;
             var i: usize = 0;
             while (i + W <= N) : (i += W) {
@@ -95,7 +94,7 @@ pub fn main() !void {
                 output[i..][0..W].* = result;
             }
             while (i < N) : (i += 1) output[i] = Quantizer.f32_to_fp8_e5m2(input[i]);
-            const ns = timer.read();
+            const ns: u64 = @intCast(nowNs(io) - t0);
             std.mem.doNotOptimizeAway(output.ptr);
             best_ns = @min(best_ns, ns);
         }
@@ -114,9 +113,9 @@ pub fn main() !void {
     {
         var best_ns: u64 = std.math.maxInt(u64);
         for (0..RUNS) |_| {
-            var timer = try std.time.Timer.start();
+            const t0 = nowNs(io);
             for (output, output_lut) |b, *o| o.* = Quantizer.fp8_e4m3_to_f32(b);
-            const ns = timer.read();
+            const ns: u64 = @intCast(nowNs(io) - t0);
             std.mem.doNotOptimizeAway(output_lut.ptr);
             best_ns = @min(best_ns, ns);
         }
@@ -127,9 +126,9 @@ pub fn main() !void {
     {
         var best_ns: u64 = std.math.maxInt(u64);
         for (0..RUNS) |_| {
-            var timer = try std.time.Timer.start();
+            const t0 = nowNs(io);
             for (output, output_lut) |b, *o| o.* = Quantizer.lut_e4m3[b];
-            const ns = timer.read();
+            const ns: u64 = @intCast(nowNs(io) - t0);
             std.mem.doNotOptimizeAway(output_lut.ptr);
             best_ns = @min(best_ns, ns);
         }
@@ -145,9 +144,9 @@ pub fn main() !void {
     {
         var best_ns: u64 = std.math.maxInt(u64);
         for (0..RUNS) |_| {
-            var timer = try std.time.Timer.start();
+            const t0 = nowNs(io);
             for (output, output_lut) |b, *o| o.* = Quantizer.fp8_e5m2_to_f32(b);
-            const ns = timer.read();
+            const ns: u64 = @intCast(nowNs(io) - t0);
             std.mem.doNotOptimizeAway(output_lut.ptr);
             best_ns = @min(best_ns, ns);
         }
@@ -158,9 +157,9 @@ pub fn main() !void {
     {
         var best_ns: u64 = std.math.maxInt(u64);
         for (0..RUNS) |_| {
-            var timer = try std.time.Timer.start();
+            const t0 = nowNs(io);
             for (output, output_lut) |b, *o| o.* = Quantizer.lut_e5m2[b];
-            const ns = timer.read();
+            const ns: u64 = @intCast(nowNs(io) - t0);
             std.mem.doNotOptimizeAway(output_lut.ptr);
             best_ns = @min(best_ns, ns);
         }
@@ -169,4 +168,8 @@ pub fn main() !void {
     }
 
     print("\n", .{});
+}
+
+fn nowNs(io: std.Io) i96 {
+    return std.Io.Timestamp.now(io, .awake).nanoseconds;
 }

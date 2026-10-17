@@ -1,6 +1,7 @@
 const std = @import("std");
 const ggml = @import("build_ggml.zig");
 const cimgui = @import("cimgui");
+const Translator = @import("translate_c").Translator;
 
 pub fn build(b: *std.Build) void {
     const git_version = get_git_version(b.allocator, b.graph.io) catch "dev";
@@ -16,12 +17,20 @@ pub fn build(b: *std.Build) void {
 
     // --- Shared modules ---
 
+    const ggml_c: Translator = .init(b.dependency("translate_c", .{}), .{
+        .c_source_file = b.path("src/ggml_c.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ggml_c.addIncludePath(b.path("vendor/ggml/include"));
+    ggml_c.defineCMacro("NDEBUG", "1");
+
     const ggml_h_module = b.addModule("ggml.h", .{
         .root_source_file = b.path("src/ggml_bindings.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{.{ .name = "ggml_c", .module = ggml_c.mod }},
     });
-    ggml_h_module.addIncludePath(b.path("vendor/ggml/include"));
 
     const mod = b.addModule("ggufy", .{
         .root_source_file = b.path("src/root.zig"),
@@ -62,7 +71,7 @@ pub fn build(b: *std.Build) void {
 
     const run_cmd = b.addRunArtifact(cli);
     run_cmd.step.dependOn(&cli_install.step);
-    if (b.args) |args| run_cmd.addArgs(args);
+    run_cmd.addPassthruArgs();
     b.step("run", "Run the CLI").dependOn(&run_cmd.step);
 
     // --- GUI ---
@@ -87,10 +96,10 @@ pub fn build(b: *std.Build) void {
     gui.root_module.addImport("backend", dvui_dep.module("sdl3"));
     gui.root_module.addImport("build_options", options_mod);
 
-    // When cross-compiling for macOS with an explicit sysroot (e.g. CI),
-    // Zig does not automatically add the SDK's framework search path, so we must wire it up ourselves.
+    // Zig does not add the SDK's framework search path when cross-compiling for macOS, and build.zig
+    // cannot see --sysroot, so CI passes the SDK root again as -Dmacos-sdk.
     if (target.result.os.tag == .macos) {
-        if (b.sysroot) |sysroot| {
+        if (b.option([]const u8, "macos-sdk", "macOS SDK root for cross-compiling")) |sysroot| {
             const fw_path = b.pathJoin(&.{ sysroot, "System/Library/Frameworks" });
             gui.root_module.addFrameworkPath(.{ .cwd_relative = fw_path });
         }
@@ -102,7 +111,7 @@ pub fn build(b: *std.Build) void {
 
     const run_gui_cmd = b.addRunArtifact(gui);
     run_gui_cmd.step.dependOn(&gui_install.step);
-    if (b.args) |args| run_gui_cmd.addArgs(args);
+    run_gui_cmd.addPassthruArgs();
     b.step("run-gui", "Run the GUI").dependOn(&run_gui_cmd.step);
 
     // --- Default: build both ---
@@ -117,13 +126,13 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/bench.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
             .imports = &.{
                 .{ .name = "ggml.h", .module = ggml_h_module },
             },
         }),
     });
-    ggml.link(b, bench, target, .ReleaseFast);
+    ggml.link(b, bench, target, .fast);
     const run_bench = b.addRunArtifact(bench);
     b.step("bench", "Run F8 benchmarks").dependOn(&run_bench.step);
 
@@ -142,7 +151,7 @@ pub fn build(b: *std.Build) void {
     });
     ggml.link(b, precision, target, optimize);
     const run_precision = b.addRunArtifact(precision);
-    if (b.args) |args| run_precision.addArgs(args);
+    run_precision.addPassthruArgs();
     b.step("precision", "Run the quantization precision report").dependOn(&run_precision.step);
 
     const bench_eff = b.addExecutable(.{
@@ -150,13 +159,13 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/bench_efficiency.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
             .imports = &.{
                 .{ .name = "ggml.h", .module = ggml_h_module },
             },
         }),
     });
-    ggml.link(b, bench_eff, target, .ReleaseFast);
+    ggml.link(b, bench_eff, target, .fast);
     const run_bench_eff = b.addRunArtifact(bench_eff);
     b.step("bench-efficiency", "Run quantization efficiency benchmarks").dependOn(&run_bench_eff.step);
 
@@ -173,7 +182,7 @@ pub fn build(b: *std.Build) void {
     });
     ggml.link(b, bench_convrot, target, optimize);
     const run_bench_convrot = b.addRunArtifact(bench_convrot);
-    if (b.args) |args| run_bench_convrot.addArgs(args);
+    run_bench_convrot.addPassthruArgs();
     b.step("bench-convrot", "Time the ConvRot-family quantizers (follows -Doptimize)").dependOn(&run_bench_convrot.step);
 
     // --- Tests ---
@@ -349,7 +358,7 @@ fn get_git_version(allocator: std.mem.Allocator, io: std.Io) ![]const u8 {
     const trimmed_version = std.mem.trimEnd(u8, version_result.stdout, "\n");
 
     if (status_result.stdout.len > 0) {
-        return try std.fmt.allocPrint(allocator, "{s}(DIRTY)", .{trimmed_version});
+        return try allocator.print("{s}(DIRTY)", .{trimmed_version});
     }
     return try allocator.dupe(u8, trimmed_version);
 }

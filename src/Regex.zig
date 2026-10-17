@@ -9,7 +9,7 @@ const Regex = @This();
 
 pub const Error = error{ InvalidPattern, UnsupportedPattern, PatternTooLarge, OutOfMemory };
 
-const Set = std.StaticBitSet(256);
+const Set = std.bit_set.Static(256);
 
 const Inst = union(enum) {
     set: u32,
@@ -274,7 +274,7 @@ const Parser = struct {
             },
             '[' => return .{ .set = try p.parseClass() },
             '.' => {
-                var s = Set.initFull();
+                var s = Set.full;
                 s.unset('\n');
                 s.unset('\r');
                 return .{ .set = s };
@@ -344,7 +344,7 @@ const Parser = struct {
             negate = true;
             p.i += 1;
         }
-        var set = Set.initEmpty();
+        var set = Set.empty;
         while (true) {
             const c = p.peek() orelse return error.InvalidPattern;
             if (c == ']') {
@@ -393,11 +393,11 @@ const Parser = struct {
 
     fn parseNamedClass(p: *Parser) Error!Set {
         p.i += 1;
-        const end = std.mem.indexOfPos(u8, p.src, p.i, ":]") orelse return error.InvalidPattern;
+        const end = std.mem.findPos(u8, p.src, p.i, ":]") orelse return error.InvalidPattern;
         const name = p.src[p.i..end];
         p.i = end + 2;
         const pred: *const fn (u8) bool = if (std.mem.eql(u8, name, "alnum")) std.ascii.isAlphanumeric else if (std.mem.eql(u8, name, "alpha")) std.ascii.isAlphabetic else if (std.mem.eql(u8, name, "digit") or std.mem.eql(u8, name, "d")) std.ascii.isDigit else if (std.mem.eql(u8, name, "lower")) std.ascii.isLower else if (std.mem.eql(u8, name, "upper")) std.ascii.isUpper else if (std.mem.eql(u8, name, "space") or std.mem.eql(u8, name, "s")) std.ascii.isWhitespace else if (std.mem.eql(u8, name, "xdigit")) std.ascii.isHex else if (std.mem.eql(u8, name, "punct")) isPunct else if (std.mem.eql(u8, name, "w")) isWordChar else return error.UnsupportedPattern;
-        var s = Set.initEmpty();
+        var s = Set.empty;
         for (0..256) |b| if (pred(@intCast(b))) s.set(b);
         return s;
     }
@@ -408,7 +408,7 @@ fn isPunct(c: u8) bool {
 }
 
 fn single(c: u8) Set {
-    var s = Set.initEmpty();
+    var s = Set.empty;
     s.set(c);
     return s;
 }
@@ -420,7 +420,7 @@ fn firstSet(s: Set) ?u8 {
 const Class = enum { digit, word, space };
 
 fn classSet(class: Class, negate: bool) Set {
-    var s = Set.initEmpty();
+    var s = Set.empty;
     for (0..256) |b| {
         const c: u8 = @intCast(b);
         const in = switch (class) {
