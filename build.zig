@@ -297,6 +297,20 @@ pub fn build(b: *std.Build) void {
     ggml.link(b, safetensor_test, target, optimize);
     test_step.dependOn(&b.addRunArtifact(safetensor_test).step);
 
+    const file_loader_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/FileLoader.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ggml.h", .module = ggml_h_module },
+                .{ .name = "build_options", .module = options_mod },
+            },
+        }),
+    });
+    ggml.link(b, file_loader_test, target, optimize);
+    test_step.dependOn(&b.addRunArtifact(file_loader_test).step);
+
     const target_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/Target.zig"),
