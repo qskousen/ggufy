@@ -82,21 +82,17 @@ pub fn init(path: []const u8, io: std.Io, allocator: std.mem.Allocator, arena_al
     if (stat.kind == .directory) {
         // Joined into the arena, not `allocator`: entry_path outlives the branch
         // that builds it, and the tensors below keep their own arena copies of it.
-        // Look for index.json
-        const paths_index = [_][]const u8{ path, "model.safetensors.index.json" };
-        const index_path = try std.Io.Dir.path.join(arena_alloc, &paths_index);
-        if (std.Io.Dir.cwd().access(io, index_path, .{})) {
-            entry_path = index_path;
-        } else |_| {
-            // Look for model.safetensors
-            const paths_single = [_][]const u8{ path, "model.safetensors" };
-            const single_path = try std.Io.Dir.path.join(arena_alloc, &paths_single);
-            if (std.Io.Dir.cwd().access(io, single_path, .{})) {
-                entry_path = single_path;
-            } else |_| {
-                return error.ModelNotFound;
-            }
-        }
+        // Transformers names, then a diffusers component folder's.
+        const candidates = [_][]const u8{
+            "model.safetensors.index.json",
+            "model.safetensors",
+            "diffusion_pytorch_model.safetensors.index.json",
+            "diffusion_pytorch_model.safetensors",
+        };
+        entry_path = for (candidates) |name| {
+            const candidate = try std.Io.Dir.path.join(arena_alloc, &.{ path, name });
+            if (std.Io.Dir.cwd().access(io, candidate, .{})) break candidate else |_| {}
+        } else return error.ModelNotFound;
     }
 
     if (std.mem.endsWith(u8, entry_path, "index.json")) {

@@ -13,6 +13,7 @@ ggufy:
 Download pre-built executables [on the releases page](https://github.com/qskousen/ggufy/releases)
 
 Join our [fluxer](https://chat.syf.me/invite/T2JOigIZ) to discuss ggufy, AI, and relevant topics.
+
 "Why not just use Discord like everyone else?" https://blog.qskousen.info/why-not-discord
 
 ### GUI screenshots
@@ -107,6 +108,7 @@ This table lists the architectures that ggufy can convert, and whether they have
 | Mage-Flow          | ✅         | ❌                |
 | SenseNova U1.5     | ✅         | ❌                |
 | MiniMax H3         | ✅         | ❌                |
+| MOSS-Image         | ✅         | ❌                |
 
 I initially intended to have this all in pure zig, but now it includes ggml c/c++ code for quantization. I did actually get a working q8_0 implementation in zig (you can find it if you look back through the commits) but got stuck on figuring out q5_0 and decided to just pull in ggml and use that.
 

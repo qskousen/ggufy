@@ -1155,6 +1155,39 @@ pub const sensenova_u15 = Arch{
     },
 };
 
+// MOSS-Image: a single-stream DiT in the FLUX.2 latent space, conditioned on
+// Qwen3.5-9B hidden states through a two-block text refiner. The diffusers
+// release splits q/k/v; ComfyUI's single files fuse them into `proj.qkv`.
+pub const moss_image = Arch{
+    .name = "moss_image",
+    .attention_modules = &.{
+        "layers.N",
+        "text_embedder.blocks.N",
+    },
+    // Conditioning-only attention, which ComfyUI's own int8 bake leaves out.
+    .attention_skip = &.{
+        "text_embedder.blocks.N",
+    },
+    // The pair ComfyUI's model_detection keys off.
+    .keys_detect = &.{
+        &.{
+            "shared_block_modulation.weight",
+            "layers.0.proj.ffn_up_gate.weight",
+        },
+    },
+    .shape_fix = true,
+    .threshhold = null,
+    // What ComfyUI's own int8 bake leaves in bf16: everything outside the blocks.
+    .keys_hiprec = &.{
+        "text_embedder.",
+        "time_embedding.",
+        "shared_block_modulation.",
+        "video_embedder.",
+        "video_head_modulation.",
+        "final_linear_video.",
+    },
+};
+
 /// LLM families llama.cpp consumes natively. Datasets cover both name spaces:
 /// GGUF-native (blk.N.*, token_embd) for requantizing llama.cpp files, HF
 /// (model.layers.N.*) for checkpoints. They quantize uniformly - the sensitivity
@@ -1364,6 +1397,7 @@ pub const arch_list = [_]*const Arch{
     &krea2,
     &minimax_h3,
     &sensenova_u15,
+    &moss_image,
     &qwen35moe,
     &qwen35,
     &qwen3vl,

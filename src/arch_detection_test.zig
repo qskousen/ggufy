@@ -198,6 +198,12 @@ test "sensenova u1.5 8B MoT" {
     try expectArch(@embedFile("test_fixtures/sensenova_u15.json"), "sensenova_u15");
 }
 
+// The diffusers release (split q/k/v) and ComfyUI's int8 single file (fused qkv).
+test "moss-image" {
+    try expectArch(@embedFile("test_fixtures/moss_image.json"), "moss_image");
+    try expectArch(@embedFile("test_fixtures/moss_image_int8_convrot.json"), "moss_image");
+}
+
 // Dumped from llama.cpp GGUF files on disk (native tensor names).
 test "llama 24B GGUF-native" {
     try expectArch(@embedFile("test_fixtures/llama.json"), "llama");
@@ -274,6 +280,7 @@ test "attention modules match ComfyUI's for every family" {
         .{ "ernie", &imagearch.ernie },          .{ "krea2", &imagearch.krea2 },
         .{ "mage_flow", &imagearch.mageflow },   .{ "qwen_image21", &imagearch.qwen21 },
         .{ "qwen_image", &imagearch.qwen },      .{ "sensenova_u15", &imagearch.sensenova_u15 },
+        .{ "moss_image", &imagearch.moss_image },
         .{ "minimax_h3", &imagearch.minimax_h3 }, .{ "ltx2", &imagearch.ltx2 },
         .{ "wan", &imagearch.wan },              .{ "lumina2", &imagearch.lumina2 },
         .{ "sd3", &imagearch.sd3 },              .{ "aura", &imagearch.aura },
@@ -288,18 +295,25 @@ test "attention modules match ComfyUI's for every family" {
     }
 }
 
-test "flux3 int8 attention leaves out the blocks ComfyUI's bake leaves out" {
+test "int8 attention leaves out the blocks ComfyUI's bake leaves out" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const names = try std.json.parseFromSliceLeaky([]const []const u8, a, @embedFile("test_fixtures/flux3_klein_int8_convrot.json"), .{});
-    var baked: std.ArrayList([]const u8) = .empty;
-    for (names) |n| if (std.mem.endsWith(u8, n, ".comfy_attention.config")) try baked.append(a, n);
-    const kept = try imagearch.flux3.attentionConfigNames(names, false, a);
-    try std.testing.expectEqual(baked.items.len, kept.len);
-    for (kept) |k| {
-        var hit = false;
-        for (baked.items) |b| hit = hit or std.mem.eql(u8, b, k);
-        try std.testing.expect(hit);
+    const cases = .{
+        .{ "flux3_klein_int8_convrot", &imagearch.flux3 },
+        .{ "moss_image_int8_convrot", &imagearch.moss_image },
+    };
+    inline for (cases) |c| {
+        const names = try std.json.parseFromSliceLeaky([]const []const u8, a, @embedFile("test_fixtures/" ++ c[0] ++ ".json"), .{});
+        var baked: std.ArrayList([]const u8) = .empty;
+        for (names) |n| if (std.mem.endsWith(u8, n, ".comfy_attention.config")) try baked.append(a, n);
+        try std.testing.expect(baked.items.len > 0);
+        const kept = try c[1].attentionConfigNames(names, false, a);
+        try std.testing.expectEqual(baked.items.len, kept.len);
+        for (kept) |k| {
+            var hit = false;
+            for (baked.items) |b| hit = hit or std.mem.eql(u8, b, k);
+            try std.testing.expect(hit);
+        }
     }
 }

@@ -430,6 +430,7 @@ pub fn archFusion(arch_name: []const u8) ?Fusion {
     // Gate rows first, the order ComfyUI's SwiGLU chunks it in.
     if (std.mem.eql(u8, arch_name, "qwen_image21")) return .{ .parts = &.{ ".img_mlp.gate_layer.", ".img_mlp.proj." }, .fused = ".img_mlp.gate_up." };
     if (std.mem.eql(u8, arch_name, "flux3")) return .{ .parts = &.{ ".q_proj.", ".k_proj.", ".v_proj." }, .fused = ".qkv." };
+    if (std.mem.eql(u8, arch_name, "moss_image")) return .{ .parts = &.{ ".proj.q.", ".proj.k.", ".proj.v." }, .fused = ".proj.qkv." };
     return null;
 }
 

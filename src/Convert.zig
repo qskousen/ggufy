@@ -6167,6 +6167,93 @@ test "assignTensorType: flux3 spares what ComfyUI's bake spares and keeps BFL's 
     }
 }
 
+test "a diffusers component folder converts, and the ComfyUI target fuses MOSS-Image's q, k and v into proj.qkv" {
+    testing.log_level = .err;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const dir = try targetTestDir(io, a, "mossfuse");
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const B = "layers.0.proj.";
+    const specs = [_]StSpec{
+        .{ .name = "shared_block_modulation.weight", .dims = &.{ 8, 8 } },
+        .{ .name = B ++ "ffn_up_gate.weight", .dims = &.{ 8, 8 } },
+        .{ .name = B ++ "q.weight", .dims = &.{ 4, 8 } },
+        .{ .name = B ++ "k.weight", .dims = &.{ 4, 8 } },
+        .{ .name = B ++ "v.weight", .dims = &.{ 4, 8 } },
+        .{ .name = B ++ "o.weight", .dims = &.{ 8, 4 } },
+    };
+    const first_part = 2;
+    const src_dir = try a.print("{s}/transformer", .{dir});
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io, src_dir, .default_dir);
+    try writeF32Safetensors(io, a, try a.print("{s}/diffusion_pytorch_model.safetensors", .{src_dir}), &specs, 0, 1);
+
+    var f = try st.init(src_dir, io, gpa, a, false, false);
+    defer f.deinit();
+
+    try convert(&f, try applyTarget(&f, targetTestOpts(io, src_dir, dir, .comfyui, .F32), gpa, a), gpa, a);
+    var out = try st.init(try a.print("{s}/out.safetensors", .{dir}), io, gpa, a, false, false);
+    defer out.deinit();
+    var qkv: ?types.Tensor = null;
+    for (out.tensors.items) |t| {
+        if (std.mem.eql(u8, t.name, B ++ "qkv.weight")) qkv = t;
+        for ([_][]const u8{ B ++ "q.weight", B ++ "k.weight", B ++ "v.weight" }) |split|
+            try testing.expect(!std.mem.eql(u8, t.name, split));
+    }
+    const t = qkv orelse return error.TestExpectedTensor;
+    try testing.expectEqualSlices(usize, &.{ 12, 8 }, t.dims);
+    const buf = try a.alignedAlloc(u8, .of(f32), @intCast(t.size));
+    const file = try out.openFileForTensor(t.name);
+    _ = try file.readPositionalAll(io, buf, t.offset + out.current_data_begin);
+    const v = std.mem.bytesAsSlice(f32, buf);
+    for (0..3) |part| for (0..32) |i| {
+        try testing.expectEqual(@as(f32, @floatFromInt((first_part + part) * 1000 + i)), v[part * 32 + i]);
+    };
+}
+
+test "assignTensorType: moss_image quantizes only the block linears, as ComfyUI's bake does" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Probe = struct { name: []const u8, dims: []const usize, quantized: bool };
+    const probes = [_]Probe{
+        .{ .name = "layers.0.proj.qkv.weight", .dims = &.{ 9216, 3072 }, .quantized = true },
+        .{ .name = "layers.41.proj.q.weight", .dims = &.{ 3072, 3072 }, .quantized = true },
+        .{ .name = "layers.20.proj.o.weight", .dims = &.{ 3072, 3072 }, .quantized = true },
+        .{ .name = "layers.20.proj.ffn_up_gate.weight", .dims = &.{ 16384, 3072 }, .quantized = true },
+        .{ .name = "layers.20.proj.ffn_down.weight", .dims = &.{ 3072, 8192 }, .quantized = true },
+        .{ .name = "text_embedder.proj.weight", .dims = &.{ 3072, 4096 }, .quantized = false },
+        .{ .name = "text_embedder.blocks.1.qkv.weight", .dims = &.{ 9216, 3072 }, .quantized = false },
+        .{ .name = "text_embedder.blocks.0.ffn_down.weight", .dims = &.{ 3072, 8192 }, .quantized = false },
+        .{ .name = "time_embedding.2.weight", .dims = &.{ 3072, 3072 }, .quantized = false },
+        .{ .name = "shared_block_modulation.weight", .dims = &.{ 18432, 3072 }, .quantized = false },
+        .{ .name = "video_head_modulation.weight", .dims = &.{ 6144, 3072 }, .quantized = false },
+        .{ .name = "video_embedder.weight", .dims = &.{ 3072, 128 }, .quantized = false },
+        .{ .name = "final_linear_video.weight", .dims = &.{ 128, 3072 }, .quantized = false },
+    };
+    for ([_]types.DataType{ .q4_k, .INT8_CONVROT }) |target| {
+        var opts = testOpts(target);
+        opts.filetype = target.formatType();
+        for (probes) |p| {
+            var n: u64 = 1;
+            for (p.dims) |d| n *= d;
+            var t = types.Tensor{ .name = p.name, .type = "BF16", .dims = @constCast(p.dims), .size = 0, .offset = 0 };
+            try assignTensorType(&t, n, &imagearch.moss_image, QUANTIZATION_THRESHOLD, opts, false, null, a);
+            const spared = if (target.formatType() == .gguf) "f32" else "BF16";
+            testing.expectEqualStrings(if (p.quantized) @tagName(target) else spared, t.type) catch |e| {
+                std.debug.print("{s} at {s}\n", .{ p.name, @tagName(target) });
+                return e;
+            };
+        }
+    }
+}
+
 test "the ComfyUI target warns about a GGUF of an architecture ComfyUI-GGUF does not list" {
     testing.log_level = .err;
     const gpa = testing.allocator;

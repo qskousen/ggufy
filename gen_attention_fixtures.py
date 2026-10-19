@@ -40,6 +40,7 @@ SOURCES = {
     "qwen_image21": f"{D}/diffusion_models/qwen2.1/qwen_image_2.1_bf16.safetensors",
     "qwen_image": f"{D}/diffusion_models/qwen/hyphoria_qwen_v1_Q6_K.gguf",
     "sensenova_u15": f"{D}/diffusion_models/sensenova/sensenovaU158BMot_sft.safetensors",
+    "moss_image": "hf:Comfy-Org/MOSS-Image:diffusion_models/moss_image_sft_bf16.safetensors",
     "minimax_h3": f"{D}/diffusion_models/h3/10erosMaxInt8Ref2va_v10Beta.safetensors",
     "ltx2": f"{D}/diffusion_models/ltx-2/ltx-2.3-22b-dev-Q4_K_M.gguf",
     "wan": f"{D}/diffusion_models/wan2.2/wan22EnhancedNSFWCameraPrompt_nsfwV2Q8High.gguf",
