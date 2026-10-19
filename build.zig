@@ -96,13 +96,15 @@ pub fn build(b: *std.Build) void {
     gui.root_module.addImport("backend", dvui_dep.module("sdl3"));
     gui.root_module.addImport("build_options", options_mod);
 
-    // Zig does not add the SDK's framework search path when cross-compiling for macOS, and build.zig
-    // cannot see --sysroot, so CI passes the SDK root again as -Dmacos-sdk.
-    if (target.result.os.tag == .macos) {
-        if (b.option([]const u8, "macos-sdk", "macOS SDK root for cross-compiling")) |sysroot| {
-            const fw_path = b.pathJoin(&.{ sysroot, "System/Library/Frameworks" });
-            gui.root_module.addFrameworkPath(.{ .cwd_relative = fw_path });
-        }
+    // Cross-compiling for macOS, Zig adds none of the SDK's search paths and build.zig cannot see
+    // --sysroot, so CI passes the SDK root again as -Dmacos-sdk. SDL3 resolves its frameworks and
+    // libiconv when the library itself is compiled, and its build only takes SDK paths for iOS.
+    if (b.option([]const u8, "macos-sdk", "macOS SDK root for cross-compiling")) |sdk| {
+        const fw: std.Build.LazyPath = .{ .cwd_relative = b.pathJoin(&.{ sdk, "System/Library/Frameworks" }) };
+        const lib: std.Build.LazyPath = .{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/lib" }) };
+        gui.root_module.addFrameworkPath(fw);
+        var seen: std.AutoHashMapUnmanaged(*std.Build.Module, void) = .empty;
+        if (!addSdkPathsToLib(b, gui.root_module, "SDL3", fw, lib, &seen)) @panic("no SDL3 library under the GUI to give the macOS SDK paths to");
     }
 
     const gui_install = b.addInstallArtifact(gui, .{});
@@ -375,4 +377,30 @@ fn get_git_version(allocator: std.mem.Allocator, io: std.Io) ![]const u8 {
         return try allocator.print("{s}(DIRTY)", .{trimmed_version});
     }
     return try allocator.dupe(u8, trimmed_version);
+}
+
+/// Adds the SDK paths to the library named `name` linked anywhere below `m`; false if none is.
+fn addSdkPathsToLib(
+    b: *std.Build,
+    m: *std.Build.Module,
+    name: []const u8,
+    fw: std.Build.LazyPath,
+    lib: std.Build.LazyPath,
+    seen: *std.AutoHashMapUnmanaged(*std.Build.Module, void),
+) bool {
+    if ((seen.fetchPut(b.allocator, m, {}) catch @panic("OOM")) != null) return false;
+    var found = false;
+    for (m.link_objects.items) |obj| switch (obj) {
+        .other_step => |c| {
+            if (std.mem.eql(u8, c.name, name)) {
+                c.root_module.addFrameworkPath(fw);
+                c.root_module.addLibraryPath(lib);
+                found = true;
+            }
+            found = addSdkPathsToLib(b, c.root_module, name, fw, lib, seen) or found;
+        },
+        else => {},
+    };
+    for (m.import_table.values()) |dep| found = addSdkPathsToLib(b, dep, name, fw, lib, seen) or found;
+    return found;
 }
