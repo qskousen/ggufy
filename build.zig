@@ -104,7 +104,10 @@ pub fn build(b: *std.Build) void {
         const lib: std.Build.LazyPath = .{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/lib" }) };
         gui.root_module.addFrameworkPath(fw);
         var seen: std.AutoHashMapUnmanaged(*std.Build.Module, void) = .empty;
-        if (!addSdkPathsToLib(b, gui.root_module, "SDL3", fw, lib, &seen)) @panic("no SDL3 library under the GUI to give the macOS SDK paths to");
+        // SDL3 is a lazy dependency: on a fresh checkout the first configure pass has none, and
+        // the build reruns once it is fetched.
+        if (!addSdkPathsToLib(b, gui.root_module, "SDL3", fw, lib, &seen) and b.graph.needed_lazy_dependencies.count() == 0)
+            @panic("no SDL3 library under the GUI to give the macOS SDK paths to");
     }
 
     const gui_install = b.addInstallArtifact(gui, .{});
