@@ -96,18 +96,22 @@ pub fn build(b: *std.Build) void {
     gui.root_module.addImport("backend", dvui_dep.module("sdl3"));
     gui.root_module.addImport("build_options", options_mod);
 
-    // Cross-compiling for macOS, Zig adds none of the SDK's search paths. The compiler resolves
-    // absolute -L/-F paths under --sysroot, so these are SDK-relative and need --sysroot set to
-    // the SDK. SDL3 resolves its frameworks and libiconv when the library itself is compiled, and
-    // its build only takes SDK paths for iOS.
-    if (b.option(bool, "macos-sdk-paths", "Add the macOS SDK's framework and library paths (needs --sysroot)") orelse false) {
-        const fw: std.Build.LazyPath = .{ .cwd_relative = "/System/Library/Frameworks" };
-        const lib: std.Build.LazyPath = .{ .cwd_relative = "/usr/lib" };
-        gui.root_module.addFrameworkPath(fw);
+    // Cross-compiling for macOS, Zig adds none of the SDK's search paths, so CI passes the SDK
+    // root as -Dmacos-sdk. Do not also pass --sysroot: it re-roots absolute -L/-F paths and doubles
+    // them. The frameworks must be system paths, or clang compiles Apple's headers as user headers
+    // and fails on their deprecations. SDL3 resolves its frameworks and libiconv when the library
+    // itself is compiled, and its build only takes SDK paths for iOS.
+    if (b.option([]const u8, "macos-sdk", "macOS SDK root for cross-compiling")) |sdk| {
+        const paths: SdkPaths = .{
+            .include = .{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/include" }) },
+            .framework = .{ .cwd_relative = b.pathJoin(&.{ sdk, "System/Library/Frameworks" }) },
+            .library = .{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/lib" }) },
+        };
+        paths.addTo(gui.root_module);
         var seen: std.AutoHashMapUnmanaged(*std.Build.Module, void) = .empty;
         // SDL3 is a lazy dependency: on a fresh checkout the first configure pass has none, and
         // the build reruns once it is fetched.
-        if (!addSdkPathsToLib(b, gui.root_module, "SDL3", fw, lib, &seen) and b.graph.needed_lazy_dependencies.count() == 0)
+        if (!addSdkPathsToLib(b, gui.root_module, "SDL3", paths, &seen) and b.graph.needed_lazy_dependencies.count() == 0)
             @panic("no SDL3 library under the GUI to give the macOS SDK paths to");
     }
 
@@ -383,13 +387,24 @@ fn get_git_version(allocator: std.mem.Allocator, io: std.Io) ![]const u8 {
     return try allocator.dupe(u8, trimmed_version);
 }
 
+const SdkPaths = struct {
+    include: std.Build.LazyPath,
+    framework: std.Build.LazyPath,
+    library: std.Build.LazyPath,
+
+    fn addTo(self: SdkPaths, m: *std.Build.Module) void {
+        m.addSystemIncludePath(self.include);
+        m.addSystemFrameworkPath(self.framework);
+        m.addLibraryPath(self.library);
+    }
+};
+
 /// Adds the SDK paths to the library named `name` linked anywhere below `m`; false if none is.
 fn addSdkPathsToLib(
     b: *std.Build,
     m: *std.Build.Module,
     name: []const u8,
-    fw: std.Build.LazyPath,
-    lib: std.Build.LazyPath,
+    paths: SdkPaths,
     seen: *std.AutoHashMapUnmanaged(*std.Build.Module, void),
 ) bool {
     if ((seen.fetchPut(b.allocator, m, {}) catch @panic("OOM")) != null) return false;
@@ -397,14 +412,13 @@ fn addSdkPathsToLib(
     for (m.link_objects.items) |obj| switch (obj) {
         .other_step => |c| {
             if (std.mem.eql(u8, c.name, name)) {
-                c.root_module.addFrameworkPath(fw);
-                c.root_module.addLibraryPath(lib);
+                paths.addTo(c.root_module);
                 found = true;
             }
-            found = addSdkPathsToLib(b, c.root_module, name, fw, lib, seen) or found;
+            found = addSdkPathsToLib(b, c.root_module, name, paths, seen) or found;
         },
         else => {},
     };
-    for (m.import_table.values()) |dep| found = addSdkPathsToLib(b, dep, name, fw, lib, seen) or found;
+    for (m.import_table.values()) |dep| found = addSdkPathsToLib(b, dep, name, paths, seen) or found;
     return found;
 }
