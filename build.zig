@@ -96,12 +96,13 @@ pub fn build(b: *std.Build) void {
     gui.root_module.addImport("backend", dvui_dep.module("sdl3"));
     gui.root_module.addImport("build_options", options_mod);
 
-    // Cross-compiling for macOS, Zig adds none of the SDK's search paths and build.zig cannot see
-    // --sysroot, so CI passes the SDK root again as -Dmacos-sdk. SDL3 resolves its frameworks and
-    // libiconv when the library itself is compiled, and its build only takes SDK paths for iOS.
-    if (b.option([]const u8, "macos-sdk", "macOS SDK root for cross-compiling")) |sdk| {
-        const fw: std.Build.LazyPath = .{ .cwd_relative = b.pathJoin(&.{ sdk, "System/Library/Frameworks" }) };
-        const lib: std.Build.LazyPath = .{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/lib" }) };
+    // Cross-compiling for macOS, Zig adds none of the SDK's search paths. The compiler resolves
+    // absolute -L/-F paths under --sysroot, so these are SDK-relative and need --sysroot set to
+    // the SDK. SDL3 resolves its frameworks and libiconv when the library itself is compiled, and
+    // its build only takes SDK paths for iOS.
+    if (b.option(bool, "macos-sdk-paths", "Add the macOS SDK's framework and library paths (needs --sysroot)") orelse false) {
+        const fw: std.Build.LazyPath = .{ .cwd_relative = "/System/Library/Frameworks" };
+        const lib: std.Build.LazyPath = .{ .cwd_relative = "/usr/lib" };
         gui.root_module.addFrameworkPath(fw);
         var seen: std.AutoHashMapUnmanaged(*std.Build.Module, void) = .empty;
         // SDL3 is a lazy dependency: on a fresh checkout the first configure pass has none, and
