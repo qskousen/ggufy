@@ -491,6 +491,12 @@ pub const PreparedConversion = struct {
     imatrix: ?ImatrixMod.Imatrix = null,
     vision_plan: ?HfLlm.VisionPlan = null,
     hf_vision: ?HfLlm.Vision = null,
+
+    /// The imatrix is the one member on the long-lived allocator, not the arena.
+    pub fn deinit(self: *PreparedConversion) void {
+        if (self.imatrix) |*im| im.deinit();
+        self.imatrix = null;
+    }
 };
 
 /// Run everything from architecture detection through quantization-type assignment,
@@ -927,6 +933,7 @@ pub fn convert(
     };
 
     var prep = try prepareConversion(f, opts, allocator, arena_alloc);
+    defer prep.deinit();
 
     const verdicts = try Target.assess(try outputFacts(f, &prep, opts, arena_alloc), arena_alloc);
     const problem = try Target.problem(opts.target_issue, &verdicts, opts.target, arena_alloc);
@@ -1040,7 +1047,8 @@ pub fn predictOutput(
     allocator: std.mem.Allocator,
     arena_alloc: std.mem.Allocator,
 ) !Prediction {
-    const prep = try prepareConversion(f, opts, allocator, arena_alloc);
+    var prep = try prepareConversion(f, opts, allocator, arena_alloc);
+    defer prep.deinit();
     const verdicts = try Target.assess(try outputFacts(f, &prep, opts, arena_alloc), arena_alloc);
     return .{ .size = try predictedSize(f, &prep, opts, allocator, arena_alloc), .verdicts = verdicts };
 }
@@ -3714,6 +3722,104 @@ fn writeTestSafetensors(io: std.Io, path: []const u8, a: std.mem.Allocator) !voi
     try w.writeAll(header);
     try w.writeAll(data);
     try w.flush();
+}
+
+/// An imatrix GGUF weighting every column of the 512-wide `unet.foo.weight`
+/// that `writeTestSafetensors` writes.
+fn writeTestImatrix(io: std.Io, path: []const u8) !void {
+    const cols = 512;
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    defer file.close(io);
+    var buf: [4096]u8 = undefined;
+    var fw = file.writer(io, &buf);
+    const w = &fw.interface;
+    var n = try gguf.writeHeaderTracked(w, 2, 1);
+    n += try gguf.writeMetadataKVStringTracked(w, "general.type", "imatrix");
+    n += try gguf.writeTensorInfoTracked(w, "unet.foo.weight.counts", &.{ 1, 1 }, .f32, 0);
+    n += try gguf.writeTensorInfoTracked(w, "unet.foo.weight.in_sum2", &.{ 1, cols }, .f32, 32);
+    try w.splatByteAll(0, std.mem.alignForward(u64, n, 32) - n);
+    try w.writeInt(u32, @bitCast(@as(f32, 4)), .little);
+    try w.splatByteAll(0, 28);
+    for (0..cols) |j| try w.writeInt(u32, @bitCast(@as(f32, @floatFromInt(j + 1))), .little);
+    try w.flush();
+}
+
+test "convert and predictOutput free the imatrix they load" {
+    testing.log_level = .err;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const ts_ns: i96 = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    const token: u64 = @as(u64, @bitCast(@as(i64, @truncate(ts_ns)))) ^ @as(u64, @intFromPtr(&arena));
+    const dir = try a.print("/tmp/ggufy_imatrix_free_test_{x}", .{token});
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const src_path = try a.print("{s}/src.safetensors", .{dir});
+    try writeTestSafetensors(io, src_path, a);
+    const im_path = try a.print("{s}/imatrix.gguf", .{dir});
+    try writeTestImatrix(io, im_path);
+
+    const opts = ConvertOptions{
+        .io = io,
+        .path = src_path,
+        .filetype = .gguf,
+        .datatype = .q4_k,
+        .template_path = null,
+        .output_dir = dir,
+        .output_name = "out",
+        .threads = 1,
+        .skip_sensitivity = true,
+        .quantization_aggressiveness = 0,
+        .allow_unknown_arch = true,
+        .imatrix_path = im_path,
+    };
+
+    var f = try st.init(src_path, io, gpa, a, false, false);
+    defer f.deinit();
+    _ = try predictOutput(&f, opts, gpa, a);
+    try convert(&f, opts, gpa, a);
+    // testing.allocator fails the test on any leak.
+}
+
+test "an imatrix is read by its content, not its extension" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const ts_ns: i96 = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    const token: u64 = @as(u64, @bitCast(@as(i64, @truncate(ts_ns)))) ^ @as(u64, @intFromPtr(&arena));
+    const dir = try a.print("/tmp/ggufy_imatrix_ext_test_{x}", .{token});
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    // Named so that gguf tools skip it.
+    const odd = try a.print("{s}/imatrix.gguf_file", .{dir});
+    try writeTestImatrix(io, odd);
+    var im = try ImatrixMod.load(odd, io, gpa);
+    defer im.deinit();
+    try testing.expectEqual(@as(usize, 512), im.forTensor("unet.foo.weight").?.len);
+
+    // A .gguf name does not make a file one.
+    const fake = try a.print("{s}/imatrix.gguf", .{dir});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = fake, .data = "not a gguf at all" });
+    try testing.expectError(error.ImatrixNotGguf, ImatrixMod.load(fake, io, gpa));
+
+    // A missing path is an error and stays missing.
+    const missing = try a.print("{s}/typo.gguf", .{dir});
+    try testing.expectError(error.FileNotFound, ImatrixMod.load(missing, io, gpa));
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, missing, .{}));
 }
 
 test "predictOutputSize matches the actual written file size" {

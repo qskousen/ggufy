@@ -640,14 +640,11 @@ fn showInputFile() void {
 
         // Advanced section (accordion, collapsed by default)
         {
-            var adv_tree = dvui.TreeWidget.tree(@src(), .{ .enable_reordering = false }, .{ .expand = .horizontal });
-            defer adv_tree.deinit();
-            const adv_branch = adv_tree.branch(@src(), .{ .expanded = false }, .{ .expand = .horizontal });
-            defer adv_branch.deinit();
-            const adv_caret: []const u8 = if (adv_branch.expanded) "v " else "> ";
-            const adv_header = fa.print("{s}Advanced", .{adv_caret}) catch "> Advanced";
-            dvui.labelNoFmt(@src(), adv_header, .{}, .{ .expand = .horizontal, .margin = .{ .x = 0, .y = 8, .w = 0, .h = 2 } });
-            if (adv_branch.expander(@src(), .{ .indent = 10 }, .{ .expand = .horizontal })) {
+            // Not a TreeWidget: its focus group would swallow the Attention
+            // dropdown's, and dvui logs that every frame at debug level.
+            if (dvui.expander(@src(), "Advanced", .{}, .{ .expand = .horizontal, .font = .theme(.body), .margin = .{ .x = 0, .y = 8, .w = 0, .h = 2 } })) {
+                var adv_body = dvui.box(@src(), .{}, .{ .expand = .horizontal, .margin = .{ .x = 10 } });
+                defer adv_body.deinit();
                 const is_safetensors_out = state.target_filetype == .safetensors;
                 const has_sensitivities = if (file.arch) |a| a.sensitivities.len > 1 else false;
 
@@ -1305,6 +1302,7 @@ fn convertErrorHint(err: anyerror) ?[]const u8 {
         error.TypeRequiresImatrix => "Some tensors are assigned iq1_s/iq2_xs/iq2_xxs, which cannot be encoded without an importance matrix. Choose an imatrix file, or pick types that do not need one.",
         error.NotAnImatrix => "That file is not a llama.cpp imatrix (its general.type is not \"imatrix\").",
         error.ImatrixEmpty => "The imatrix file holds no usable entries.",
+        error.ImatrixNotGguf => "That imatrix file is not a GGUF. Older llama.cpp builds wrote imatrix.dat in another format; a current llama-imatrix can convert one to GGUF.",
         error.UnmappedTensors => "Some tensors have no name in the target vocabulary. Enable \"allow unknown arch\" to drop them, or convert this file as its own architecture.",
         else => null,
     };

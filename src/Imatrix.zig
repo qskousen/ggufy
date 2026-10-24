@@ -73,7 +73,7 @@ pub const Imatrix = struct {
     }
 };
 
-/// Read an imatrix GGUF. Errors when the file is not one rather than returning
+/// Read an imatrix GGUF, whatever the file is named. Errors when the file is not one rather than returning
 /// an empty set: a silently unweighted conversion is indistinguishable from a
 /// weighted one in the output, so a wrong path must not look like success.
 pub fn load(
@@ -88,7 +88,12 @@ pub fn load(
     var scratch = std.heap.ArenaAllocator.init(gpa);
     defer scratch.deinit();
 
-    var f = try Gguf.init(path, io, gpa, scratch.allocator(), false);
+    // Gguf.init creates a missing file, which would leave a typo behind as an empty one.
+    try std.Io.Dir.cwd().access(io, path, .{});
+    var f = Gguf.init(path, io, gpa, scratch.allocator(), false) catch |e| return switch (e) {
+        error.InvalidGgufMagic => error.ImatrixNotGguf,
+        else => e,
+    };
     defer f.deinit();
 
     if (f.metadata.get("general.type")) |v| switch (v) {
