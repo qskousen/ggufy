@@ -227,8 +227,8 @@ pub fn assess(out: Output, alloc: std.mem.Allocator) ![4]Verdict {
 }
 
 fn assessComfy(out: Output, alloc: std.mem.Allocator) !Verdict {
-    if (out.kind == .diffusion and comfyNeedsFusion(out.arch_name, out.fused))
-        return .{ .consumer = .comfyui, .level = .no, .note = try alloc.print("ComfyUI reads {s} only with its attention fused (--target comfyui)", .{out.arch_name}) };
+    if (out.kind == .diffusion and needsComfyLayout(out.arch_name, out.fused))
+        return .{ .consumer = .comfyui, .level = .no, .note = try alloc.print("ComfyUI reads {s} only in its own layout, with split projections fused (--target comfyui)", .{out.arch_name}) };
     if (out.filetype == .gguf) return assessComfyGguf(out, alloc);
     var need: []const u8 = "";
     var it = out.dtypes.iterator();
@@ -292,6 +292,8 @@ fn assessSdCpp(out: Output, alloc: std.mem.Allocator) !Verdict {
         return .{ .consumer = .sdcpp, .level = .no, .note = try alloc.print("{s}: {s}", .{ @tagName(t), why }) };
     };
     if (out.reshaped > 0) return .{ .consumer = .sdcpp, .level = .no, .note = try alloc.print("{d} tensors are stored reshaped for ComfyUI-GGUF, and sd.cpp reads the stored shape (--target sdcpp)", .{out.reshaped}) };
+    if (needsComfyLayout(out.arch_name, out.fused) and sdcppTakesComfyLayout(out.arch_name))
+        return .{ .consumer = .sdcpp, .level = .no, .note = try alloc.print("sd.cpp reads {s} only in ComfyUI's layout (--target sdcpp)", .{out.arch_name}) };
     if (out.fused) |fu| if (!sdcppReadsFused(out.arch_name, fu))
         return .{ .consumer = .sdcpp, .level = .no, .note = try alloc.print("sd.cpp reads {s} only as split projections, not fused into {s} (--target sdcpp)", .{ out.arch_name, std.mem.trim(u8, fu.fused, ".") }) };
     if (!sdcppLoads(out.arch_name)) return .{ .consumer = .sdcpp, .level = .partial, .warn = true, .note = try alloc.print("sd.cpp does not detect {s}", .{out.arch_name}) };
@@ -301,6 +303,7 @@ fn assessSdCpp(out: Output, alloc: std.mem.Allocator) !Verdict {
 /// Qwen-Image 2.1's model (qwen_image_2_1.hpp) takes its MLP fused or split;
 /// FLUX.3's (flux3.hpp) has only split q/k/v.
 fn sdcppReadsFused(arch_name: []const u8, fu: Fusion) bool {
+    if (sdcppTakesComfyLayout(arch_name)) return true;
     return std.mem.eql(u8, arch_name, "qwen_image21") and std.mem.eql(u8, fu.fused, ".img_mlp.gate_up.");
 }
 
@@ -414,7 +417,14 @@ pub fn hfNames(target: Target, kind: Kind, arch_name: []const u8, ft: types.File
 }
 
 /// Split projections stored as one tensor, `parts` stacked along rows in order.
-pub const Fusion = struct { parts: []const []const u8, fused: []const u8 };
+pub const Fusion = struct {
+    parts: []const []const u8,
+    fused: []const u8,
+    /// Each part's second half of rows goes before its first.
+    swap_halves: bool = false,
+    /// Every part after the first is stored minus the first.
+    delta: bool = false,
+};
 
 /// Whether a shape_fix arch's GGUF may store a tensor as (n/256, 256) so a block quant
 /// fits it. Only ComfyUI-GGUF restores the real shape; ggml consumers read the stored one.
@@ -422,14 +432,78 @@ pub fn reshapesRows(target: Target) bool {
     return target != .sdcpp;
 }
 
-/// A substring of a tensor name that ComfyUI spells differently.
-pub const Rename = struct { from: []const u8, to: []const u8 };
+/// A substring of a tensor name that ComfyUI spells differently. An `anchored` one
+/// matches only at the start of the name, past any model prefix.
+pub const Rename = struct { from: []const u8, to: []const u8, anchored: bool = false };
+
+/// A tensor `target` needs that a source may lack, with its exact bytes.
+pub const Addition = struct { name: []const u8, dtype: []const u8, dims: []const usize, data: []const u8 };
+
+/// Whether sd.cpp reads `arch_name` in ComfyUI's layout, so it takes the same repack.
+fn sdcppTakesComfyLayout(arch_name: []const u8) bool {
+    return std.mem.eql(u8, arch_name, "minimax_h3");
+}
+
+fn takesComfyLayout(target: Target, arch_name: []const u8) bool {
+    return target == .comfyui or (target == .sdcpp and sdcppTakesComfyLayout(arch_name));
+}
+
+fn isMinimaxH3(arch_name: []const u8) bool {
+    return std.mem.eql(u8, arch_name, "minimax_h3") or std.mem.eql(u8, arch_name, "minimax_h3_image");
+}
+
+// diffusers' MiniMax H3 against ComfyUI's, checked tensor by tensor against Comfy-Org's
+// repacks of the same release. The anchored ones would otherwise also hit
+// time_embedder.proj_in/proj_out in a file already in ComfyUI's layout.
+const minimax_h3_renames = [_]Rename{
+    .{ .from = "pdd_proj_out.", .to = "final_layer.pdd_out.", .anchored = true },
+    .{ .from = "audio_proj_out.", .to = "final_layer.audio_out.", .anchored = true },
+    .{ .from = "audio_proj_in.", .to = "audio_patch_proj.", .anchored = true },
+    .{ .from = "proj_in.", .to = "video_patch_proj.", .anchored = true },
+    .{ .from = "proj_out.", .to = "final_layer.video_out.", .anchored = true },
+    .{ .from = "time_embedder.linear_1.", .to = "time_embedder.proj_in.", .anchored = true },
+    .{ .from = "time_embedder.linear_2.", .to = "time_embedder.proj_out.", .anchored = true },
+    .{ .from = "context_embedder.", .to = "condition_proj.", .anchored = true },
+    .{ .from = "norm_out.linear.", .to = "final_layer.adaln_proj.linear.", .anchored = true },
+    .{ .from = "norm_out.norm.", .to = "final_layer.norm.", .anchored = true },
+    .{ .from = "token_refiner.refiner_blocks.", .to = "token_refiner.blocks.", .anchored = true },
+    .{ .from = "transformer_blocks.", .to = "blocks.", .anchored = true },
+    .{ .from = ".attn.norm_q.", .to = ".attn.q_norm." },
+    .{ .from = ".attn.norm_k.", .to = ".attn.k_norm." },
+    .{ .from = ".attn.to_out.0.", .to = ".attn.out_proj." },
+    .{ .from = ".ff.net.2.", .to = ".mlp.fc2." },
+};
+
+const minimax_h3_fusions = [_]Fusion{
+    .{ .parts = &.{ ".attn.to_q.", ".attn.to_k.", ".attn.to_v." }, .fused = ".attn.qkv_proj." },
+    .{ .parts = &.{".ff.net.0.proj."}, .fused = ".mlp.fc1.", .swap_halves = true },
+    // ComfyUI's PDD head bank: head 0 whole, each later head as its offset from head 0.
+    .{
+        .parts = &.{ "final_layer.pdd_out.0.", "final_layer.pdd_out.1.", "final_layer.pdd_out.2.", "final_layer.pdd_out.3.", "final_layer.pdd_out.4.", "final_layer.pdd_out.5." },
+        .fused = "final_layer.video_out.",
+        .delta = true,
+    },
+};
+
+// The rope buffer ComfyUI loads from the file, as Comfy-Org's H3 files carry it:
+// 10000^(-i/16) rounded the way their converter rounded it.
+const minimax_h3_inv_freq = [16]u32{ 0x3f800000, 0x3f0ff59a, 0x3ea1e89b, 0x3e361887, 0x3dcccccd, 0x3d6655c2, 0x3d0186e3, 0x3c91ad39, 0x3c23d70a, 0x3bb8449c, 0x3b4f3e38, 0x3ae91528, 0x3a83126f, 0x3a136a16, 0x39a5cb60, 0x393a7753 };
+
+const minimax_h3_additions = [_]Addition{
+    .{ .name = "rope.inv_freq", .dtype = "F32", .dims = &.{16}, .data = std.mem.asBytes(&minimax_h3_inv_freq) },
+};
+
+/// Tensors `target` needs for this architecture that its source may lack.
+pub fn additions(target: Target, arch_name: []const u8) []const Addition {
+    if (!takesComfyLayout(target, arch_name) or !isMinimaxH3(arch_name)) return &.{};
+    return &minimax_h3_additions;
+}
 
 /// The split projections `target` takes fused for this architecture. ComfyUI maps LoRAs
 /// under either naming onto the fused layout but only the split names onto a split one,
 /// and runs a fused projection as one GEMM (with one activation quantization on int8).
 pub fn fusions(target: Target, arch_name: []const u8) []const Fusion {
-    return if (target == .comfyui) archFusions(arch_name) else &.{};
+    return if (takesComfyLayout(target, arch_name)) archFusions(arch_name) else &.{};
 }
 
 /// The fused layout ComfyUI takes for `arch_name`, whichever target is asked for.
@@ -446,13 +520,16 @@ pub fn archFusions(arch_name: []const u8) []const Fusion {
         .{ .parts = &.{ ".attention.to_q.", ".attention.to_k.", ".attention.to_v." }, .fused = ".attention.qkv." },
         .{ .parts = &.{ "_attention.to_k.", "_attention.to_v." }, .fused = "_attention.to_kv." },
     };
+    if (std.mem.eql(u8, arch_name, "minimax_h3")) return minimax_h3_fusions[0..2];
+    if (std.mem.eql(u8, arch_name, "minimax_h3_image")) return &minimax_h3_fusions;
     return &.{};
 }
 
 /// The names `target` takes for this architecture that its source spells differently.
-/// Applied to the source's names, before `fusions`.
+/// Applied to the source's names, before `fusions`: every rule that matches, once, in order.
 pub fn renames(target: Target, arch_name: []const u8) []const Rename {
-    if (target != .comfyui) return &.{};
+    if (!takesComfyLayout(target, arch_name)) return &.{};
+    if (isMinimaxH3(arch_name)) return &minimax_h3_renames;
     if (std.mem.eql(u8, arch_name, "fibo2")) return &.{
         .{ .from = ".attention.to_out.0.", .to = ".attention.out." },
         .{ .from = "_attention.to_out.0.", .to = "_attention.to_out." },
@@ -462,10 +539,10 @@ pub fn renames(target: Target, arch_name: []const u8) []const Rename {
     return &.{};
 }
 
-/// Whether ComfyUI cannot read `arch_name` in the layout `fused` says the file has.
-/// Fibo 2.0 under diffusers' names: ComfyUI keys its detection off attention.qkv.
-fn comfyNeedsFusion(arch_name: []const u8, fused: ?Fusion) bool {
-    return fused == null and std.mem.eql(u8, arch_name, "fibo2");
+/// Whether `arch_name` loads only in ComfyUI's layout, which `fused` null says the file
+/// lacks: Fibo 2.0 and MiniMax H3 under diffusers' names.
+fn needsComfyLayout(arch_name: []const u8, fused: ?Fusion) bool {
+    return fused == null and (std.mem.eql(u8, arch_name, "fibo2") or isMinimaxH3(arch_name));
 }
 
 /// What a target asks of a conversion of `arch_name`. `datatype` null means the
@@ -879,4 +956,28 @@ test "ComfyUI reads Fibo 2.0 only fused, and Fibo 1.5 only through custom nodes"
     }
     try testing.expectEqual(@as(usize, 0), renames(.custom, "fibo2").len);
     try testing.expectEqual(@as(usize, 0), fusions(.sdcpp, "fibo2").len);
+}
+
+test "MiniMax H3 loads in ComfyUI and sd.cpp only in ComfyUI's layout, which both targets repack into" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const split = try assess(.{ .kind = .diffusion, .filetype = .gguf, .arch_name = "minimax_h3", .dtypes = set(&.{.q4_k}) }, a);
+    try testing.expectEqual(Level.no, verdictFor(&split, .comfyui).level);
+    try testing.expectEqual(Level.no, verdictFor(&split, .sdcpp).level);
+    for (archFusions("minimax_h3")) |fu| {
+        const fused = try assess(.{ .kind = .diffusion, .filetype = .gguf, .arch_name = "minimax_h3", .fused = fu, .dtypes = set(&.{.q4_k}) }, a);
+        try testing.expect(verdictFor(&fused, .comfyui).level != .no);
+        try testing.expectEqual(Level.yes, verdictFor(&fused, .sdcpp).level);
+    }
+    const image = try assess(.{ .kind = .diffusion, .filetype = .gguf, .arch_name = "minimax_h3_image", .dtypes = set(&.{.q4_k}) }, a);
+    try testing.expectEqual(Level.no, verdictFor(&image, .comfyui).level);
+
+    try testing.expect(renames(.sdcpp, "minimax_h3").len > 0 and fusions(.sdcpp, "minimax_h3").len > 0);
+    try testing.expectEqual(@as(usize, 0), renames(.sdcpp, "minimax_h3_image").len);
+    try testing.expectEqual(@as(usize, 0), renames(.custom, "minimax_h3").len);
+    try testing.expectEqual(@as(usize, 0), additions(.custom, "minimax_h3").len);
+    // The PDD bank is the image model's alone.
+    try testing.expectEqual(@as(usize, 2), archFusions("minimax_h3").len);
+    try testing.expect(archFusions("minimax_h3_image")[2].delta);
 }

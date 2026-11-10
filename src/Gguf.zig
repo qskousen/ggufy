@@ -499,6 +499,16 @@ pub fn saveWithSTData(self: Gguf, source: anytype, threads: usize, callbacks: cb
         var elements: usize = 1;
         for (t.dims) |d| elements *= d;
 
+        // A tensor the conversion added, which no source holds. Only F32 ones reach a GGUF.
+        if (t.inline_data) |data| {
+            if (data.len != elements * 4) return error.InlineTensorNotF32;
+            try self.writeTensorData(t, .F32, data, &writer.interface, &pool);
+            try self.maybeWritePadding(try Gguf.calculateTensorSize(t), &writer.interface);
+            callbacks.reportProgress(count, total_tensors, t.name, "F32", t.type, @intCast(elements));
+            count += 1;
+            continue;
+        }
+
         // Cluster dequantization path: checked first to avoid matching the raw U8 weight
         var matched = false;
         if (try TensorClusters.tryDequantCluster(t, source, groups, self.allocator, &pool)) |f32_buf| {
@@ -522,13 +532,11 @@ pub fn saveWithSTData(self: Gguf, source: anytype, threads: usize, callbacks: cb
         }
 
         if (!matched) {
-            // Normal single-tensor path
-            for (source.tensors.items) |source_tensor| {
-                if (std.mem.eql(u8, source_tensor.name, t.name) or
-                    (source_tensor.name.len > t.name.len and
-                        source_tensor.name[source_tensor.name.len - t.name.len - 1] == '.' and
-                        std.mem.endsWith(u8, source_tensor.name, t.name)))
-                {
+            // Normal single-tensor path. The exact name, else the shortest one it is a suffix
+            // of: renamed sources can hold both blocks.0.x and token_refiner.blocks.0.x.
+            const pick = TensorClusters.bestSourceMatch(source.tensors.items, t.name);
+            for (source.tensors.items, 0..) |source_tensor, si| {
+                if (pick == si) {
                     matched = true;
                     std.log.info("Writing tensor data for tensor {}/{} {s} - {s} to {s}, {} elements", .{
                         count,

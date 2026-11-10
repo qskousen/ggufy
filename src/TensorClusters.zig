@@ -1568,10 +1568,22 @@ pub fn gatherExpertStack(
             break :blk part.?;
         };
 
+        var sub: ?[]f32 = null;
+        defer if (sub) |s| allocator.free(s);
+        if (seg.minus) |m| {
+            if (runs != 1) return error.ExpertStackMinusRuns;
+            const one = [_]StackSegment{.{ .tensor = m, .elem_offset = seg.elem_offset, .elem_count = seg.elem_count }};
+            sub = try gatherExpertStack(.{ .name = m.name, .dims = &.{seg.elem_count}, .dtype = m.type, .segments = &one }, source, groups, allocator, pool);
+        }
+
         for (0..runs) |r| {
             const dst = if (seg.out_offset) |o| o + r * seg.out_stride else at;
             if (dst + seg.elem_count > total) return error.ExpertStackOverflow;
-            @memcpy(out[dst..][0..seg.elem_count], src[r * seg.stride ..][0..seg.elem_count]);
+            const d = out[dst..][0..seg.elem_count];
+            @memcpy(d, src[r * seg.stride ..][0..seg.elem_count]);
+            if (sub) |s| for (d, s) |*x, y| {
+                x.* -= y;
+            };
             if (seg.out_offset == null) at += seg.elem_count;
         }
         filled += runs * seg.elem_count;

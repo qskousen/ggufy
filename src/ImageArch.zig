@@ -992,7 +992,9 @@ pub const flux3 = Arch{
 // assigns, used verbatim as `general.architecture`.
 //
 // The paired detect keys are the same ones ComfyUI keys off, and no other
-// architecture carries an audio and a video patch projection side by side.
+// architecture carries an audio and a video patch projection side by side. The
+// diffusers release spells the model differently and is repacked into ComfyUI's
+// layout by Target.renames and Target.fusions; the precision rules below name both.
 //
 // Two checkpoint forms exist and the policy has to cover both. The full form
 // stores each block's AdaLN projection at the time-embedding width (2688), which
@@ -1013,6 +1015,7 @@ pub const minimax_h3 = Arch{
     },
     .keys_detect = &.{
         &.{ "video_patch_proj.weight", "audio_patch_proj.weight" },
+        &.{ "audio_proj_in.weight", "transformer_blocks.0.adaln_proj.linear.weight" },
     },
     .threshhold = null,
     // Matches the set ComfyUI's reference int8_convrot bake leaves unquantized: the
@@ -1035,6 +1038,11 @@ pub const minimax_h3 = Arch{
         "time_embedder", // absent from pruned checkpoints
         "token_refiner",
         "final_layer", // fp32 output heads plus their AdaLN
+        // diffusers' names for the patch projections, output heads, text projection and final AdaLN
+        "proj_in",
+        "proj_out",
+        "context_embedder",
+        "norm_out",
     },
     .keys_hiprec_narrow = &.{
         .{ .key = "adaln_proj.linear.weight", .below_cols = 256 },
@@ -1047,6 +1055,9 @@ pub const minimax_h3 = Arch{
         ".norm2.weight",
         ".final_norm.weight",
         "final_layer.norm.weight",
+        ".attn.norm_q.weight",
+        ".attn.norm_k.weight",
+        "norm_out.norm.weight",
     },
     // NVFP4 nibble-packing halves the contiguous dimension. condition_proj.weight
     // shape[1] is text_dim and time_embedder.proj_in.weight shape[1] is
@@ -1055,7 +1066,24 @@ pub const minimax_h3 = Arch{
     .keys_nvfp4_passthrough = &.{
         "condition_proj.weight",
         "time_embedder.proj_in.weight",
+        "context_embedder.weight",
+        "time_embedder.linear_1.weight",
     },
+};
+
+// MiniMax H3 Image: H3 without the audio stream, and the name ComfyUI gives a file
+// that lacks audio_patch_proj. Its checkpoints stack six PDD output heads in
+// final_layer.video_out and say so only in the safetensors `config` metadata, which
+// ComfyUI needs to size the model.
+pub const minimax_h3_image = blk: {
+    var a = minimax_h3;
+    a.name = "minimax_h3_image";
+    a.keys_detect = &.{
+        &.{ "video_patch_proj.weight", "condition_proj.weight" },
+        &.{ "proj_in.weight", "context_embedder.weight", "transformer_blocks.0.adaln_proj.linear.weight" },
+    };
+    a.keys_banned = &.{ "audio_patch_proj.weight", "audio_proj_in.weight" };
+    break :blk a;
 };
 
 // SenseNova U1.5: a Mixture-of-Transformers unified model. One Qwen2-shaped
@@ -1459,6 +1487,7 @@ pub const arch_list = [_]*const Arch{
     &ernie,
     &krea2,
     &minimax_h3,
+    &minimax_h3_image,
     &sensenova_u15,
     &moss_image,
     &fibo2,
@@ -1946,6 +1975,21 @@ test "detect minimax_h3 architecture with prefix" {
         "model.diffusion_model.audio_patch_proj.weight",
     };
     try std.testing.expectEqualStrings("minimax_h3", detectArch(&names).?.name);
+}
+
+test "minimax_h3_image is H3 without audio, under the same precision rules" {
+    const image = [_][]const u8{
+        "model.diffusion_model.video_patch_proj.weight",
+        "model.diffusion_model.condition_proj.weight",
+    };
+    try std.testing.expectEqualStrings("minimax_h3_image", detectArch(&image).?.name);
+    const av = [_][]const u8{ "video_patch_proj.weight", "audio_patch_proj.weight", "condition_proj.weight" };
+    try std.testing.expectEqualStrings("minimax_h3", detectArch(&av).?.name);
+
+    try std.testing.expect(minimax_h3_image.isHighPrecision("final_layer.video_out.weight"));
+    try std.testing.expect(!minimax_h3_image.isHighPrecision("blocks.7.mlp.fc2.weight"));
+    try std.testing.expect(minimax_h3_image.isNarrowHighPrecision("blocks.0.adaln_proj.linear.weight", &.{ 96768, 8 }));
+    try std.testing.expect(!minimax_h3_image.shape_fix);
 }
 
 test "minimax_h3 keeps the conditioning and IO path high-precision" {

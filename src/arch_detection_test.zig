@@ -129,6 +129,19 @@ test "minimax h3 (pruned int8_convrot)" {
     try expectArch(@embedFile("test_fixtures/minimax_h3.json"), "minimax_h3");
 }
 
+// Comfy-Org's pruned int8_convrot bake, and the release's transformer/ (MiniMax's own
+// layout under ComfyUI's names) and transformer_diffusers/. None has an audio stream.
+test "minimax h3 image, in all three layouts" {
+    try expectArch(@embedFile("test_fixtures/minimax_h3_image_int8_convrot.json"), "minimax_h3_image");
+    try expectArch(@embedFile("test_fixtures/minimax_h3_image.json"), "minimax_h3_image");
+    try expectArch(@embedFile("test_fixtures/minimax_h3_image_diffusers.json"), "minimax_h3_image");
+}
+
+test "minimax h3, as Comfy-Org repacks it and under diffusers' names" {
+    try expectArch(@embedFile("test_fixtures/minimax_h3_fl2va.json"), "minimax_h3");
+    try expectArch(@embedFile("test_fixtures/minimax_h3_diffusers.json"), "minimax_h3");
+}
+
 // Mage-Flow's tensor names are byte-for-byte the same set as Qwen-Image's, so
 // this fixture (dumped from mageFlow_mageFlow4B.safetensors) only resolves
 // correctly because detection also checks txt_norm/proj_out dimensions.
@@ -291,6 +304,7 @@ test "attention modules match ComfyUI's for every family" {
         .{ "qwen_image", &imagearch.qwen },      .{ "sensenova_u15", &imagearch.sensenova_u15 },
         .{ "moss_image", &imagearch.moss_image }, .{ "fibo2", &imagearch.fibo2 },
         .{ "minimax_h3", &imagearch.minimax_h3 }, .{ "ltx2", &imagearch.ltx2 },
+        .{ "minimax_h3_image", &imagearch.minimax_h3_image },
         .{ "wan", &imagearch.wan },              .{ "lumina2", &imagearch.lumina2 },
         .{ "sd3", &imagearch.sd3 },              .{ "aura", &imagearch.aura },
         .{ "hidream", &imagearch.hidream },      .{ "hyvid", &imagearch.hyvid },
@@ -311,6 +325,7 @@ test "int8 attention leaves out the blocks ComfyUI's bake leaves out" {
     const cases = .{
         .{ "flux3_klein_int8_convrot", &imagearch.flux3 },
         .{ "moss_image_int8_convrot", &imagearch.moss_image },
+        .{ "minimax_h3_image_int8_convrot", &imagearch.minimax_h3_image },
     };
     inline for (cases) |c| {
         const names = try std.json.parseFromSliceLeaky([]const []const u8, a, @embedFile("test_fixtures/" ++ c[0] ++ ".json"), .{});

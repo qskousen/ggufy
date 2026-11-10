@@ -43,6 +43,7 @@ SOURCES = {
     "moss_image": "hf:Comfy-Org/MOSS-Image:diffusion_models/moss_image_sft_bf16.safetensors",
     "fibo2": "hf:Comfy-Org/Fibo-2.0:diffusion_models/fibo2_dev_bf16.safetensors",
     "minimax_h3": f"{D}/diffusion_models/h3/10erosMaxInt8Ref2va_v10Beta.safetensors",
+    "minimax_h3_image": "hf:Comfy-Org/MiniMax-H3-Image:diffusion_models/minimax_h3_image_pruned_bf16.safetensors",
     "ltx2": f"{D}/diffusion_models/ltx-2/ltx-2.3-22b-dev-Q4_K_M.gguf",
     "wan": f"{D}/diffusion_models/wan2.2/wan22EnhancedNSFWCameraPrompt_nsfwV2Q8High.gguf",
     "lumina2": f"{T}/z_image_bf16.safetensors",

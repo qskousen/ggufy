@@ -845,9 +845,13 @@ pub fn prepareConversion(
     var groups = try TensorClusters.groupClusters(f, arena_alloc, allocator);
     groups.expert_stacks = expert_stacks;
     try TensorClusters.collapseModelTensors(&model_tensors, &groups, .dequant, arena_alloc);
+    var pdd_steps: usize = 0;
     for (Target.fusions(opts.target, arch.name)) |fu| {
+        const before = groups.expert_stacks.len;
         groups.expert_stacks = try fuseSplit(f.tensors.items, &model_tensors, groups.expert_stacks, fu, arena_alloc);
+        if (fu.delta and groups.expert_stacks.len > before) pdd_steps = fu.parts.len;
     }
+    try addMissing(&model_tensors, Target.additions(opts.target, arch.name), arena_alloc);
 
     // --- Assign quantization types (template or auto) -------------------------
     var template_metadata: ?std.json.ObjectMap = null;
@@ -874,6 +878,16 @@ pub fn prepareConversion(
 
     // --- Shape fix ------------------------------------------------------------
     var extra_metadata: std.json.ObjectMap = .empty;
+    if (pdd_steps > 0) try putPddConfig(&extra_metadata, f.getSourceMetadata(), opts, pdd_steps, arena_alloc);
+    for (Target.fusions(opts.target, arch.name)) |fu| if (fu.delta and !extra_metadata.contains("config")) {
+        const has = if (f.getSourceMetadata()) |m| m.contains("config") else false;
+        if (!has) {
+            // MiniMax's own transformer/ is the case in point: ComfyUI's names, but q/k/v
+            // interleaved per head and the PDD heads in a file of their own.
+            std.log.warn("{s} without a PDD head bank or the config metadata that sizes one is not a layout {s} loads; convert the release's diffusers transformer instead", .{ arch.name, @tagName(opts.target) });
+            return error.TargetCannotLoad;
+        }
+    };
     if (reshapesRows(arch, opts)) {
         try applyShapeFix(&model_tensors, &extra_metadata, arena_alloc);
     }
@@ -1273,16 +1287,68 @@ fn hfDirCandidates(io: std.Io, path: []const u8) ?[]const u8 {
     return dir;
 }
 
-/// Rewrite the first matching `renames` substring of each name.
+/// Append each of `additions` that no model tensor already is.
+fn addMissing(model_tensors: *std.ArrayList(types.Tensor), additions: []const Target.Addition, arena_alloc: std.mem.Allocator) !void {
+    next: for (additions) |ad| {
+        for (model_tensors.items) |t| if (std.mem.eql(u8, imagearch.stripPrefix(t.name), ad.name)) continue :next;
+        try model_tensors.append(arena_alloc, .{
+            .name = ad.name,
+            .type = ad.dtype,
+            .dims = try arena_alloc.dupe(usize, ad.dims),
+            .size = ad.data.len,
+            .offset = 0,
+            .inline_data = ad.data,
+        });
+        std.log.info("added {s}, which ComfyUI loads from the file", .{ad.name});
+    }
+}
+
+/// ComfyUI sizes a PDD head bank and builds its sampler from the `config` metadata,
+/// which a diffusers release keeps in pdd_config.json at its root.
+fn putPddConfig(
+    extra: *std.json.ObjectMap,
+    source_meta: ?std.json.ObjectMap,
+    opts: ConvertOptions,
+    pdd_steps: usize,
+    arena_alloc: std.mem.Allocator,
+) !void {
+    if (source_meta) |m| if (m.contains("config")) return;
+    const dir = hfDirCandidates(opts.io, opts.path) orelse ".";
+    const parent = std.Io.Dir.path.dirname(dir) orelse ".";
+    const content = for ([_][]const u8{ dir, parent }) |d| {
+        const path = try std.Io.Dir.path.join(arena_alloc, &.{ d, "pdd_config.json" });
+        break readTemplate(opts.io, path, arena_alloc) catch continue;
+    } else {
+        std.log.warn("a {d}-head PDD bank needs its sigmas, from the release's pdd_config.json, beside the transformer or one directory up", .{pdd_steps});
+        return error.MissingPddConfig;
+    };
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena_alloc, content, .{});
+    const sigmas = if (parsed == .object) parsed.object.get("sigmas") else null;
+    if (sigmas == null or sigmas.? != .array or sigmas.?.array.items.len != pdd_steps + 1) {
+        std.log.warn("pdd_config.json needs \"sigmas\", {d} values for {d} heads", .{ pdd_steps + 1, pdd_steps });
+        return error.BadPddConfig;
+    }
+    var aw: std.Io.Writer.Allocating = .init(arena_alloc);
+    try std.json.Stringify.value(.{ .transformer = .{ .pdd_steps = pdd_steps, .pdd_sigmas = sigmas.? } }, .{}, &aw.writer);
+    try extra.put(arena_alloc, "config", .{ .string = aw.written() });
+}
+
+/// Apply each matching rule of `renames` once, in order, to each name.
 fn applyRenames(tensors: []types.Tensor, renames: []const Target.Rename, arena_alloc: std.mem.Allocator) !void {
     if (renames.len == 0) return;
     var n: usize = 0;
-    for (tensors) |*t| for (renames) |r| {
-        const at = std.mem.find(u8, t.name, r.from) orelse continue;
-        t.name = try std.mem.concat(arena_alloc, u8, &.{ t.name[0..at], r.to, t.name[at + r.from.len ..] });
-        n += 1;
-        break;
-    };
+    for (tensors) |*t| {
+        var hit = false;
+        for (renames) |r| {
+            const at = if (r.anchored) at: {
+                const prefix_len = t.name.len - imagearch.stripPrefix(t.name).len;
+                break :at if (std.mem.startsWith(u8, t.name[prefix_len..], r.from)) prefix_len else continue;
+            } else std.mem.find(u8, t.name, r.from) orelse continue;
+            t.name = try std.mem.concat(arena_alloc, u8, &.{ t.name[0..at], r.to, t.name[at + r.from.len ..] });
+            hit = true;
+        }
+        if (hit) n += 1;
+    }
     if (n > 0) std.log.info("renamed {d} tensors to ComfyUI's names", .{n});
 }
 
@@ -1300,6 +1366,7 @@ fn fuseSplit(
     try out.appendSlice(arena_alloc, stacks);
     var absorbed: std.StringHashMapUnmanaged(void) = .empty;
     var kept: std.ArrayList(types.Tensor) = .empty;
+    var n_fused: usize = 0;
 
     next: for (model_tensors.items) |t| {
         const at = std.mem.find(u8, t.name, fu.parts[0]) orelse {
@@ -1310,9 +1377,14 @@ fn fuseSplit(
         const tail = t.name[at + fu.parts[0].len ..];
         const n_parts = fu.parts.len;
         const names = try arena_alloc.alloc([]const u8, n_parts);
-        const segments = try arena_alloc.alloc(types.StackSegment, n_parts);
+        const sources_of = try arena_alloc.alloc(types.Tensor, n_parts);
         var n: usize = 1;
         for (t.dims) |d| n *= d;
+        if (fu.swap_halves and (t.dims.len == 0 or t.dims[0] % 2 != 0)) {
+            std.log.warn("{s} has an odd row count; keeping it unfused", .{t.name});
+            try kept.append(arena_alloc, t);
+            continue;
+        }
         for (fu.parts, 0..) |part, i| {
             names[i] = try std.mem.concat(arena_alloc, u8, &.{ head, part, tail });
             const p = for (model_tensors.items) |u| {
@@ -1328,13 +1400,22 @@ fn fuseSplit(
                 try kept.append(arena_alloc, t);
                 continue :next;
             }
-            segments[i] = .{ .tensor = sources[src.?], .elem_offset = 0, .elem_count = n };
+            sources_of[i] = sources[src.?];
+        }
+
+        var segments: std.ArrayList(types.StackSegment) = .empty;
+        for (sources_of, 0..) |src, i| {
+            const minus: ?types.Tensor = if (fu.delta and i > 0) sources_of[0] else null;
+            if (fu.swap_halves) {
+                try segments.append(arena_alloc, .{ .tensor = src, .elem_offset = n / 2, .elem_count = n / 2, .minus = minus });
+                try segments.append(arena_alloc, .{ .tensor = src, .elem_offset = 0, .elem_count = n / 2, .minus = minus });
+            } else try segments.append(arena_alloc, .{ .tensor = src, .elem_offset = 0, .elem_count = n, .minus = minus });
         }
 
         const dims = try arena_alloc.dupe(usize, t.dims);
         dims[0] *= n_parts;
         const name = try std.mem.concat(arena_alloc, u8, &.{ head, fu.fused, tail });
-        try out.append(arena_alloc, .{ .name = name, .dims = dims, .dtype = t.type, .segments = segments });
+        try out.append(arena_alloc, .{ .name = name, .dims = dims, .dtype = t.type, .segments = segments.items });
 
         var fused = t;
         fused.name = name;
@@ -1342,12 +1423,13 @@ fn fuseSplit(
         fused.size = (try types.DataType.fromString(t.type)).calcSizeInBytes(n_parts * n);
         try kept.append(arena_alloc, fused);
         for (names[1..]) |nm| try absorbed.put(arena_alloc, nm, {});
+        n_fused += 1;
     }
 
-    if (absorbed.count() == 0) return stacks;
+    if (n_fused == 0) return stacks;
     model_tensors.clearRetainingCapacity();
     for (kept.items) |t| if (!absorbed.contains(t.name)) try model_tensors.append(arena_alloc, t);
-    std.log.info("fused {d} sets of split projections into {s}, the layout ComfyUI's LoRA loader and int8 path expect", .{ absorbed.count() / (fu.parts.len - 1), fu.fused });
+    std.log.info("fused {d} sets of split projections into {s}, the layout ComfyUI's LoRA loader and int8 path expect", .{ n_fused, fu.fused });
     return out.items;
 }
 
@@ -6869,7 +6951,7 @@ test "a config.json with no tokenizer anywhere writes a native text encoder" {
 
 /// F32 safetensors whose element i of spec k holds (k * 1000 + i) * scale, so a byte
 /// compare after conversion shows which source element landed where.
-const StSpec = struct { name: []const u8, dims: []const usize };
+const StSpec = struct { name: []const u8, dims: []const usize, data: ?[]const f32 = null };
 
 fn writeF32Safetensors(io: std.Io, a: std.mem.Allocator, path: []const u8, specs: []const StSpec, first_index: usize, scale: f32) !void {
     var header: std.ArrayList(u8) = .empty;
@@ -6879,7 +6961,10 @@ fn writeF32Safetensors(io: std.Io, a: std.mem.Allocator, path: []const u8, specs
         var n: usize = 1;
         for (sp.dims) |d| n *= d;
         const start = data.items.len;
-        for (0..n) |i| {
+        if (sp.data) |d| {
+            std.debug.assert(d.len == n);
+            try data.appendSlice(a, std.mem.sliceAsBytes(d));
+        } else for (0..n) |i| {
             const v: f32 = @as(f32, @floatFromInt((first_index + k) * 1000 + i)) * scale;
             try data.appendSlice(a, std.mem.asBytes(&v));
         }
@@ -8103,4 +8188,171 @@ test "a Qwen3-VL text GGUF with no mmproj beside it is refused for -H" {
     opts.hf_names = true;
     opts.output_dir = try a.print("{s}/hf", .{dir});
     try testing.expectError(error.MmprojMissing, convert(&g, opts, gpa, a));
+}
+
+/// Every name in a fixture list at a tiny shape, with the real PDD head biases where
+/// `pdd_heads` is given, since the head bank is the one repack that does arithmetic.
+fn minimaxH3Specs(a: std.mem.Allocator, names_json: []const u8, pdd_heads: ?[]const f32) ![]StSpec {
+    const names = try std.json.parseFromSliceLeaky([]const []const u8, a, names_json, .{});
+    const specs = try a.alloc(StSpec, names.len);
+    for (names, specs) |name, *sp| {
+        sp.* = .{ .name = name, .dims = if (std.mem.endsWith(u8, name, ".bias")) &.{4} else &.{ 4, 2 } };
+        if (pdd_heads) |heads| if (std.mem.startsWith(u8, name, "pdd_proj_out.") and std.mem.endsWith(u8, name, ".bias")) {
+            const k: usize = name["pdd_proj_out.".len] - '0';
+            sp.dims = &.{96};
+            sp.data = heads[k * 96 ..][0..96];
+        };
+    }
+    return specs;
+}
+
+fn fixtureF32(comptime path: []const u8) []const f32 {
+    const bytes = @embedFile(path);
+    return @as([*]const f32, @ptrCast(@alignCast(&struct {
+        const data: [bytes.len]u8 align(4) = bytes.*;
+    }.data)))[0 .. bytes.len / 4];
+}
+
+fn sortedTensorNames(a: std.mem.Allocator, tensors: []const types.Tensor) ![]const []const u8 {
+    const names = try a.alloc([]const u8, tensors.len);
+    for (tensors, names) |t, *n| n.* = t.name;
+    std.sort.block([]const u8, names, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    return names;
+}
+
+test "MiniMax H3 under diffusers' names repacks into ComfyUI's layout, PDD head bank and all" {
+    testing.log_level = .err;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const ts_ns: i96 = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    const token: u64 = @as(u64, @bitCast(@as(i64, @truncate(ts_ns)))) ^ @as(u64, @intFromPtr(&arena));
+    const dir = try a.print("/tmp/ggufy_h3_test_{x}", .{token});
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io, try a.print("{s}/transformer_diffusers", .{dir}), .default_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    {
+        const file = try std.Io.Dir.cwd().createFile(io, try a.print("{s}/pdd_config.json", .{dir}), .{ .truncate = true });
+        defer file.close(io);
+        try file.writeStreamingAll(io,
+            \\{"num_inference_steps": 6, "sigmas": [1.0, 0.9675236940383911, 0.8875485062599182, 0.75, 0.5327739119529724, 0.23200887441635132, 0.0]}
+        );
+    }
+
+    const readG = struct {
+        fn f(g: anytype, name: []const u8, alloc: std.mem.Allocator) ![]const f32 {
+            for (g.tensors.items) |t| if (std.mem.eql(u8, t.name, name)) {
+                const buf = try alloc.alloc(f32, @intCast(t.size / 4));
+                const file = try g.openFileForTensor(t.name);
+                _ = try file.readPositionalAll(g.io, std.mem.sliceAsBytes(buf), t.offset + g.current_data_begin);
+                return buf;
+            };
+            return error.TestExpectedTensor;
+        }
+    }.f;
+    const expectNames = struct {
+        fn f(alloc: std.mem.Allocator, got: []const types.Tensor, want_json: []const u8) !void {
+            const want = try std.json.parseFromSliceLeaky([]const []const u8, alloc, want_json, .{});
+            const g = try sortedTensorNames(alloc, got);
+            try testing.expectEqual(want.len, g.len);
+            for (want, g) |w, n| try testing.expectEqualStrings(w, n);
+        }
+    }.f;
+
+    var opts = ConvertOptions{
+        .io = io,
+        .path = "",
+        .filetype = .gguf,
+        .datatype = .f32,
+        .template_path = null,
+        .output_dir = dir,
+        .output_name = "h3",
+        .threads = 1,
+        .skip_sensitivity = true,
+        .quantization_aggressiveness = 0,
+        .target = .comfyui,
+    };
+
+    // H3 Image: the release's transformer_diffusers/ comes out with exactly the names
+    // of its transformer/, plus rope.inv_freq, and the head bank Comfy-Org ships.
+    const heads = fixtureF32("test_fixtures/minimax_h3_pdd_heads.f32");
+    const img = try minimaxH3Specs(a, @embedFile("test_fixtures/minimax_h3_image_diffusers.json"), heads);
+    opts.path = try a.print("{s}/transformer_diffusers/model.safetensors", .{dir});
+    try writeF32Safetensors(io, a, opts.path, img, 0, 1);
+    {
+        var f = try st.init(opts.path, io, gpa, a, false, false);
+        defer f.deinit();
+        try convert(&f, opts, gpa, a);
+        var g = try gguf.init(try a.print("{s}/h3.gguf", .{dir}), io, gpa, a, false);
+        defer g.deinit();
+        try expectNames(a, g.tensors.items, @embedFile("test_fixtures/minimax_h3_image.json"));
+        try testing.expectEqualStrings("minimax_h3_image", g.metadata.get("general.architecture").?.string);
+
+        const bank = try readG(&g, "final_layer.video_out.bias", a);
+        const want_bank = fixtureF32("test_fixtures/minimax_h3_pdd_bank.f32");
+        try testing.expectEqualSlices(u32, @ptrCast(want_bank), @ptrCast(bank));
+        const inv = try readG(&g, "rope.inv_freq", a);
+        try testing.expectEqualSlices(u32, @ptrCast(fixtureF32("test_fixtures/minimax_h3_inv_freq.f32")), @ptrCast(inv));
+
+        // Spec values are (index * 1000 + element), so each output element names its source.
+        const indexOf = struct {
+            fn at(specs: []const StSpec, name: []const u8) f32 {
+                for (specs, 0..) |sp, i| if (std.mem.eql(u8, sp.name, name)) return @floatFromInt(i * 1000);
+                unreachable;
+            }
+        }.at;
+        const qkv = try readG(&g, "blocks.3.attn.qkv_proj.weight", a);
+        for ([_][]const u8{ "q", "k", "v" }, 0..) |p, i| for (0..8) |e| {
+            const src = indexOf(img, try a.print("transformer_blocks.3.attn.to_{s}.weight", .{p}));
+            try testing.expectEqual(src + @as(f32, @floatFromInt(e)), qkv[i * 8 + e]);
+        };
+        // A renamed block tensor reads its own source, not token_refiner's, whose
+        // renamed name it is a suffix of.
+        const norm = try readG(&g, "blocks.1.norm1.weight", a);
+        try testing.expectEqual(indexOf(img, "transformer_blocks.1.norm1.weight"), norm[0]);
+        // fc1 is ff.net.0.proj with its halves swapped.
+        const fc1 = try readG(&g, "token_refiner.blocks.1.mlp.fc1.weight", a);
+        const ff = indexOf(img, "token_refiner.refiner_blocks.1.ff.net.0.proj.weight");
+        for (0..8) |e| try testing.expectEqual(ff + @as(f32, @floatFromInt((e + 4) % 8)), fc1[e]);
+
+        const config = g.metadata.get("config").?.string;
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, config, .{});
+        const tr = parsed.object.get("transformer").?.object;
+        try testing.expectEqual(@as(i64, 6), tr.get("pdd_steps").?.integer);
+        try testing.expectEqual(@as(usize, 7), tr.get("pdd_sigmas").?.array.items.len);
+        try testing.expectEqual(@as(f64, 0.9675236940383911), tr.get("pdd_sigmas").?.array.items[1].float);
+    }
+
+    // H3 audio-video: the release's transformer/ comes out with Comfy-Org's names, and a
+    // file already in ComfyUI's layout keeps every name, gaining nothing.
+    const av_cases = [_][]const u8{ @embedFile("test_fixtures/minimax_h3_diffusers.json"), @embedFile("test_fixtures/minimax_h3_fl2va.json") };
+    for (av_cases, 0..) |names, i| {
+        opts.path = try a.print("{s}/av{d}.safetensors", .{ dir, i });
+        try writeF32Safetensors(io, a, opts.path, try minimaxH3Specs(a, names, null), 0, 1);
+        var f = try st.init(opts.path, io, gpa, a, false, false);
+        defer f.deinit();
+        try convert(&f, opts, gpa, a);
+        var g = try gguf.init(try a.print("{s}/h3.gguf", .{dir}), io, gpa, a, false);
+        defer g.deinit();
+        try expectNames(a, g.tensors.items, @embedFile("test_fixtures/minimax_h3_fl2va.json"));
+        try testing.expectEqualStrings("minimax_h3", g.metadata.get("general.architecture").?.string);
+    }
+
+    // MiniMax's own layout for H3 Image has ComfyUI's names but not its q/k/v order or
+    // head bank, and no config to size one: refused rather than written wrong.
+    opts.path = try a.print("{s}/native.safetensors", .{dir});
+    try writeF32Safetensors(io, a, opts.path, try minimaxH3Specs(a, @embedFile("test_fixtures/minimax_h3_image.json"), null), 0, 1);
+    {
+        var f = try st.init(opts.path, io, gpa, a, false, false);
+        defer f.deinit();
+        try testing.expectError(error.TargetCannotLoad, convert(&f, opts, gpa, a));
+    }
 }

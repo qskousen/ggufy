@@ -40,6 +40,7 @@ pub const FileType = enum {
 /// elements in and each `stride` past the last. With `out_offset` null the
 /// spans land back to back after the previous segment's; otherwise span i
 /// lands at out_offset + i * out_stride, which is how two segments interleave.
+/// With `minus` set, the same elements of that tensor are subtracted (one run only).
 pub const StackSegment = struct {
     tensor: Tensor,
     elem_offset: usize,
@@ -48,6 +49,7 @@ pub const StackSegment = struct {
     stride: usize = 0,
     out_offset: ?usize = null,
     out_stride: usize = 0,
+    minus: ?Tensor = null,
 };
 
 /// An output tensor no single source tensor holds: HF's per-expert MoE weights
