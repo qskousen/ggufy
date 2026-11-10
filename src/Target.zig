@@ -227,6 +227,8 @@ pub fn assess(out: Output, alloc: std.mem.Allocator) ![4]Verdict {
 }
 
 fn assessComfy(out: Output, alloc: std.mem.Allocator) !Verdict {
+    if (out.kind == .diffusion and comfyNeedsFusion(out.arch_name, out.fused))
+        return .{ .consumer = .comfyui, .level = .no, .note = try alloc.print("ComfyUI reads {s} only with its attention fused (--target comfyui)", .{out.arch_name}) };
     if (out.filetype == .gguf) return assessComfyGguf(out, alloc);
     var need: []const u8 = "";
     var it = out.dtypes.iterator();
@@ -240,6 +242,8 @@ fn assessComfy(out: Output, alloc: std.mem.Allocator) !Verdict {
         if (out.hf_sidecars) return .{ .consumer = .comfyui, .level = .partial, .note = "as a text encoder; the HF directory's config and tokenizer files are not needed there" };
         return .{ .consumer = .comfyui, .level = .partial, .note = "as a text encoder, for a model that uses this LLM" };
     }
+    if (std.mem.eql(u8, out.arch_name, "fibo"))
+        return .{ .consumer = .comfyui, .level = .partial, .warn = true, .note = "ComfyUI has no model for fibo; it needs custom nodes such as ComfyUI_Fibo-1.5" };
     var note: []const u8 = "";
     if (need.len > 0) note = try alloc.print("{s} or newer", .{need});
     if (out.dtypes.contains(.MXFP8_E4M3)) note = try alloc.print("{s}, with a comfy_kitchen that has MXFP8", .{note});
@@ -418,20 +422,50 @@ pub fn reshapesRows(target: Target) bool {
     return target != .sdcpp;
 }
 
+/// A substring of a tensor name that ComfyUI spells differently.
+pub const Rename = struct { from: []const u8, to: []const u8 };
+
 /// The split projections `target` takes fused for this architecture. ComfyUI maps LoRAs
 /// under either naming onto the fused layout but only the split names onto a split one,
 /// and runs a fused projection as one GEMM (with one activation quantization on int8).
-pub fn fusion(target: Target, arch_name: []const u8) ?Fusion {
-    return if (target == .comfyui) archFusion(arch_name) else null;
+pub fn fusions(target: Target, arch_name: []const u8) []const Fusion {
+    return if (target == .comfyui) archFusions(arch_name) else &.{};
 }
 
 /// The fused layout ComfyUI takes for `arch_name`, whichever target is asked for.
-pub fn archFusion(arch_name: []const u8) ?Fusion {
+/// Parts match after `renames` has run.
+pub fn archFusions(arch_name: []const u8) []const Fusion {
     // Gate rows first, the order ComfyUI's SwiGLU chunks it in.
-    if (std.mem.eql(u8, arch_name, "qwen_image21")) return .{ .parts = &.{ ".img_mlp.gate_layer.", ".img_mlp.proj." }, .fused = ".img_mlp.gate_up." };
-    if (std.mem.eql(u8, arch_name, "flux3")) return .{ .parts = &.{ ".q_proj.", ".k_proj.", ".v_proj." }, .fused = ".qkv." };
-    if (std.mem.eql(u8, arch_name, "moss_image")) return .{ .parts = &.{ ".proj.q.", ".proj.k.", ".proj.v." }, .fused = ".proj.qkv." };
-    return null;
+    if (std.mem.eql(u8, arch_name, "qwen_image21")) return &.{.{ .parts = &.{ ".img_mlp.gate_layer.", ".img_mlp.proj." }, .fused = ".img_mlp.gate_up." }};
+    if (std.mem.eql(u8, arch_name, "flux3")) return &.{.{ .parts = &.{ ".q_proj.", ".k_proj.", ".v_proj." }, .fused = ".qkv." }};
+    if (std.mem.eql(u8, arch_name, "moss_image")) return &.{.{ .parts = &.{ ".proj.q.", ".proj.k.", ".proj.v." }, .fused = ".proj.qkv." }};
+    // ".attention." is the blocks' self-attention; "_attention." is cross_attention and the
+    // perceiver's self_attention, which ComfyUI runs as q plus kv. ComfyUI's model also takes
+    // w13, but its rows are padded to 9728, so w1/w3 stay split, which it reads as well.
+    if (std.mem.eql(u8, arch_name, "fibo2")) return &.{
+        .{ .parts = &.{ ".attention.to_q.", ".attention.to_k.", ".attention.to_v." }, .fused = ".attention.qkv." },
+        .{ .parts = &.{ "_attention.to_k.", "_attention.to_v." }, .fused = "_attention.to_kv." },
+    };
+    return &.{};
+}
+
+/// The names `target` takes for this architecture that its source spells differently.
+/// Applied to the source's names, before `fusions`.
+pub fn renames(target: Target, arch_name: []const u8) []const Rename {
+    if (target != .comfyui) return &.{};
+    if (std.mem.eql(u8, arch_name, "fibo2")) return &.{
+        .{ .from = ".attention.to_out.0.", .to = ".attention.out." },
+        .{ .from = "_attention.to_out.0.", .to = "_attention.to_out." },
+        .{ .from = ".attention.norm_q.", .to = ".attention.q_norm." },
+        .{ .from = ".attention.norm_k.", .to = ".attention.k_norm." },
+    };
+    return &.{};
+}
+
+/// Whether ComfyUI cannot read `arch_name` in the layout `fused` says the file has.
+/// Fibo 2.0 under diffusers' names: ComfyUI keys its detection off attention.qkv.
+fn comfyNeedsFusion(arch_name: []const u8, fused: ?Fusion) bool {
+    return fused == null and std.mem.eql(u8, arch_name, "fibo2");
 }
 
 /// What a target asks of a conversion of `arch_name`. `datatype` null means the
@@ -798,7 +832,7 @@ test "sd.cpp target plans diffusion models, in either container, and never resha
     try testing.expectError(error.TargetCannotLoad, plan(.sdcpp, .llm, "qwen3", .q4_k, null, false, false, a, &why));
     try testing.expect(!reshapesRows(.sdcpp));
     try testing.expect(reshapesRows(.comfyui) and reshapesRows(.custom));
-    try testing.expect(fusion(.sdcpp, "flux3") == null);
+    try testing.expectEqual(@as(usize, 0), fusions(.sdcpp, "flux3").len);
 }
 
 test "sd.cpp verdicts refuse reshaped tensors and fusions it has no slot for" {
@@ -814,9 +848,9 @@ test "sd.cpp verdicts refuse reshaped tensors and fusions it has no slot for" {
     try testing.expectEqual(Level.yes, verdictFor(&reshaped, .comfyui).level);
     try testing.expect(std.mem.find(u8, try problem("", &reshaped, .sdcpp, a), "reshaped") != null);
 
-    const qkv = try assess(.{ .kind = .diffusion, .filetype = .gguf, .arch_name = "flux3", .fused = archFusion("flux3"), .dtypes = set(&.{.q4_k}) }, a);
+    const qkv = try assess(.{ .kind = .diffusion, .filetype = .gguf, .arch_name = "flux3", .fused = archFusions("flux3")[0], .dtypes = set(&.{.q4_k}) }, a);
     try testing.expectEqual(Level.no, verdictFor(&qkv, .sdcpp).level);
-    const gate_up = try assess(.{ .kind = .diffusion, .filetype = .gguf, .arch_name = "qwen_image21", .fused = archFusion("qwen_image21"), .dtypes = set(&.{.q4_k}) }, a);
+    const gate_up = try assess(.{ .kind = .diffusion, .filetype = .gguf, .arch_name = "qwen_image21", .fused = archFusions("qwen_image21")[0], .dtypes = set(&.{.q4_k}) }, a);
     try testing.expectEqual(Level.yes, verdictFor(&gate_up, .sdcpp).level);
 
     const unlisted = try assess(.{ .kind = .diffusion, .filetype = .gguf, .arch_name = "cosmos", .dtypes = set(&.{.q4_k}) }, a);
@@ -827,4 +861,22 @@ test "sd.cpp verdicts refuse reshaped tensors and fusions it has no slot for" {
     try testing.expectEqual(Level.no, verdictFor(&mx, .sdcpp).level);
     const int8 = try assess(.{ .kind = .diffusion, .filetype = .safetensors, .arch_name = "flux", .dtypes = set(&.{ .BF16, .F32, .INT8_CONVROT }) }, a);
     try testing.expectEqual(Level.yes, verdictFor(&int8, .sdcpp).level);
+}
+
+test "ComfyUI reads Fibo 2.0 only fused, and Fibo 1.5 only through custom nodes" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]types.FileType{ .safetensors, .gguf }) |ft| {
+        const dt: types.DataType = if (ft == .gguf) .q4_k else .BF16;
+        const split = try assess(.{ .kind = .diffusion, .filetype = ft, .arch_name = "fibo2", .dtypes = set(&.{dt}) }, a);
+        try testing.expectEqual(Level.no, verdictFor(&split, .comfyui).level);
+        const fused = try assess(.{ .kind = .diffusion, .filetype = ft, .arch_name = "fibo2", .fused = archFusions("fibo2")[0], .dtypes = set(&.{dt}) }, a);
+        try testing.expect(verdictFor(&fused, .comfyui).level != .no);
+        const fibo = try assess(.{ .kind = .diffusion, .filetype = ft, .arch_name = "fibo", .dtypes = set(&.{dt}) }, a);
+        try testing.expectEqual(Level.partial, verdictFor(&fibo, .comfyui).level);
+        try testing.expect(verdictFor(&fibo, .comfyui).warn);
+    }
+    try testing.expectEqual(@as(usize, 0), renames(.custom, "fibo2").len);
+    try testing.expectEqual(@as(usize, 0), fusions(.sdcpp, "fibo2").len);
 }

@@ -205,6 +205,15 @@ test "moss-image" {
 }
 
 // Dumped from llama.cpp GGUF files on disk (native tensor names).
+test "fibo 1.5 (Fibo Edit 1.5 has the same tensors)" {
+    try expectArch(@embedFile("test_fixtures/fibo15.json"), "fibo");
+}
+
+test "fibo 2.0 under diffusers' names and as Comfy-Org repacks it" {
+    try expectArch(@embedFile("test_fixtures/fibo2.json"), "fibo2");
+    try expectArch(@embedFile("test_fixtures/fibo2_int8_convrot.json"), "fibo2");
+}
+
 test "llama 24B GGUF-native" {
     try expectArch(@embedFile("test_fixtures/llama.json"), "llama");
 }
@@ -280,7 +289,7 @@ test "attention modules match ComfyUI's for every family" {
         .{ "ernie", &imagearch.ernie },          .{ "krea2", &imagearch.krea2 },
         .{ "mage_flow", &imagearch.mageflow },   .{ "qwen_image21", &imagearch.qwen21 },
         .{ "qwen_image", &imagearch.qwen },      .{ "sensenova_u15", &imagearch.sensenova_u15 },
-        .{ "moss_image", &imagearch.moss_image },
+        .{ "moss_image", &imagearch.moss_image }, .{ "fibo2", &imagearch.fibo2 },
         .{ "minimax_h3", &imagearch.minimax_h3 }, .{ "ltx2", &imagearch.ltx2 },
         .{ "wan", &imagearch.wan },              .{ "lumina2", &imagearch.lumina2 },
         .{ "sd3", &imagearch.sd3 },              .{ "aura", &imagearch.aura },

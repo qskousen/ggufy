@@ -827,6 +827,10 @@ pub fn prepareConversion(
         }
     }
 
+    // --- ComfyUI's spelling of names its source spells differently -----------
+    // On the source list itself, which is where a writer looks a tensor's bytes up.
+    try applyRenames(f.tensors.items, Target.renames(opts.target, arch.name), arena_alloc);
+
     // --- Filter and normalise tensor list ------------------------------------
     var model_tensors = try filterAndStripTensors(f, arch, opts.filetype, opts.model_only, arena_alloc);
 
@@ -841,7 +845,7 @@ pub fn prepareConversion(
     var groups = try TensorClusters.groupClusters(f, arena_alloc, allocator);
     groups.expert_stacks = expert_stacks;
     try TensorClusters.collapseModelTensors(&model_tensors, &groups, .dequant, arena_alloc);
-    if (Target.fusion(opts.target, arch.name)) |fu| {
+    for (Target.fusions(opts.target, arch.name)) |fu| {
         groups.expert_stacks = try fuseSplit(f.tensors.items, &model_tensors, groups.expert_stacks, fu, arena_alloc);
     }
 
@@ -998,10 +1002,9 @@ fn outputFacts(f: anytype, prep: *const PreparedConversion, opts: ConvertOptions
     while (keys.next()) |kv| {
         if (std.mem.startsWith(u8, kv.key_ptr.*, "comfy.gguf.orig_shape.")) out.reshaped += 1;
     }
-    const fusion = Target.archFusion(prep.arch.name);
     var native = false;
     for (prep.model_tensors.items) |t| {
-        if (fusion) |fu| if (std.mem.find(u8, t.name, fu.fused) != null) {
+        for (Target.archFusions(prep.arch.name)) |fu| if (std.mem.find(u8, t.name, fu.fused) != null) {
             out.fused = fu;
         };
         // A passthrough tensor can still carry its source's spelling of the type.
@@ -1268,6 +1271,19 @@ fn hfDirCandidates(io: std.Io, path: []const u8) ?[]const u8 {
         if (stat.kind != .directory) return null;
     }
     return dir;
+}
+
+/// Rewrite the first matching `renames` substring of each name.
+fn applyRenames(tensors: []types.Tensor, renames: []const Target.Rename, arena_alloc: std.mem.Allocator) !void {
+    if (renames.len == 0) return;
+    var n: usize = 0;
+    for (tensors) |*t| for (renames) |r| {
+        const at = std.mem.find(u8, t.name, r.from) orelse continue;
+        t.name = try std.mem.concat(arena_alloc, u8, &.{ t.name[0..at], r.to, t.name[at + r.from.len ..] });
+        n += 1;
+        break;
+    };
+    if (n > 0) std.log.info("renamed {d} tensors to ComfyUI's names", .{n});
 }
 
 /// Replace each set of split projections `fu.parts` with one `fu.fused` tensor.
@@ -6321,6 +6337,125 @@ test "a diffusers component folder converts, and the ComfyUI target fuses MOSS-I
     for (0..3) |part| for (0..32) |i| {
         try testing.expectEqual(@as(f32, @floatFromInt((first_part + part) * 1000 + i)), v[part * 32 + i]);
     };
+}
+
+test "the ComfyUI target repacks Fibo 2.0 from diffusers' names into ComfyUI's, and custom keeps them" {
+    testing.log_level = .err;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const dir = try targetTestDir(io, a, "fibo2repack");
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const L = "layers.0.";
+    const P = "perceiver.layers.0.self_attention.";
+    const specs = [_]StSpec{
+        .{ .name = "perceiver.latent_queries", .dims = &.{ 4, 8 } },
+        .{ .name = "final_layer.linear.weight", .dims = &.{ 8, 8 } },
+        .{ .name = L ++ "attention.to_q.weight", .dims = &.{ 4, 8 } }, // 2
+        .{ .name = L ++ "attention.to_k.weight", .dims = &.{ 4, 8 } },
+        .{ .name = L ++ "attention.to_v.weight", .dims = &.{ 4, 8 } },
+        .{ .name = L ++ "attention.to_out.0.weight", .dims = &.{ 8, 4 } },
+        .{ .name = L ++ "attention.norm_q.weight", .dims = &.{2} },
+        .{ .name = L ++ "attention.norm_k.weight", .dims = &.{2} },
+        .{ .name = L ++ "cross_attention.to_q.weight", .dims = &.{ 4, 8 } },
+        .{ .name = L ++ "cross_attention.to_k.weight", .dims = &.{ 4, 16 } }, // 9
+        .{ .name = L ++ "cross_attention.to_v.weight", .dims = &.{ 4, 16 } },
+        .{ .name = L ++ "cross_attention.to_out.0.weight", .dims = &.{ 8, 4 } },
+        .{ .name = L ++ "cross_attention.norm_q.weight", .dims = &.{2} },
+        .{ .name = P ++ "to_q.weight", .dims = &.{ 4, 8 } },
+        .{ .name = P ++ "to_k.weight", .dims = &.{ 4, 8 } }, // 14
+        .{ .name = P ++ "to_v.weight", .dims = &.{ 4, 8 } },
+        .{ .name = P ++ "to_out.0.weight", .dims = &.{ 8, 4 } },
+        .{ .name = L ++ "feed_forward.w1.weight", .dims = &.{ 8, 8 } },
+        .{ .name = L ++ "feed_forward.w3.weight", .dims = &.{ 8, 8 } },
+    };
+    const src_path = try a.print("{s}/m.safetensors", .{dir});
+    try writeF32Safetensors(io, a, src_path, &specs, 0, 1);
+
+    const sortedNames = struct {
+        fn f(tensors: []const types.Tensor, alloc: std.mem.Allocator) ![]const []const u8 {
+            const names = try alloc.alloc([]const u8, tensors.len);
+            for (tensors, names) |t, *n| n.* = t.name;
+            std.sort.block([]const u8, names, {}, struct {
+                fn lt(_: void, x: []const u8, y: []const u8) bool {
+                    return std.mem.lessThan(u8, x, y);
+                }
+            }.lt);
+            return names;
+        }
+    }.f;
+    // Each fused tensor is its parts' rows in order, parts numbered as in `specs`.
+    const expectFused = struct {
+        fn f(g: anytype, name: []const u8, first: usize, parts: usize, per_part: usize, alloc: std.mem.Allocator) !void {
+            const t = for (g.tensors.items) |t| {
+                if (std.mem.eql(u8, t.name, name)) break t;
+            } else return error.TestExpectedTensor;
+            const buf = try alloc.alignedAlloc(u8, .of(f32), @intCast(t.size));
+            const file = try g.openFileForTensor(t.name);
+            _ = try file.readPositionalAll(g.io, buf, t.offset + g.current_data_begin);
+            const v = std.mem.bytesAsSlice(f32, buf);
+            try testing.expectEqual(parts * per_part, v.len);
+            for (0..parts) |part| for (0..per_part) |i| {
+                try testing.expectEqual(@as(f32, @floatFromInt((first + part) * 1000 + i)), v[part * per_part + i]);
+            };
+        }
+    }.f;
+
+    {
+        var f = try st.init(src_path, io, gpa, a, false, false);
+        defer f.deinit();
+        var opts = targetTestOpts(io, src_path, dir, .comfyui, .F32);
+        opts.filetype = .safetensors;
+        try convert(&f, try applyTarget(&f, opts, gpa, a), gpa, a);
+        var out = try st.init(try a.print("{s}/out.safetensors", .{dir}), io, gpa, a, false, false);
+        defer out.deinit();
+        const want = [_][]const u8{
+            "final_layer.linear.weight",
+            L ++ "attention.k_norm.weight",
+            L ++ "attention.out.weight",
+            L ++ "attention.q_norm.weight",
+            L ++ "attention.qkv.weight",
+            L ++ "cross_attention.norm_q.weight",
+            L ++ "cross_attention.to_kv.weight",
+            L ++ "cross_attention.to_out.weight",
+            L ++ "cross_attention.to_q.weight",
+            L ++ "feed_forward.w1.weight",
+            L ++ "feed_forward.w3.weight",
+            "perceiver.latent_queries",
+            P ++ "to_kv.weight",
+            P ++ "to_out.weight",
+            P ++ "to_q.weight",
+        };
+        const got = try sortedNames(out.tensors.items, a);
+        try testing.expectEqual(want.len, got.len);
+        for (want, got) |w, g| try testing.expectEqualStrings(w, g);
+        try expectFused(&out, L ++ "attention.qkv.weight", 2, 3, 32, a);
+        try expectFused(&out, L ++ "cross_attention.to_kv.weight", 9, 2, 64, a);
+        try expectFused(&out, P ++ "to_kv.weight", 14, 2, 32, a);
+        try expectFused(&out, L ++ "attention.out.weight", 5, 1, 32, a);
+    }
+
+    {
+        var f = try st.init(src_path, io, gpa, a, false, false);
+        defer f.deinit();
+        var opts = targetTestOpts(io, src_path, dir, .custom, .F32);
+        opts.filetype = .safetensors;
+        opts.output_name = "split";
+        try convert(&f, try applyTarget(&f, opts, gpa, a), gpa, a);
+        var out = try st.init(try a.print("{s}/split.safetensors", .{dir}), io, gpa, a, false, false);
+        defer out.deinit();
+        const got = try sortedNames(out.tensors.items, a);
+        try testing.expectEqual(specs.len, got.len);
+        for (got) |g| for (specs) |s| {
+            if (std.mem.eql(u8, s.name, g)) break;
+        } else return error.TestUnexpectedTensor;
+    }
 }
 
 test "assignTensorType: moss_image quantizes only the block linears, as ComfyUI's bake does" {

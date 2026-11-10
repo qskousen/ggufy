@@ -1188,6 +1188,68 @@ pub const moss_image = Arch{
     },
 };
 
+/// Bria's FIBO 1.x transformer (Fibo 1.5 and Fibo Edit 1.5 share it), under diffusers'
+/// names. ComfyUI has no model for it; the ComfyUI_Fibo-1.5 custom nodes load its GGUF
+/// through ComfyUI-GGUF, keeping these names and requiring the architecture "fibo".
+pub const fibo = Arch{
+    .name = "fibo",
+    // flux bans its own diffusers key, so these blocks reach no other architecture.
+    .keys_detect = &.{
+        &.{
+            "caption_projection.0.linear.weight",
+            "transformer_blocks.0.attn.norm_added_k.weight",
+            "single_transformer_blocks.0.proj_mlp.weight",
+        },
+    },
+    .shape_fix = true,
+    .threshhold = null,
+    // The input, timestep, text and output projections outside the blocks.
+    // Not "proj_out": every single block has one.
+    .keys_hiprec = &.{
+        "x_embedder.",
+        "context_embedder.",
+        "caption_projection.",
+        "time_embed.",
+        "norm_out.",
+    },
+};
+
+/// Bria's Fibo 2.0 (dev and edit turbo share it). Detected under diffusers' names and
+/// under ComfyUI's, which fuses self-attention q/k/v into qkv and the text k/v into
+/// to_kv; the ComfyUI target converts the first into the second (Target.archFusions).
+pub const fibo2 = Arch{
+    .name = "fibo2",
+    .attention_modules = &.{
+        "layers.N.attention",
+        "layers.N.cross_attention",
+        "noise_refiner.N.attention",
+        "perceiver.layers.N.cross_attention",
+        "perceiver.layers.N.self_attention",
+    },
+    // What ComfyUI's own int8 bake leaves out, except that it also leaves out the last four
+    // main blocks, which a module pattern cannot say.
+    .attention_skip = &.{
+        "layers.N.cross_attention",
+        "noise_refiner.N.attention",
+        "perceiver.layers.N.cross_attention",
+        "perceiver.layers.N.self_attention",
+    },
+    .keys_detect = &.{
+        &.{ "perceiver.latent_queries", "final_layer.linear.weight" },
+    },
+    .shape_fix = true,
+    .threshhold = null,
+    // What ComfyUI's own int8 bake leaves in bf16, plus the gist queries, an nn.Parameter
+    // that no quantized Linear wraps.
+    .keys_hiprec = &.{
+        "adaLN_modulation.",
+        "t_embedder.",
+        "x_embedder.",
+        "final_layer.",
+        "perceiver.latent_queries",
+    },
+};
+
 /// LLM families llama.cpp consumes natively. Datasets cover both name spaces:
 /// GGUF-native (blk.N.*, token_embd) for requantizing llama.cpp files, HF
 /// (model.layers.N.*) for checkpoints. They quantize uniformly - the sensitivity
@@ -1377,6 +1439,7 @@ pub const qwen35moe = Arch{
 /// List of all known architectures, in detection priority order
 pub const arch_list = [_]*const Arch{
     &flux3,
+    &fibo,
     &flux,
     &sd3,
     &aura,
@@ -1398,6 +1461,7 @@ pub const arch_list = [_]*const Arch{
     &minimax_h3,
     &sensenova_u15,
     &moss_image,
+    &fibo2,
     &qwen35moe,
     &qwen35,
     &qwen3vl,
