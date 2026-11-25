@@ -14,6 +14,8 @@ pub const Target = enum {
     sdcpp,
     llamacpp,
     transformers,
+    /// Only for the models checked against its loaders; see `tensorPencilChecked`.
+    tensorpencil,
     /// No derivation: -f, -H and -A as given.
     custom,
 
@@ -24,18 +26,33 @@ pub const Target = enum {
             .sdcpp => "sd.cpp",
             .llamacpp => "llama.cpp",
             .transformers => "transformers",
+            .tensorpencil => "TensorPencil",
             .custom => "custom",
         };
     }
 };
 
-pub const Kind = enum { diffusion, llm };
+pub const Kind = enum {
+    diffusion,
+    llm,
+    /// The model an LLM's image tokens are encoded and decoded with.
+    image_tokenizer,
+
+    fn noun(self: Kind) []const u8 {
+        return switch (self) {
+            .diffusion => "a diffusion model",
+            .llm => "an LLM",
+            .image_tokenizer => "an image tokenizer",
+        };
+    }
+};
 
 pub const Consumer = enum {
     comfyui,
     sdcpp,
     llamacpp,
     transformers,
+    tensorpencil,
 
     pub fn label(self: Consumer) []const u8 {
         return switch (self) {
@@ -43,6 +60,7 @@ pub const Consumer = enum {
             .sdcpp => "sd.cpp",
             .llamacpp => "llama.cpp",
             .transformers => "transformers",
+            .tensorpencil => "TensorPencil",
         };
     }
 };
@@ -70,6 +88,7 @@ fn comfyGgufLoads(kind: Kind, arch_name: []const u8) bool {
     return switch (kind) {
         .diffusion => comfyGgufLoadsImage(arch_name),
         .llm => comfyGgufLoadsText(arch_name),
+        .image_tokenizer => false,
     };
 }
 
@@ -158,6 +177,7 @@ pub fn dtypeIssue(target: Target, t: types.DataType) ?[]const u8 {
         .sdcpp => sdcppIssue(t),
         .llamacpp => if (t.formatType() == .gguf) null else "llama.cpp reads GGUF types only",
         .transformers => if (t.formatType() == .safetensors and (t.isFloatType() or plainInt(t))) null else "transformers cannot load this tool's quantized layouts; use F16, BF16 or F32",
+        .tensorpencil => if (if (t.formatType() == .gguf) tensorPencilGgufReads(t) else tensorPencilSafetensorsReads(t)) null else "TensorPencil's loader for this model does not read this type",
         .auto, .custom => null,
     };
 }
@@ -217,16 +237,53 @@ pub const Verdict = struct {
     warn: bool = false,
 };
 
-pub fn assess(out: Output, alloc: std.mem.Allocator) ![4]Verdict {
+pub fn assess(out: Output, alloc: std.mem.Allocator) ![5]Verdict {
     return .{
         try assessComfy(out, alloc),
         try assessSdCpp(out, alloc),
         assessLlamaCpp(out),
         try assessTransformers(out, alloc),
+        assessTensorPencil(out),
     };
 }
 
+/// The ggml types TensorPencil's GGUF reader (core/gguf.zig dtypeFromGgml) takes.
+fn tensorPencilGgufReads(t: types.DataType) bool {
+    return switch (t) {
+        .f32, .f16, .bf16, .q4_0, .q4_1, .q5_0, .q5_1, .q8_0, .q2_k, .q3_k, .q4_k, .q5_k, .q6_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s, .iq4_nl, .iq4_xs, .q1_0, .i8, .i32 => true,
+        else => false,
+    };
+}
+
+fn tensorPencilSafetensorsReads(t: types.DataType) bool {
+    return switch (t) {
+        .F32, .F16, .BF16 => true,
+        else => false,
+    };
+}
+
+/// The models checked against TensorPencil's loaders, and the container each
+/// is read from: the Nemotron-Labs-Image pair its nemotron-image command takes,
+/// the language model as a GGUF under llama.cpp's names and the decoder as
+/// safetensors (its --decoder opens nothing else). null = not checked.
+pub fn tensorPencilChecked(arch_name: []const u8) ?types.FileType {
+    if (std.mem.eql(u8, arch_name, "nemotron_h_moe")) return .gguf;
+    if (std.mem.eql(u8, arch_name, "l24sq_vit")) return .safetensors;
+    return null;
+}
+
+/// Anything not checked is left out of "Works with" rather than called unloadable.
+fn assessTensorPencil(out: Output) Verdict {
+    const no: Verdict = .{ .consumer = .tensorpencil, .level = .no };
+    const ft = tensorPencilChecked(out.arch_name) orelse return no;
+    if (out.filetype != ft or out.hf_names) return no;
+    var it = out.dtypes.iterator();
+    while (it.next()) |t| if (dtypeIssue(.tensorpencil, t) != null) return no;
+    return .{ .consumer = .tensorpencil, .level = .yes, .note = "nemotron-image" };
+}
+
 fn assessComfy(out: Output, alloc: std.mem.Allocator) !Verdict {
+    if (out.kind == .image_tokenizer) return .{ .consumer = .comfyui, .level = .no, .note = try alloc.print("ComfyUI has no model for {s}", .{out.arch_name}) };
     if (out.kind == .diffusion and needsComfyLayout(out.arch_name, out.fused))
         return .{ .consumer = .comfyui, .level = .no, .note = try alloc.print("ComfyUI reads {s} only in its own layout, with split projections fused (--target comfyui)", .{out.arch_name}) };
     if (out.filetype == .gguf) return assessComfyGguf(out, alloc);
@@ -310,7 +367,7 @@ fn sdcppReadsFused(arch_name: []const u8, fu: Fusion) bool {
 fn assessLlamaCpp(out: Output) Verdict {
     const no: Verdict = .{ .consumer = .llamacpp, .level = .no };
     if (out.filetype != .gguf) return no;
-    if (out.kind != .llm) return .{ .consumer = .llamacpp, .level = .no, .note = "llama.cpp runs LLMs only" };
+    if (out.kind != .llm) return .{ .consumer = .llamacpp, .level = .no, .note = if (out.kind == .image_tokenizer) "llama.cpp has no implementation of this image tokenizer" else "llama.cpp runs LLMs only" };
     if (out.hf_names) return .{ .consumer = .llamacpp, .level = .no, .note = "llama.cpp needs its own blk.* tensor names" };
     if (std.mem.eql(u8, out.arch_name, "unknown")) return .{ .consumer = .llamacpp, .level = .no, .note = "the file names no architecture" };
     if (out.has_vision and !out.mmproj) return .{ .consumer = .llamacpp, .level = .partial, .note = "text only: no mmproj is written" };
@@ -320,7 +377,15 @@ fn assessLlamaCpp(out: Output) Verdict {
 
 fn assessTransformers(out: Output, alloc: std.mem.Allocator) !Verdict {
     const no: Verdict = .{ .consumer = .transformers, .level = .no };
-    if (out.filetype != .safetensors or out.kind != .llm) return no;
+    if (out.filetype != .safetensors or out.kind == .diffusion) return no;
+    if (out.kind == .image_tokenizer) {
+        var dts = out.dtypes.iterator();
+        while (dts.next()) |t| if (dtypeIssue(.transformers, t)) |why| {
+            return .{ .consumer = .transformers, .level = .no, .note = try alloc.print("{s}: {s}", .{ @tagName(t), why }) };
+        };
+        if (!out.hf_sidecars) return .{ .consumer = .transformers, .level = .partial, .note = "with the source's config.json and .py files copied beside it" };
+        return .{ .consumer = .transformers, .level = .yes, .note = "with trust_remote_code, through the model's own code" };
+    }
     if (!out.hf_names) return .{ .consumer = .transformers, .level = .no, .note = "transformers needs HF tensor names (-H)" };
     var it = out.dtypes.iterator();
     while (it.next()) |t| if (dtypeIssue(.transformers, t)) |why| {
@@ -342,6 +407,7 @@ pub fn targetVerdict(verdicts: []const Verdict, t: Target) ?Verdict {
         .sdcpp => verdictFor(verdicts, .sdcpp),
         .llamacpp => verdictFor(verdicts, .llamacpp),
         .transformers => verdictFor(verdicts, .transformers),
+        .tensorpencil => verdictFor(verdicts, .tensorpencil),
         .auto, .custom => null,
     };
 }
@@ -376,6 +442,7 @@ pub fn resolve(target: Target, kind: Kind) Target {
     return if (target == .auto) switch (kind) {
         .diffusion => .comfyui,
         .llm => .llamacpp,
+        .image_tokenizer => .transformers,
     } else target;
 }
 
@@ -386,7 +453,9 @@ pub fn readsContainer(target: Target, kind: Kind, ft: types.FileType) bool {
         .comfyui => true,
         .sdcpp => kind == .diffusion,
         .llamacpp => kind == .llm and ft == .gguf,
-        .transformers => kind == .llm and ft == .safetensors,
+        .transformers => kind != .diffusion and ft == .safetensors,
+        // Per model rather than per kind; plan refuses an unchecked one.
+        .tensorpencil => true,
         .auto, .custom => true,
     };
 }
@@ -412,7 +481,7 @@ pub fn hfNames(target: Target, kind: Kind, arch_name: []const u8, ft: types.File
         // Qwen3-VL, whose tower it reads from the same file.
         .comfyui => if (ft == .safetensors) source_is_gguf else std.mem.eql(u8, arch_name, "qwen3vl"),
         .transformers => source_is_gguf,
-        .sdcpp, .llamacpp, .auto, .custom => false,
+        .sdcpp, .llamacpp, .tensorpencil, .auto, .custom => false,
     };
 }
 
@@ -557,6 +626,10 @@ pub fn plan(target: Target, kind: Kind, arch_name: []const u8, datatype: ?types.
 
     switch (t) {
         .comfyui => {
+            if (kind == .image_tokenizer) {
+                why.* = try alloc.print("ComfyUI has no model for {s}", .{arch_name});
+                return error.TargetCannotLoad;
+            }
             // With no type the output is unquantized, which ComfyUI loads as safetensors with no
             // extension. A GGUF source stays GGUF: safetensors from it would need a generated HF layout.
             const ft = container orelse if (source_is_gguf) types.FileType.gguf else .safetensors;
@@ -570,7 +643,7 @@ pub fn plan(target: Target, kind: Kind, arch_name: []const u8, datatype: ?types.
         },
         .sdcpp => {
             if (kind != .diffusion) {
-                why.* = try alloc.print("sd.cpp's target here is diffusion models; {s} is an LLM", .{arch_name});
+                why.* = try alloc.print("sd.cpp's target here is diffusion models; {s} is {s}", .{ arch_name, kind.noun() });
                 return error.TargetCannotLoad;
             }
             if (datatype) |d| if (sdcppIssue(d)) |reason| {
@@ -582,7 +655,7 @@ pub fn plan(target: Target, kind: Kind, arch_name: []const u8, datatype: ?types.
         },
         .llamacpp => {
             if (kind != .llm) {
-                why.* = try alloc.print("llama.cpp runs LLMs; {s} is a diffusion model", .{arch_name});
+                why.* = try alloc.print("llama.cpp runs LLMs; {s} is {s}", .{ arch_name, kind.noun() });
                 return error.TargetCannotLoad;
             }
             if (container == .safetensors) {
@@ -595,8 +668,8 @@ pub fn plan(target: Target, kind: Kind, arch_name: []const u8, datatype: ?types.
             return .{ .target = t, .filetype = .gguf, .hf_names = hfNames(t, kind, arch_name, .gguf, source_is_gguf) };
         },
         .transformers => {
-            if (kind != .llm) {
-                why.* = try alloc.print("transformers output is for LLMs; {s} is a diffusion model", .{arch_name});
+            if (kind == .diffusion) {
+                why.* = try alloc.print("transformers output is for LLMs and image tokenizers; {s} is a diffusion model", .{arch_name});
                 return error.TargetCannotLoad;
             }
             if (datatype) |d| if (dtypeIssue(.transformers, d)) |reason| {
@@ -607,11 +680,31 @@ pub fn plan(target: Target, kind: Kind, arch_name: []const u8, datatype: ?types.
                 why.* = "transformers reads safetensors, not GGUF";
                 return error.TargetCannotLoad;
             }
+            // Its config.json and code are copied from beside the source, which a GGUF has none of.
+            if (kind == .image_tokenizer and source_is_gguf) {
+                why.* = try alloc.print("{s}'s safetensors loads with the config.json and code beside its source checkpoint; convert from that checkpoint", .{arch_name});
+                return error.TargetCannotLoad;
+            }
             if (source_is_gguf and !hf_config_writable) {
                 why.* = try alloc.print("this tool writes config.json for {s} only; {s} is not one", .{ HfLlm.hf_config_archs_text, arch_name });
                 return error.TargetCannotLoad;
             }
             return .{ .target = t, .filetype = .safetensors, .hf_names = hfNames(t, kind, arch_name, .safetensors, source_is_gguf) };
+        },
+        .tensorpencil => {
+            const ft = tensorPencilChecked(arch_name) orelse {
+                why.* = try alloc.print("ggufy has checked TensorPencil's loaders for the Nemotron-Labs-Image models only, not {s}; use -T custom for an unchecked conversion", .{arch_name});
+                return error.TargetCannotLoad;
+            };
+            if (container) |c| if (c != ft) {
+                why.* = try alloc.print("TensorPencil reads {s} from {s}", .{ arch_name, @tagName(ft) });
+                return error.TargetCannotLoad;
+            };
+            if (datatype) |d| if (dtypeIssue(.tensorpencil, d)) |reason| {
+                why.* = try alloc.print("{s}: {s}", .{ @tagName(d), reason });
+                return error.TargetCannotLoad;
+            };
+            return .{ .target = t, .filetype = ft, .hf_names = false };
         },
         .auto, .custom => unreachable,
     }
@@ -624,6 +717,7 @@ pub fn targetsFor(kind: ?Kind) []const Target {
     return switch (k) {
         .diffusion => &.{ .comfyui, .sdcpp, .custom },
         .llm => &.{ .comfyui, .llamacpp, .transformers, .custom },
+        .image_tokenizer => &.{ .transformers, .tensorpencil, .custom },
     };
 }
 
@@ -980,4 +1074,61 @@ test "MiniMax H3 loads in ComfyUI and sd.cpp only in ComfyUI's layout, which bot
     // The PDD bank is the image model's alone.
     try testing.expectEqual(@as(usize, 2), archFusions("minimax_h3").len);
     try testing.expect(archFusions("minimax_h3_image")[2].delta);
+}
+
+test "an image tokenizer targets transformers, and nothing loads its GGUF" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var why: []const u8 = "";
+    const auto = try plan(.auto, .image_tokenizer, "l24sq_vit", null, null, false, false, a, &why);
+    try testing.expectEqual(Target.transformers, auto.target);
+    try testing.expectEqual(types.FileType.safetensors, auto.filetype);
+    try testing.expect(!auto.hf_names);
+    try testing.expectError(error.TargetCannotLoad, plan(.comfyui, .image_tokenizer, "l24sq_vit", null, null, false, false, a, &why));
+    try testing.expectError(error.TargetCannotLoad, plan(.llamacpp, .image_tokenizer, "l24sq_vit", .q8_0, null, false, false, a, &why));
+    try testing.expectError(error.TargetCannotLoad, plan(.transformers, .image_tokenizer, "l24sq_vit", .q8_0, null, false, false, a, &why));
+    try testing.expectError(error.TargetCannotLoad, plan(.transformers, .image_tokenizer, "l24sq_vit", null, null, true, false, a, &why));
+
+    const st_out = try assess(.{ .kind = .image_tokenizer, .filetype = .safetensors, .arch_name = "l24sq_vit", .hf_sidecars = true, .dtypes = set(&.{ .BF16, .F32 }) }, a);
+    try testing.expectEqualStrings("transformers (with trust_remote_code, through the model's own code); TensorPencil (nemotron-image)", try worksWith(&st_out, a));
+    const gguf_out = try assess(.{ .kind = .image_tokenizer, .filetype = .gguf, .arch_name = "l24sq_vit", .dtypes = set(&.{ .q8_0, .f32 }) }, a);
+    try testing.expectEqualStrings("nothing this tool knows of", try worksWith(&gguf_out, a));
+}
+
+test "TensorPencil is named for the Nemotron-Labs-Image pair only" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const lm = try assess(.{ .kind = .llm, .filetype = .gguf, .arch_name = "nemotron_h_moe", .dtypes = set(&.{ .q5_0, .q4_k, .q8_0, .f32 }) }, a);
+    try testing.expectEqual(Level.yes, verdictFor(&lm, .tensorpencil).level);
+    // A type its GGUF reader has no case for.
+    const tq = try assess(.{ .kind = .llm, .filetype = .gguf, .arch_name = "nemotron_h_moe", .dtypes = set(&.{ .tq1_0, .f32 }) }, a);
+    try testing.expectEqual(Level.no, verdictFor(&tq, .tensorpencil).level);
+    // Its decoder flag opens safetensors only.
+    const dec_gguf = try assess(.{ .kind = .image_tokenizer, .filetype = .gguf, .arch_name = "l24sq_vit", .dtypes = set(&.{ .q8_0, .f32 }) }, a);
+    try testing.expectEqual(Level.no, verdictFor(&dec_gguf, .tensorpencil).level);
+    // Unjudged models stay out of the line rather than being called unloadable.
+    const q3 = try assess(.{ .kind = .llm, .filetype = .gguf, .arch_name = "qwen3", .dtypes = set(&.{ .q4_k, .f32 }) }, a);
+    try testing.expect(std.mem.find(u8, try worksWith(&q3, a), "TensorPencil") == null);
+}
+
+test "the tensorpencil target plans the Nemotron-Labs-Image models and refuses unchecked ones" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var why: []const u8 = "";
+    const dec = try plan(.tensorpencil, .image_tokenizer, "l24sq_vit", .BF16, null, false, false, a, &why);
+    try testing.expectEqual(types.FileType.safetensors, dec.filetype);
+    try testing.expectEqual(types.FileType.safetensors, (try plan(.tensorpencil, .image_tokenizer, "l24sq_vit", null, null, false, false, a, &why)).filetype);
+    try testing.expectError(error.TargetCannotLoad, plan(.tensorpencil, .image_tokenizer, "l24sq_vit", .q8_0, null, false, false, a, &why));
+    try testing.expectError(error.TargetCannotLoad, plan(.tensorpencil, .image_tokenizer, "l24sq_vit", .INT8, null, false, false, a, &why));
+    const lm = try plan(.tensorpencil, .llm, "nemotron_h_moe", .q4_k, null, false, false, a, &why);
+    try testing.expectEqual(types.FileType.gguf, lm.filetype);
+    try testing.expect(!lm.hf_names);
+    try testing.expectError(error.TargetCannotLoad, plan(.tensorpencil, .llm, "nemotron_h_moe", .BF16, null, false, false, a, &why));
+    try testing.expectError(error.TargetCannotLoad, plan(.tensorpencil, .diffusion, "krea2", .q4_k, null, false, false, a, &why));
+    try testing.expect(std.mem.find(u8, why, "checked") != null);
+    try testing.expect(std.mem.indexOfScalar(Target, targetsFor(.image_tokenizer), .tensorpencil) != null);
+    try testing.expect(std.mem.indexOfScalar(Target, targetsFor(.diffusion), .tensorpencil) == null);
 }

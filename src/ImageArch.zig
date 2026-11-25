@@ -149,6 +149,9 @@ pub const Arch = struct {
     /// would leave the file claiming an architecture its <arch>.* keys do not
     /// use. -A still names it by hand.
     keys_family_wide: bool = false,
+    /// The image tokenizer an LLM's image tokens are encoded and decoded with,
+    /// rather than a diffusion model or an LLM itself.
+    image_tokenizer: bool = false,
 
     /// Check if this architecture matches the given tensor names
     pub fn matches(self: Arch, tensor_names: []const []const u8) bool {
@@ -1464,6 +1467,23 @@ pub const qwen35moe = Arch{
     .precision_floor = &llm_output_floor,
 };
 
+/// NVIDIA's L24SQ ViT image tokenizer (Nemotron-Labs-Image): the encoder that
+/// turns pixels into codes, the decoder that turns them back, and the codebook
+/// between them. Loaded by its own remote code through transformers.
+pub const l24sq_vit = Arch{
+    .name = "l24sq_vit",
+    .component_filter = false,
+    .row_aligned_blocks = true,
+    .image_tokenizer = true,
+    .threshhold = null,
+    .keys_detect = &.{
+        &.{ "quantize.embedding.weight", "quant_embed.weight", "post_quant_embed.weight", "encoder.patch_embed.weight", "decoder.conv_out.weight" },
+    },
+    // The codebook rows are lattice points every code is decoded from; rounding
+    // them moves every patch of every image.
+    .keys_hiprec_named = &.{"quantize.embedding.weight"},
+};
+
 /// Nemotron-H with MoE blocks: Mamba2, attention and expert layers in the order
 /// config.json's hybrid_override_pattern gives. HfLlm refuses the dense variant,
 /// which shares the model_type.
@@ -1514,6 +1534,7 @@ pub const arch_list = [_]*const Arch{
     &sensenova_u15,
     &moss_image,
     &fibo2,
+    &l24sq_vit,
     &nemotron_h_moe,
     &qwen35moe,
     &qwen35,
@@ -2223,6 +2244,21 @@ test "llama family detects from GGUF-native and HF name spaces" {
 
     // Missing the norms must not reach qwen3.
     try std.testing.expectEqualStrings("llama", detectArch(&llama_native).?.name);
+}
+
+test "l24sq_vit is detected from its codebook and both halves" {
+    const names = [_][]const u8{
+        "quantize.embedding.weight",
+        "quant_embed.weight",
+        "post_quant_embed.weight",
+        "encoder.patch_embed.weight",
+        "decoder.conv_out.weight",
+        "decoder.blocks.0.attn.q_proj.weight",
+    };
+    const got = detectArch(&names).?;
+    try std.testing.expectEqualStrings("l24sq_vit", got.name);
+    try std.testing.expect(got.image_tokenizer);
+    try std.testing.expect(got.isHighPrecisionNamed("quantize.embedding.weight"));
 }
 
 test "nemotron_h_moe claims its own GGUF but not a granitehybrid one" {

@@ -77,7 +77,7 @@ fn targetName(t: Target.Target) []const u8 {
         .llamacpp => "llama.cpp (also Ollama, LM Studio)",
         .transformers => "transformers (Hugging Face)",
         .custom => "Custom",
-        .comfyui, .auto => t.label(),
+        .comfyui, .tensorpencil, .auto => t.label(),
     };
 }
 
@@ -90,6 +90,7 @@ fn targetTip(t: Target.Target, kind: ?Target.Kind) []const u8 {
         .sdcpp => "Every tensor keeps its real shape, which sd.cpp checks; projections stay split where sd.cpp reads them split. GGUF or safetensors.",
         .llamacpp => "A GGUF with llama.cpp's tensor names and tokenizer, and a separate mmproj file for a vision tower.",
         .transformers => "A directory transformers' from_pretrained loads: HF tensor names in model.safetensors, with config.json and tokenizer files beside it.",
+        .tensorpencil => "For TensorPencil's nemotron-image: the decoder as one safetensors file, the language model as a GGUF. Other models have not been checked against TensorPencil.",
         .custom => "Choose the format and tensor naming yourself. Nothing is refused for being unloadable.",
         .auto => "",
     };

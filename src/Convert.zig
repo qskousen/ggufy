@@ -190,6 +190,7 @@ pub fn targetModel(
     arena_alloc: std.mem.Allocator,
 ) !?TargetModel {
     const detected = try imagearch.detectArchFromTensors(tensors, allocator) orelse return null;
+    if (detected.image_tokenizer) return .{ .kind = .image_tokenizer, .arch_name = detected.name };
     if (detected.hf_model_type.len == 0) return .{ .kind = .diffusion, .arch_name = detected.name };
     const source_arch: ?[]const u8 = if (source_metadata) |m| switch (m.get("general.architecture") orelse std.json.Value.null) {
         .string => |s| if (s.len > 0) s else null,
@@ -1000,6 +1001,7 @@ pub fn convert(
             prep.hf_renamed,
             prep.hf_unpermute,
             prep.hf_vision,
+            prep.arch.image_tokenizer,
         ),
     }
 
@@ -1010,11 +1012,11 @@ pub fn convert(
 /// What the prepared output is, as far as deciding who can load it goes.
 fn outputFacts(f: anytype, prep: *const PreparedConversion, opts: ConvertOptions, arena_alloc: std.mem.Allocator) !Target.Output {
     var out: Target.Output = .{
-        .kind = if (prep.llm) .llm else .diffusion,
+        .kind = if (prep.llm) .llm else if (prep.arch.image_tokenizer) .image_tokenizer else .diffusion,
         .filetype = opts.filetype,
         .arch_name = opts.arch_override orelse prep.arch.name,
         .mmproj = prep.vision_plan != null,
-        .hf_sidecars = opts.filetype == .safetensors and prep.hf_renamed,
+        .hf_sidecars = opts.filetype == .safetensors and (prep.hf_renamed or (prep.arch.image_tokenizer and opts.target == .transformers)),
         .has_vision = prep.vision_plan != null or prep.hf_vision != null,
     };
     if (opts.filetype == .gguf) out.arch_name = ggufArchName(f, prep.arch, prep.template_metadata, opts, prep.hf);
@@ -1059,7 +1061,7 @@ pub fn predictOutputSize(
 pub const Prediction = struct {
     size: u64,
     /// Every known consumer's verdict on the output, in Target.Consumer order.
-    verdicts: [4]Target.Verdict,
+    verdicts: [5]Target.Verdict,
 };
 
 /// `predictOutputSize` plus who can load the result. Unlike `convert`, an
@@ -3234,6 +3236,24 @@ fn buildSafetensorsMetadata(
     }
 }
 
+/// The files an image tokenizer's remote code reads beside its weights, in a
+/// stable order.
+fn modelCodeFiles(io: std.Io, dir: std.Io.Dir, alloc: std.mem.Allocator) ![]const []const u8 {
+    var found: std.ArrayList([]const u8) = .empty;
+    var it = dir.iterate();
+    while (try it.next(io)) |e| {
+        if (e.kind != .file and e.kind != .sym_link) continue;
+        if (std.mem.eql(u8, e.name, "config.json") or std.mem.endsWith(u8, e.name, ".py"))
+            try found.append(alloc, try alloc.dupe(u8, e.name));
+    }
+    std.mem.sort([]const u8, found.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    return found.items;
+}
+
 /// Whether two paths name the same file. Both sides are built by joining a
 /// directory onto a name, so "model.safetensors" and "./model.safetensors"
 /// arrive as different strings for the same file; the output does not exist
@@ -3263,6 +3283,7 @@ fn writeSafetensors(
     hf_renamed: bool,
     hf_unpermute: ?HfLlm.RopeHeads,
     hf_vision: ?HfLlm.Vision,
+    image_tokenizer: bool,
 ) !void {
     // --- Resolve output path -------------------------------------------------
     const dir_path = if (opts.output_dir) |od| od else std.Io.Dir.path.dirname(opts.path) orelse ".";
@@ -3273,7 +3294,10 @@ fn writeSafetensors(
     // transformers loads model.safetensors (or an index naming it) and nothing
     // else, so the HF layout has one usable weights name: a <stem>-<dtype> file
     // beside the sidecars would be a directory that only looks loadable.
-    const out_filename = try computeOutputPath(opts, hf_renamed, arena_alloc);
+    // Only transformers reads an image tokenizer as a directory; TensorPencil
+    // and custom get the one file.
+    const code_dir = image_tokenizer and opts.target == .transformers;
+    const out_filename = try computeOutputPath(opts, hf_renamed or code_dir, arena_alloc);
 
     // A fixed output name can land on the source itself (a safetensors already
     // named model.safetensors, converted in place). The writer truncates before
@@ -3349,6 +3373,45 @@ fn writeSafetensors(
         }
     }
 
+    // An image tokenizer loads through its own remote code, which reads the
+    // config.json and .py files beside the weights: those are copied from the
+    // source, and settled before the write for the same reasons as above.
+    var code_files: []const []const u8 = &.{};
+    var code_src: ?std.Io.Dir = null;
+    var code_dst: ?std.Io.Dir = null;
+    defer if (code_src) |d| d.close(opts.io);
+    defer if (code_dst) |d| d.close(opts.io);
+    if (code_dir) {
+        const src_path = std.Io.Dir.path.dirname(opts.path) orelse ".";
+        const src = try std.Io.Dir.cwd().openDir(opts.io, src_path, .{ .iterate = true });
+        code_src = src;
+        code_files = try modelCodeFiles(opts.io, src, arena_alloc);
+        if (code_files.len == 0) std.log.warn("no config.json or .py files beside {s}; transformers will not load the output without them", .{opts.path});
+        // Converting into the source directory under -n: the files are already there.
+        if (pathsCollide(opts.io, try std.Io.Dir.path.join(arena_alloc, &.{ dir_path, "config.json" }), try std.Io.Dir.path.join(arena_alloc, &.{ src_path, "config.json" }))) {
+            std.log.warn("{s} sits beside the source weights, which transformers loads instead; pass -o to write a directory of its own", .{out_filename});
+        } else {
+            const dst = try std.Io.Dir.cwd().openDir(opts.io, dir_path, .{});
+            code_dst = dst;
+            if (!opts.force) {
+                var clashes: std.ArrayList([]const u8) = .empty;
+                const weights_name = std.Io.Dir.path.basename(out_filename);
+                var wanted: std.ArrayList([]const u8) = .empty;
+                try wanted.appendSlice(arena_alloc, code_files);
+                try wanted.appendSlice(arena_alloc, &.{ weights_name, HfLlm.weights_index_name });
+                if (!std.mem.eql(u8, weights_name, HfLlm.default_weights_name)) try wanted.append(arena_alloc, HfLlm.default_weights_name);
+                for (wanted.items) |n| {
+                    if (dst.access(opts.io, n, .{})) |_| try clashes.append(arena_alloc, n) else |_| {}
+                }
+                if (clashes.items.len > 0) {
+                    std.log.warn("files already in {s}: {s}", .{ dir_path, try std.mem.join(arena_alloc, ", ", clashes.items) });
+                    std.log.warn("pass --force to overwrite them, or -o to write into another directory", .{});
+                    return error.SidecarExists;
+                }
+            }
+        }
+    }
+
     // --- Initialise Safetensors writer ----------------------------------------------
     var out_st = try st.init(out_filename, opts.io, allocator, arena_alloc, true, true);
     defer out_st.deinit();
@@ -3385,6 +3448,21 @@ fn writeSafetensors(
         return err;
     };
     std.log.info("Converted to {s}", .{out_filename});
+
+    if (code_dst) |dst| {
+        for (code_files) |n| try code_src.?.copyFile(n, dst, n, opts.io, .{});
+        const weights_name = std.Io.Dir.path.basename(out_filename);
+        if (!std.mem.eql(u8, weights_name, HfLlm.default_weights_name)) {
+            var names = try std.ArrayList([]const u8).initCapacity(arena_alloc, model_tensors.items.len);
+            var total_size: u64 = 0;
+            for (model_tensors.items) |t| {
+                names.appendAssumeCapacity(t.name);
+                total_size += t.size;
+            }
+            try HfLlm.writeWeightsIndex(opts.io, dst, weights_name, names.items, total_size, arena_alloc);
+        } else dst.deleteFile(opts.io, HfLlm.weights_index_name) catch {};
+        std.log.info("copied {s} beside it", .{try std.mem.join(arena_alloc, ", ", code_files)});
+    }
 
     // HF layout needs its sidecars too; without them the safetensors are not
     // loadable by transformers. All values come from the source GGUF metadata.
@@ -8510,4 +8588,102 @@ test "MiniMax H3 under diffusers' names repacks into ComfyUI's layout, PDD head 
         defer f.deinit();
         try testing.expectError(error.TargetCannotLoad, convert(&f, opts, gpa, a));
     }
+}
+
+test "an L24SQ image tokenizer converts to a transformers directory with its code copied and its codebook kept f32" {
+    testing.log_level = .err;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const ts_ns: i96 = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    const root = try a.print("/tmp/ggufy_l24sq_{x}", .{@as(u64, @bitCast(@as(i64, @truncate(ts_ns))))});
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const src = try a.print("{s}/src", .{root});
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io, src, .default_dir);
+    // Both big tensors are past the quantization threshold, so only the
+    // codebook rule keeps the first one f32.
+    const specs = [_]StSpec{
+        .{ .name = "quantize.embedding.weight", .dims = &.{ 4096, 24 } },
+        .{ .name = "quant_embed.weight", .dims = &.{ 24, 64 } },
+        .{ .name = "post_quant_embed.weight", .dims = &.{ 64, 24 } },
+        .{ .name = "encoder.patch_embed.weight", .dims = &.{ 64, 3, 2, 2 } },
+        .{ .name = "decoder.conv_out.weight", .dims = &.{ 12, 64 } },
+        .{ .name = "decoder.blocks.0.attn.q_proj.weight", .dims = &.{ 256, 512 } },
+        .{ .name = "decoder.norm.weight", .dims = &.{64} },
+    };
+    const src_path = try a.print("{s}/model.safetensors", .{src});
+    try writeF32Safetensors(io, a, src_path, &specs, 0, 1e-6);
+    for ([_][]const u8{ "config.json", "configuration_l24sq_vit.py", "modeling_l24sq_vit.py" }) |n| {
+        const file = try std.Io.Dir.cwd().createFile(io, try a.print("{s}/{s}", .{ src, n }), .{ .truncate = true });
+        defer file.close(io);
+        try file.writeStreamingAll(io, n);
+    }
+
+    const out = try a.print("{s}/out", .{root});
+    const opts = ConvertOptions{
+        .io = io,
+        .path = src_path,
+        .filetype = .safetensors,
+        .datatype = .BF16,
+        .template_path = null,
+        .output_dir = out,
+        .output_name = null,
+        .target = .transformers,
+        .threads = 1,
+        .skip_sensitivity = true,
+        .quantization_aggressiveness = 0,
+    };
+    {
+        var f = try st.init(src_path, io, gpa, a, false, false);
+        defer f.deinit();
+        try convert(&f, opts, gpa, a);
+    }
+    for ([_][]const u8{ "config.json", "configuration_l24sq_vit.py", "modeling_l24sq_vit.py" }) |n| {
+        const copied = try std.Io.Dir.cwd().readFileAlloc(io, try a.print("{s}/{s}", .{ out, n }), a, .limited(64));
+        try testing.expectEqualStrings(n, copied);
+    }
+    var got = try st.init(try a.print("{s}/model.safetensors", .{out}), io, gpa, a, false, false);
+    defer got.deinit();
+    for (got.tensors.items) |t| {
+        const want: []const u8 = if (std.mem.eql(u8, t.name, "decoder.blocks.0.attn.q_proj.weight")) "BF16" else if (std.mem.eql(u8, t.name, "quantize.embedding.weight")) "F32" else continue;
+        try testing.expectEqualStrings(want, t.type);
+    }
+
+    // A second run would overwrite the first directory's files.
+    var again = try st.init(src_path, io, gpa, a, false, false);
+    defer again.deinit();
+    try testing.expectError(error.SidecarExists, convert(&again, opts, gpa, a));
+
+    // A renamed weights file needs the index transformers opens it through.
+    var renamed_opts = opts;
+    renamed_opts.output_dir = try a.print("{s}/named", .{root});
+    renamed_opts.output_name = "dec";
+    var f3 = try st.init(src_path, io, gpa, a, false, false);
+    defer f3.deinit();
+    try convert(&f3, renamed_opts, gpa, a);
+    const index = try std.Io.Dir.cwd().readFileAlloc(io, try a.print("{s}/named/{s}", .{ root, HfLlm.weights_index_name }), a, .limited(1 << 20));
+    try testing.expect(std.mem.find(u8, index, "\"dec.safetensors\"") != null);
+
+    // TensorPencil opens the decoder as one file: nothing is written beside it.
+    var tp_opts = opts;
+    tp_opts.target = .tensorpencil;
+    tp_opts.output_dir = try a.print("{s}/tp", .{root});
+    tp_opts.output_name = "decoder";
+    var f4 = try st.init(src_path, io, gpa, a, false, false);
+    defer f4.deinit();
+    try convert(&f4, tp_opts, gpa, a);
+    var tp_dir = try std.Io.Dir.cwd().openDir(io, tp_opts.output_dir.?, .{ .iterate = true });
+    defer tp_dir.close(io);
+    var it = tp_dir.iterate();
+    var written: usize = 0;
+    while (try it.next(io)) |e| {
+        try testing.expectEqualStrings("decoder.safetensors", e.name);
+        written += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), written);
 }
