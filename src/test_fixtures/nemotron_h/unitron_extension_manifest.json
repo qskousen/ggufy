@@ -1,0 +1,25 @@
+{
+ "base_vocab_size": 32,
+ "tokenizer_mode": "virtual",
+ "n_vision": 20,
+ "framing_tokens": [
+  "<|img_start|>",
+  "<|img_end|>",
+  "<|vis_row|>"
+ ],
+ "model_vocab_size": 55,
+ "embedding_rows": 64,
+ "unitron_token_ranges": {
+  "framing": {
+   "<|img_start|>": 32,
+   "<|img_end|>": 33,
+   "<|vis_row|>": 34
+  },
+  "vision": {
+   "token_format": "<|vis_{i}|>",
+   "start_id": 35,
+   "end_id": 55,
+   "count": 20
+  }
+ }
+}

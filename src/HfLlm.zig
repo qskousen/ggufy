@@ -63,6 +63,25 @@ pub const Qwen35 = struct {
     }
 };
 
+/// The Mamba2/attention/MoE hybrid's layout and the keys llama.cpp's converter
+/// writes for it beyond the generic set.
+pub const NemotronH = struct {
+    /// One character per block: 'M' Mamba2, '*' attention, 'E' experts.
+    pattern: []const u8,
+    conv_kernel: u32,
+    state_size: u32,
+    /// ssm.group_count, and the row count llama.cpp reshapes ssm_norm to.
+    group_count: u32,
+    inner_size: u32,
+    /// The Mamba head count, which is what llama.cpp means by this key.
+    time_step_rank: u32,
+    shared_expert_count: u32,
+    weights_norm: bool,
+    weights_scale: f32,
+    expert_group_count: u32,
+    expert_group_used_count: u32,
+};
+
 pub const Model = struct {
     arch: *const imagearch.Arch,
     dir: []const u8,
@@ -88,6 +107,7 @@ pub const Model = struct {
     head_dim: ?u32,
     /// null = not a Gated DeltaNet hybrid.
     qwen35: ?Qwen35 = null,
+    nemotron_h: ?NemotronH = null,
     /// M-RoPE section widths padded to four, for an arch that is not qwen35
     /// (which carries its own). null = plain RoPE.
     rope_sections: ?[4]i64 = null,
@@ -289,6 +309,107 @@ fn readQwen35(c: std.json.ObjectMap, text_blocks: u32, head_dim: u32, alloc: std
     };
 }
 
+fn readNemotronH(c: std.json.ObjectMap, block_count: u32) ?NemotronH {
+    const pattern = getStr(c, "hybrid_override_pattern") orelse return null;
+    if (pattern.len != block_count) return null;
+    for (pattern) |ch| if (std.mem.findScalar(u8, "ME*", ch) == null) return null;
+    const heads = nonZero(getU32(c, "mamba_num_heads")) orelse return null;
+    const head_dim = nonZero(getU32(c, "mamba_head_dim")) orelse return null;
+    return .{
+        .pattern = pattern,
+        .conv_kernel = getU32(c, "conv_kernel") orelse return null,
+        .state_size = getU32(c, "ssm_state_size") orelse return null,
+        .group_count = nonZero(getU32(c, "n_groups")) orelse return null,
+        .inner_size = heads * head_dim,
+        .time_step_rank = heads,
+        .shared_expert_count = getU32(c, "n_shared_experts") orelse return null,
+        .weights_norm = getBool(c, "norm_topk_prob", false),
+        .weights_scale = @floatCast(getF64(c, "routed_scaling_factor") orelse return null),
+        .expert_group_count = getU32(c, "n_group") orelse return null,
+        .expert_group_used_count = getU32(c, "topk_group") orelse return null,
+    };
+}
+
+/// NVIDIA's unitron checkpoints add image tokens past the base tokenizer that
+/// only their remote tokenizer code knows, and llama.cpp's converter writes
+/// them as [PAD] holes. Name them from the manifest instead, as control
+/// tokens, so generated image codes detokenize to the <|vis_N|> text the
+/// model's own decoder parses. Each refusal says why first, since the caller
+/// only learns that the manifest was unusable.
+fn nameUnitronTokens(io: std.Io, dir: std.Io.Dir, alloc: std.mem.Allocator, model: *Model) !void {
+    const manifest = "unitron_extension_manifest.json";
+    const parsed = readJson(io, dir, manifest, alloc) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => {
+            std.log.warn("{s} could not be read: {s}", .{ manifest, @errorName(err) });
+            return error.BadManifest;
+        },
+    };
+    const malformed = struct {
+        fn f(what: []const u8) error{BadManifest} {
+            std.log.warn("{s}: {s}", .{ manifest, what });
+            return error.BadManifest;
+        }
+    }.f;
+    const m = obj(parsed.value) orelse return malformed("not a JSON object");
+    const ranges = obj(m.get("unitron_token_ranges") orelse return malformed("no unitron_token_ranges")) orelse
+        return malformed("unitron_token_ranges is not an object");
+    const tokens = try alloc.dupe([]const u8, model.tokens);
+    const types_ = try alloc.dupe(u32, model.token_types);
+    const named = try alloc.alloc(bool, tokens.len);
+    @memset(named, false);
+
+    const Place = struct {
+        fn at(toks: [][]const u8, tys: []u32, done: []bool, id: u64, name: []const u8) !void {
+            if (id >= toks.len) {
+                std.log.warn("{s} places {s} at id {d}, past the {d}-token vocabulary", .{ manifest, name, id, toks.len });
+                return error.BadManifest;
+            }
+            if (done[id]) {
+                std.log.warn("{s} places two tokens at id {d} ({s} and {s})", .{ manifest, id, toks[id], name });
+                return error.BadManifest;
+            }
+            // Never overwrite a token the tokenizer itself defines.
+            if (tys[id] != GGUF_TOKEN_TYPE_UNUSED) {
+                std.log.warn("{s} places {s} at id {d}, which the tokenizer already defines as {s}", .{ manifest, name, id, toks[id] });
+                return error.BadManifest;
+            }
+            toks[id] = name;
+            tys[id] = GGUF_TOKEN_TYPE_CONTROL;
+            done[id] = true;
+        }
+    };
+
+    if (ranges.get("framing")) |fv| {
+        const framing = obj(fv) orelse return malformed("framing is not an object");
+        var it = framing.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.* != .integer or e.value_ptr.*.integer < 0) return malformed("a framing id is not a token id");
+            try Place.at(tokens, types_, named, @intCast(e.value_ptr.*.integer), e.key_ptr.*);
+        }
+    }
+    if (ranges.get("vision")) |vv| {
+        const vision = obj(vv) orelse return malformed("vision is not an object");
+        const format = getStr(vision, "token_format") orelse return malformed("vision has no token_format");
+        const start = getU64(vision, "start_id") orelse return malformed("vision has no start_id");
+        const end = getU64(vision, "end_id") orelse return malformed("vision has no end_id");
+        const hole = std.mem.find(u8, format, "{i}") orelse return malformed("vision token_format has no {i}");
+        if (end < start) return malformed("vision end_id is below start_id");
+        // Checked before a name is built: a corrupt end_id would otherwise
+        // print billions of them.
+        if (end > tokens.len) {
+            std.log.warn("{s} ends the vision range at id {d}, past the {d}-token vocabulary", .{ manifest, end, tokens.len });
+            return error.BadManifest;
+        }
+        for (0..end - start) |i| {
+            const name = try alloc.print("{s}{d}{s}", .{ format[0..hole], i, format[hole + 3 ..] });
+            try Place.at(tokens, types_, named, start + i, name);
+        }
+    }
+    model.tokens = tokens;
+    model.token_types = types_;
+}
+
 /// rope_parameters.mrope_section, or the older rope_scaling spelling, padded to four.
 fn readMropeSections(c: std.json.ObjectMap) ?[4]i64 {
     for ([_][]const u8{ "rope_parameters", "rope_scaling" }) |k| {
@@ -340,7 +461,7 @@ pub fn configArch(io: std.Io, dir: std.Io.Dir, alloc: std.mem.Allocator) ?*const
 /// Why `load` returned null. "Not an HF checkpoint at all" and "an HF
 /// checkpoint whose tokenizer we cannot read" send the user to different
 /// files, so the caller needs to tell them apart to say anything useful.
-pub const LoadFailure = enum { no_config, unknown_model_type, incomplete_config, no_tokenizer };
+pub const LoadFailure = enum { no_config, unknown_model_type, incomplete_config, no_tokenizer, bad_manifest };
 
 /// Look for an HF checkpoint whose sidecars we understand. `dir` holds
 /// config.json (and normally model.safetensors). null = not an HF LLM
@@ -393,7 +514,7 @@ pub fn load(io: std.Io, dir: std.Io.Dir, name_path: []const u8, alloc: std.mem.A
         // loads. Refuse here rather than write one.
         .context_length = nonZero(getU32(cm, "max_position_embeddings") orelse
             getU32(cm, "n_ctx") orelse getU32(cm, "n_positions")) orelse return null,
-        .rms_eps = @floatCast(getF64(cm, "rms_norm_eps") orelse return null),
+        .rms_eps = @floatCast(getF64(cm, "rms_norm_eps") orelse getF64(cm, "layer_norm_epsilon") orelse return null),
         .rope_theta = @floatCast(readRopeTheta(cm) orelse 10000),
         .rope_scaling = readRopeScaling(cm),
         .vocab_size = getU32(cm, "vocab_size") orelse return null,
@@ -426,12 +547,24 @@ pub fn load(io: std.Io, dir: std.Io.Dir, name_path: []const u8, alloc: std.mem.A
         .base_models = &.{},
     };
 
-    if (nonZero(getU32(cm, "num_experts") orelse getU32(cm, "num_local_experts"))) |n| {
+    if (nonZero(getU32(cm, "num_experts") orelse getU32(cm, "num_local_experts") orelse getU32(cm, "n_routed_experts"))) |n| {
         model.expert_count = n;
         // llama.cpp refuses an MoE file with no used count.
         model.expert_used_count = nonZero(getU32(cm, "num_experts_per_tok")) orelse return null;
         model.expert_feed_forward_length = getU32(cm, "moe_intermediate_size");
-        model.expert_shared_feed_forward_length = getU32(cm, "shared_expert_intermediate_size");
+        model.expert_shared_feed_forward_length = getU32(cm, "shared_expert_intermediate_size") orelse
+            getU32(cm, "moe_shared_expert_intermediate_size");
+    }
+
+    if (arch == &imagearch.nemotron_h_moe) {
+        // The dense Nemotron-H shares the model_type and is a different
+        // llama.cpp arch, with tensors this one does not map.
+        if (model.expert_count == 0) {
+            if (reason) |r| r.* = .unknown_model_type;
+            return null;
+        }
+        model.nemotron_h = readNemotronH(cm, model.block_count) orelse return null;
+        if (model.expert_feed_forward_length == null or model.expert_shared_feed_forward_length == null) return null;
     }
 
     model.qwen35 = try readQwen35(
@@ -482,6 +615,12 @@ pub fn load(io: std.Io, dir: std.Io.Dir, name_path: []const u8, alloc: std.mem.A
     // text encoder that never had a tokenizer, the second a broken checkpoint.
     const vocabless = sibling == null and !anyTokenizerFile(io, dir);
     if (!vocabless) loadTokenizer(io, tok_dir, alloc, &model, c) catch return null;
+    if (reason) |r| r.* = .bad_manifest;
+    if (!vocabless) nameUnitronTokens(io, dir, alloc, &model) catch return null;
+    if (reason) |r| r.* = .no_tokenizer;
+    // llama.cpp's converter tells pixtral from tekken (same regex) by vocabulary
+    // hash, which we cannot run; only the arch says which this one is.
+    if (std.mem.eql(u8, model.tokenizer_pre, "pixtral") and arch != &imagearch.nemotron_h_moe) model.tokenizer_pre = "";
     loadCard(io, dir, alloc, &model);
 
     if (readJson(io, dir, "generation_config.json", alloc)) |gc| {
@@ -1269,13 +1408,16 @@ pub fn expertPart(name: []const u8, mtp_base: ?u32) ?ExpertPart {
             name["model.language_model.layers.".len..]
         else if (std.mem.startsWith(u8, name, "model.layers."))
             name["model.layers.".len..]
+        else if (std.mem.startsWith(u8, name, "backbone.layers."))
+            name["backbone.layers.".len..]
         else
             return null;
         const dot = std.mem.findScalar(u8, body, '.') orelse return null;
         block = std.fmt.parseInt(u32, body[0..dot], 10) catch return null;
         rest = body[dot + 1 ..];
     }
-    const pre = "mlp.experts.";
+    // mixer.experts is Nemotron-H's spelling, under backbone.layers.
+    const pre = if (std.mem.startsWith(u8, name, "backbone.")) "mixer.experts." else "mlp.experts.";
     if (!std.mem.startsWith(u8, rest, pre)) return null;
     rest = rest[pre.len..];
 
@@ -2111,8 +2253,47 @@ fn mapQwen35(alloc: std.mem.Allocator, name: []const u8, mtp_base: ?u32) !?[]con
     return null;
 }
 
+/// Every block type keeps its tensors under mixer.*, so which suffixes a block
+/// carries depends on its letter in the pattern, not on the names.
+const nemotron_h_suffix = [_]NamePair{
+    .{ .from = "norm.weight", .to = "attn_norm.weight" },
+    .{ .from = "mixer.in_proj.weight", .to = "ssm_in.weight" },
+    .{ .from = "mixer.conv1d.weight", .to = "ssm_conv1d.weight" },
+    .{ .from = "mixer.conv1d.bias", .to = "ssm_conv1d.bias" },
+    .{ .from = "mixer.A_log", .to = "ssm_a" },
+    .{ .from = "mixer.D", .to = "ssm_d" },
+    .{ .from = "mixer.dt_bias", .to = "ssm_dt.bias" },
+    .{ .from = "mixer.norm.weight", .to = "ssm_norm.weight" },
+    .{ .from = "mixer.out_proj.weight", .to = "ssm_out.weight" },
+    .{ .from = "mixer.q_proj.weight", .to = "attn_q.weight" },
+    .{ .from = "mixer.k_proj.weight", .to = "attn_k.weight" },
+    .{ .from = "mixer.v_proj.weight", .to = "attn_v.weight" },
+    .{ .from = "mixer.o_proj.weight", .to = "attn_output.weight" },
+    .{ .from = "mixer.gate.weight", .to = "ffn_gate_inp.weight" },
+    .{ .from = "mixer.gate.e_score_correction_bias", .to = "exp_probs_b.bias" },
+    .{ .from = "mixer.shared_experts.up_proj.weight", .to = "ffn_up_shexp.weight" },
+    .{ .from = "mixer.shared_experts.down_proj.weight", .to = "ffn_down_shexp.weight" },
+};
+
+fn mapNemotronH(alloc: std.mem.Allocator, name: []const u8) !?[]const u8 {
+    if (std.mem.eql(u8, name, "backbone.embeddings.weight")) return "token_embd.weight";
+    if (std.mem.eql(u8, name, "backbone.norm_f.weight")) return "output_norm.weight";
+    if (std.mem.eql(u8, name, "lm_head.weight")) return "output.weight";
+    const prefix = "backbone.layers.";
+    if (!std.mem.startsWith(u8, name, prefix)) return null;
+    const after = name[prefix.len..];
+    const dot = std.mem.findScalar(u8, after, '.') orelse return null;
+    const layer = std.fmt.parseInt(u32, after[0..dot], 10) catch return null;
+    const suffix = after[dot + 1 ..];
+    for (nemotron_h_suffix) |pair| {
+        if (std.mem.eql(u8, suffix, pair.from)) return try alloc.print("blk.{d}.{s}", .{ layer, pair.to });
+    }
+    return null;
+}
+
 pub fn mapName(alloc: std.mem.Allocator, arch: *const imagearch.Arch, name: []const u8, mtp_base: ?u32) !?[]const u8 {
     if (isQwen35Family(arch.name)) return mapQwen35(alloc, name, mtp_base);
+    if (arch == &imagearch.nemotron_h_moe) return mapNemotronH(alloc, name);
     if (visionTextTower(arch)) |text| {
         // The language tower is the plain arch, under a prefix in the newer
         // layouts and at model.* in qwen2vl's legacy one.
@@ -2226,6 +2407,8 @@ fn mapQwen35Reverse(alloc: std.mem.Allocator, name: []const u8, mtp_base: ?u32) 
 /// the name is already HF-style or is not part of the mapped LLM set.
 pub fn mapNameReverse(alloc: std.mem.Allocator, arch: *const imagearch.Arch, name: []const u8, mtp_base: ?u32) !?[]const u8 {
     if (isQwen35Family(arch.name)) return mapQwen35Reverse(alloc, name, mtp_base);
+    // Not written yet: the generic table below would hand it llama's names.
+    if (arch == &imagearch.nemotron_h_moe) return null;
     // Qwen3-VL has no legacy layout: transformers reads it under
     // model.language_model.* only. qwen2vl's legacy model.* layout loads on
     // every transformers version, so it falls through to qwen2's names.
@@ -2498,6 +2681,39 @@ fn addRopeScaling(self: Model, metadata: *std.json.ObjectMap, a: []const u8, all
     }
 }
 
+/// The keys llama.cpp's converter writes for this hybrid on top of the generic
+/// set, replacing the scalar feed-forward length and kv head count with the
+/// per-block arrays llama.cpp sizes each block from.
+fn addNemotronH(self: Model, n: NemotronH, metadata: *std.json.ObjectMap, a: []const u8, alloc: std.mem.Allocator) !void {
+    const ff = try alloc.alloc(u32, n.pattern.len);
+    const kv = try alloc.alloc(u32, n.pattern.len);
+    for (n.pattern, ff, kv) |ch, *f, *k| {
+        f.* = if (ch == 'E') self.expert_feed_forward_length.? else 0;
+        k.* = if (ch == '*') self.head_count_kv else 0;
+    }
+    try putU32Array(metadata, alloc, try alloc.print("{s}.feed_forward_length", .{a}), ff);
+    try putU32Array(metadata, alloc, try alloc.print("{s}.attention.head_count_kv", .{a}), kv);
+    // llama.cpp's converter writes this for every hybrid without RoPE scaling,
+    // whatever max_position_embeddings says.
+    try putNum(metadata, alloc, try alloc.print("{s}.context_length", .{a}), @as(u32, 1 << 20));
+    try putFloat(metadata, alloc, try alloc.print("{s}.attention.layer_norm_epsilon", .{a}), self.rms_eps);
+    // llama.cpp's converter ignores head_dim here; the attention has no RoPE,
+    // so the number goes unused either way.
+    try putNum(metadata, alloc, try alloc.print("{s}.rope.dimension_count", .{a}), self.embedding_length / self.head_count);
+    try putNum(metadata, alloc, try alloc.print("{s}.vocab_size", .{a}), self.vocab_size);
+    try metadata.put(alloc, try alloc.print("{s}.rope.scaling.finetuned", .{a}), .{ .bool = false });
+    try putNum(metadata, alloc, try alloc.print("{s}.ssm.conv_kernel", .{a}), n.conv_kernel);
+    try putNum(metadata, alloc, try alloc.print("{s}.ssm.state_size", .{a}), n.state_size);
+    try putNum(metadata, alloc, try alloc.print("{s}.ssm.group_count", .{a}), n.group_count);
+    try putNum(metadata, alloc, try alloc.print("{s}.ssm.inner_size", .{a}), n.inner_size);
+    try putNum(metadata, alloc, try alloc.print("{s}.ssm.time_step_rank", .{a}), n.time_step_rank);
+    try putNum(metadata, alloc, try alloc.print("{s}.expert_shared_count", .{a}), n.shared_expert_count);
+    try metadata.put(alloc, try alloc.print("{s}.expert_weights_norm", .{a}), .{ .bool = n.weights_norm });
+    try putFloat(metadata, alloc, try alloc.print("{s}.expert_weights_scale", .{a}), n.weights_scale);
+    try putNum(metadata, alloc, try alloc.print("{s}.expert_group_count", .{a}), n.expert_group_count);
+    try putNum(metadata, alloc, try alloc.print("{s}.expert_group_used_count", .{a}), n.expert_group_used_count);
+}
+
 /// Emit the general.*, <arch>.* and tokenizer.ggml.* metadata for an HF checkpoint.
 /// `arch_name` prefixes the dimension keys and must be whatever general.architecture
 /// ends up saying (-A renames both together, or llama.cpp looks for the keys under a
@@ -2563,6 +2779,7 @@ pub fn addMetadata(self: Model, metadata: *std.json.ObjectMap, arch_name: []cons
     }
 
     try addRopeScaling(self, metadata, a, alloc);
+    if (self.nemotron_h) |n| try addNemotronH(self, n, metadata, a, alloc);
     if (self.rope_sections) |rs| {
         try putI64Array(metadata, alloc, try alloc.print("{s}.rope.dimension_sections", .{a}), &rs);
     }
@@ -2853,6 +3070,7 @@ fn jsonArr(alloc: std.mem.Allocator, items: []const std.json.Value) !std.json.Va
 /// number run: \p{N}{1,3} against \p{N}.
 const qwen2_regex = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 const qwen35_regex = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+const tekken_regex = "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 const llama3_regex = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 
 /// The llama.cpp pre-tokenizer tags whose splitting is one regex we can carry
@@ -2880,6 +3098,8 @@ const bpe_pretokenizers = [_]BpePretok{
     .{ .tags = &.{"qwen2"}, .regex = qwen2_regex, .nfc = true },
     .{ .tags = &.{ "deepseek-r1-qwen", "megrez" }, .regex = qwen2_regex },
     .{ .tags = &.{"qwen35"}, .regex = qwen35_regex, .nfc = true },
+    // Tekken's split; llama.cpp tokenizes the tag with llama3's.
+    .{ .tags = &.{"pixtral"}, .regex = tekken_regex, .ignore_merges = true, .null_affixes = true },
 };
 
 /// The regex that reproduces the HF tokenizer.json for `model` under `pre`.
@@ -5999,4 +6219,50 @@ test "parseSpmModel rejects a length that would wrap the offset" {
     // Field 1, wire type 2, length 2^64-1: pos + len wraps back under bytes.len.
     const bytes = [_]u8{0x0A} ++ @as([9]u8, @splat(0xFF)) ++ [_]u8{0x01};
     try testing.expectError(error.BadProtobuf, parseSpmModel(arena.allocator(), &bytes));
+}
+
+test "nameUnitronTokens names the manifest's ids and refuses ones it cannot place" {
+    testing.log_level = .err;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+
+    const Case = struct { json: ?[]const u8, ok: bool };
+    const cases = [_]Case{
+        .{ .json = null, .ok = true },
+        .{ .json = "{\"unitron_token_ranges\":{\"framing\":{\"<|s|>\":2},\"vision\":{\"token_format\":\"<|v_{i}|>\",\"start_id\":3,\"end_id\":5}}}", .ok = true },
+        // Past the vocabulary, caught before any name is built.
+        .{ .json = "{\"unitron_token_ranges\":{\"vision\":{\"token_format\":\"<|v_{i}|>\",\"start_id\":3,\"end_id\":1000000000000}}}", .ok = false },
+        // A framing id inside the vision range.
+        .{ .json = "{\"unitron_token_ranges\":{\"framing\":{\"<|s|>\":3},\"vision\":{\"token_format\":\"<|v_{i}|>\",\"start_id\":3,\"end_id\":5}}}", .ok = false },
+        // A real token's id.
+        .{ .json = "{\"unitron_token_ranges\":{\"framing\":{\"<|s|>\":1}}}", .ok = false },
+        .{ .json = "{not json", .ok = false },
+        .{ .json = "{\"unitron_token_ranges\":{\"vision\":{\"start_id\":3,\"end_id\":5}}}", .ok = false },
+    };
+    for (cases) |c| {
+        var t = testing.tmpDir(.{});
+        defer t.cleanup();
+        if (c.json) |j| try t.dir.writeFile(io, .{ .sub_path = "unitron_extension_manifest.json", .data = j });
+        var m: Model = undefined;
+        m.tokens = &.{ "a", "b", "[PAD2]", "[PAD3]", "[PAD4]", "[PAD5]" };
+        m.token_types = &.{ GGUF_TOKEN_TYPE_NORMAL, GGUF_TOKEN_TYPE_NORMAL, GGUF_TOKEN_TYPE_UNUSED, GGUF_TOKEN_TYPE_UNUSED, GGUF_TOKEN_TYPE_UNUSED, GGUF_TOKEN_TYPE_UNUSED };
+        const result = nameUnitronTokens(io, t.dir, a, &m);
+        if (!c.ok) {
+            try testing.expectError(error.BadManifest, result);
+            continue;
+        }
+        try result;
+        if (c.json == null) {
+            try testing.expectEqualStrings("[PAD3]", m.tokens[3]);
+            continue;
+        }
+        try testing.expectEqualStrings("<|s|>", m.tokens[2]);
+        try testing.expectEqualStrings("<|v_0|>", m.tokens[3]);
+        try testing.expectEqualStrings("<|v_1|>", m.tokens[4]);
+        try testing.expectEqualStrings("[PAD5]", m.tokens[5]);
+        try testing.expectEqual(GGUF_TOKEN_TYPE_CONTROL, m.token_types[4]);
+        try testing.expectEqual(GGUF_TOKEN_TYPE_UNUSED, m.token_types[5]);
+    }
 }

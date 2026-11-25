@@ -1464,6 +1464,29 @@ pub const qwen35moe = Arch{
     .precision_floor = &llm_output_floor,
 };
 
+/// Nemotron-H with MoE blocks: Mamba2, attention and expert layers in the order
+/// config.json's hybrid_override_pattern gives. HfLlm refuses the dense variant,
+/// which shares the model_type.
+pub const nemotron_h_moe = Arch{
+    .name = "nemotron_h_moe",
+    .hf_model_type = "nemotron_h",
+    .component_filter = false,
+    .row_aligned_blocks = true,
+    .threshhold = null,
+    // Block 0 is Mamba and block 1 an expert layer in every released pattern.
+    // granitehybrid has every other native key here; exp_probs_b is ours alone.
+    .keys_detect = &.{
+        &.{ "token_embd.weight", "blk.0.ssm_in.weight", "blk.0.ssm_d", "blk.1.ffn_up_exps.weight", "blk.1.exp_probs_b.bias" },
+        &.{ "backbone.embeddings.weight", "backbone.layers.0.mixer.in_proj.weight", "backbone.layers.0.mixer.D", "backbone.layers.1.mixer.experts.0.up_proj.weight" },
+    },
+    .keys_hiprec = &llm_substring_protected,
+    .precision_floor = &llm_output_floor,
+    // llama.cpp's converter writes these f32 whatever the target: ggml's
+    // ssm_conv and ssm_scan take no other type, and the others are 2-D only
+    // because llama.cpp reshapes them.
+    .upcast_from_bf16 = &.{ ".ssm_conv1d.weight", ".ssm_a", ".ssm_d", ".ssm_norm.weight" },
+};
+
 /// List of all known architectures, in detection priority order
 pub const arch_list = [_]*const Arch{
     &flux3,
@@ -1491,6 +1514,7 @@ pub const arch_list = [_]*const Arch{
     &sensenova_u15,
     &moss_image,
     &fibo2,
+    &nemotron_h_moe,
     &qwen35moe,
     &qwen35,
     &qwen3vl,
@@ -2199,6 +2223,23 @@ test "llama family detects from GGUF-native and HF name spaces" {
 
     // Missing the norms must not reach qwen3.
     try std.testing.expectEqualStrings("llama", detectArch(&llama_native).?.name);
+}
+
+test "nemotron_h_moe claims its own GGUF but not a granitehybrid one" {
+    const granite = [_][]const u8{
+        "token_embd.weight",
+        "blk.0.ssm_in.weight",
+        "blk.0.ssm_d",
+        "blk.0.ssm_a",
+        "blk.1.ffn_up_exps.weight",
+        "blk.1.ffn_gate_exps.weight",
+        "blk.1.ffn_down_exps.weight",
+        "blk.1.ffn_gate_inp.weight",
+    };
+    const got = detectArch(&granite);
+    try std.testing.expect(got == null or got.? != &nemotron_h_moe);
+    const nemotron = granite ++ [_][]const u8{"blk.1.exp_probs_b.bias"};
+    try std.testing.expectEqualStrings("nemotron_h_moe", detectArch(&nemotron).?.name);
 }
 
 test "qwen35 hybrid matches by ssm keys; moe superset wins over dense" {

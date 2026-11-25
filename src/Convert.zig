@@ -571,6 +571,7 @@ pub fn prepareConversion(
                     squeezed[1] = t.dims[2];
                     t.dims = squeezed;
                 }
+                if (m.nemotron_h) |n| t.dims = try nemotronHDims(arena_alloc, native, t.dims, n.group_count);
                 try kept.append(arena_alloc, t.*);
             } else if (HfLlm.isVisionTensor(t.name)) {
                 vision += 1;
@@ -659,6 +660,11 @@ pub fn prepareConversion(
             .no_tokenizer => {
                 std.log.warn("{s} carries HF tensor names, but its tokenizer could not be read: tokenizer.json is missing (beside it and in a diffusers tokenizer/ sibling), malformed, or of a model type this tool does not map", .{opts.path});
                 std.log.warn("a GGUF without vocabulary metadata does not load; fix or supply tokenizer.json", .{});
+                return error.HfTokenizerUnreadable;
+            },
+            // nameUnitronTokens has already said what is wrong with it.
+            .bad_manifest => {
+                std.log.warn("{s} carries HF tensor names, but the unitron_extension_manifest.json beside it is unusable; fix or remove it", .{opts.path});
                 return error.HfTokenizerUnreadable;
             },
         }
@@ -2810,6 +2816,37 @@ fn vReorderMatches(ctx_ptr: *anyopaque, name: []const u8) bool {
     return qwen35Role(name) != .none;
 }
 
+/// The shapes llama.cpp's converter gives Nemotron-H's Mamba tensors: the
+/// per-head A and D as one column, and the gated norm as one row per group.
+/// Row-major bytes are unchanged by either.
+fn nemotronHDims(alloc: std.mem.Allocator, name: []const u8, dims: []usize, groups: u32) ![]usize {
+    if (dims.len != 1) return dims;
+    if (std.mem.endsWith(u8, name, ".ssm_a") or std.mem.endsWith(u8, name, ".ssm_d")) {
+        return try alloc.dupe(usize, &.{ dims[0], 1 });
+    }
+    if (std.mem.endsWith(u8, name, ".ssm_norm.weight")) {
+        if (dims[0] % groups != 0) return error.SsmNormNotDivisible;
+        return try alloc.dupe(usize, &.{ groups, dims[0] / groups });
+    }
+    return dims;
+}
+
+/// Nemotron-H: HF stores the log of the Mamba decay and llama.cpp the decay
+/// itself. llama.cpp's converter also applies the llama Q/K permute, which
+/// this attention (no RoPE) does not need but byte parity does.
+fn nemotronHApply(ctx: *anyopaque, alloc: std.mem.Allocator, name: []const u8, dims: []const usize, source_type: []const u8, bytes: []u8) !void {
+    if (!std.mem.endsWith(u8, name, ".ssm_a")) return ropePatchApply(ctx, alloc, name, dims, source_type, bytes);
+    switch (try types.DataType.fromString(source_type)) {
+        .F32, .f32 => {},
+        else => return error.RopePatchUnsupportedType,
+    }
+    for (std.mem.bytesAsSlice(f32, bytes)) |*v| v.* = @floatCast(-@exp(@as(f64, v.*)));
+}
+
+fn nemotronHMatches(ctx: *anyopaque, name: []const u8) bool {
+    return std.mem.endsWith(u8, name, ".ssm_a") or ropePatchMatches(ctx, name);
+}
+
 fn ropePatchMatches(ctx: *anyopaque, name: []const u8) bool {
     const heads: *const RopePatchCtx = @ptrCast(@alignCast(ctx));
     return HfLlm.ropePermuteGroups(.{
@@ -2946,6 +2983,12 @@ fn writeGguf(
             .value_head_dim = q.value_head_dim,
         };
         rope_patch = .{ .ctx = ctx, .apply = &vReorderApply, .matches = &vReorderMatches, .force_f32 = true };
+    };
+
+    if (hf) |m| if (m.nemotron_h != null) {
+        const ctx = try arena_alloc.create(RopePatchCtx);
+        ctx.* = .{ .head_count = m.head_count, .head_count_kv = m.head_count_kv, .to_hf = false };
+        rope_patch = .{ .ctx = ctx, .apply = &nemotronHApply, .matches = &nemotronHMatches, .force_f32 = true };
     };
 
     out_gguf.saveWithSTData(f, opts.threads, opts.callbacks, groups, rope_patch) catch |err| {
@@ -8013,6 +8056,118 @@ test "a Qwen3-VL checkpoint's vision tower becomes the mmproj llama.cpp's conver
 
 test "a Qwen2.5-VL checkpoint's vision tower becomes the mmproj llama.cpp's converter writes" {
     try expectMmprojMatchesLlamaCpp("qwen25vl");
+}
+
+// See gen_nemotron_h_fixtures.py. The one intended difference from llama.cpp's
+// converter is the unitron image tokens, which it leaves as [PAD] holes.
+test "a Nemotron-H MoE checkpoint converts to the GGUF llama.cpp's converter writes, with its image tokens named" {
+    testing.log_level = .err;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const ts_ns: i96 = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    const dir = try a.print("/tmp/ggufy_nemotron_h_{x}", .{@as(u64, @bitCast(@as(i64, @truncate(ts_ns))))});
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const P = "test_fixtures/nemotron_h/";
+    const files = .{
+        .{ "model.safetensors", @embedFile(P ++ "model.safetensors") },
+        .{ "config.json", @embedFile(P ++ "config.json") },
+        .{ "tokenizer.json", @embedFile(P ++ "tokenizer.json") },
+        .{ "tokenizer_config.json", @embedFile(P ++ "tokenizer_config.json") },
+        .{ "unitron_extension_manifest.json", @embedFile(P ++ "unitron_extension_manifest.json") },
+        .{ "ref.gguf", @embedFile(P ++ "ref-f32.gguf") },
+    };
+    inline for (files) |entry| {
+        const file = try std.Io.Dir.cwd().createFile(io, try a.print("{s}/{s}", .{ dir, entry[0] }), .{ .truncate = true });
+        defer file.close(io);
+        try file.writeStreamingAll(io, entry[1]);
+    }
+
+    const src_path = try a.print("{s}/model.safetensors", .{dir});
+    {
+        var f = try st.init(src_path, io, gpa, a, false, false);
+        defer f.deinit();
+        try convert(&f, .{
+            .io = io,
+            .path = src_path,
+            .filetype = .gguf,
+            .datatype = .f32,
+            .template_path = null,
+            .output_dir = dir,
+            .output_name = "got",
+            .threads = 1,
+            .skip_sensitivity = true,
+            .quantization_aggressiveness = 0,
+        }, gpa, a);
+    }
+    var ref = try gguf.init(try a.print("{s}/ref.gguf", .{dir}), io, gpa, a, false);
+    defer ref.deinit();
+    var got = try gguf.init(try a.print("{s}/got.gguf", .{dir}), io, gpa, a, false);
+    defer got.deinit();
+
+    // Ids 32-34 are the framing tokens and 35-54 the vision ones in the fixture's manifest.
+    const tokens = got.metadata.get("tokenizer.ggml.tokens").?.array.items;
+    const token_types = got.metadata.get("tokenizer.ggml.token_type").?.array.items;
+    try testing.expectEqualStrings("<|img_start|>", tokens[32].string);
+    try testing.expectEqualStrings("<|vis_row|>", tokens[34].string);
+    try testing.expectEqualStrings("<|vis_0|>", tokens[35].string);
+    try testing.expectEqualStrings("<|vis_19|>", tokens[54].string);
+    try testing.expectEqualStrings("[PAD55]", tokens[55].string);
+    for (32..55) |i| try testing.expectEqual(@as(i64, HfLlm.GGUF_TOKEN_TYPE_CONTROL), token_types[i].integer);
+
+    const skipped = [_][]const u8{ "general.name", "general.basename", "general.size_label", "general.finetune", "converted_by", "converter_url", "converter_note" };
+    var it = ref.metadata.iterator();
+    var compared: usize = 0;
+    while (it.next()) |e| {
+        const key = e.key_ptr.*;
+        const skip = for (skipped) |k| {
+            if (std.mem.eql(u8, k, key)) break true;
+        } else false;
+        if (skip) continue;
+        const mine = got.metadata.get(key) orelse {
+            std.debug.print("missing key {s}\n", .{key});
+            return error.TestExpectedEqual;
+        };
+        if (std.mem.eql(u8, key, "tokenizer.ggml.tokens") or std.mem.eql(u8, key, "tokenizer.ggml.token_type")) {
+            const theirs = e.value_ptr.array.items;
+            try testing.expectEqual(theirs.len, mine.array.items.len);
+            for (theirs, mine.array.items, 0..) |x, y, i| {
+                if (i >= 32 and i < 55) continue;
+                if (!jsonValuesEqual(x, y)) {
+                    std.debug.print("{s}[{d}] differs\n", .{ key, i });
+                    return error.TestExpectedEqual;
+                }
+            }
+        } else if (!jsonValuesEqual(e.value_ptr.*, mine)) {
+            std.debug.print("key {s} differs\n", .{key});
+            return error.TestExpectedEqual;
+        }
+        compared += 1;
+    }
+    try testing.expect(compared >= 40);
+
+    try testing.expectEqual(ref.tensors.items.len, got.tensors.items.len);
+    for (ref.tensors.items) |rt| {
+        const gt = for (got.tensors.items) |t| {
+            if (std.mem.eql(u8, t.name, rt.name)) break t;
+        } else {
+            std.debug.print("missing tensor {s}\n", .{rt.name});
+            return error.TestExpectedEqual;
+        };
+        try testing.expectEqualSlices(usize, rt.dims, gt.dims);
+        const rb = try readTensorBytes(&ref, rt, a);
+        const gb = try readTensorBytes(&got, gt, a);
+        if (!std.mem.eql(u8, rb, gb)) {
+            std.debug.print("tensor {s} bytes differ\n", .{rt.name});
+            return error.TestExpectedEqual;
+        }
+    }
 }
 
 fn bf16ToF32(bits: u16) f32 {
